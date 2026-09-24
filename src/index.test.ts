@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import tau from "./index.ts";
+import tau, { createTau, type TauDependencies } from "./index.ts";
+import { TaskListStore } from "./tasks/store.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -47,15 +51,21 @@ function fakePi(reply: { code: number; stdout: string }): FakePi {
   return { api, handlers, execCalls, otherCalls };
 }
 
-function fakeCtx(hasUI = true) {
+function fakeCtx(hasUI = true, sessionId = "session-1") {
   const widgets: Array<{ key: string; lines: unknown }> = [];
+  const notices: Array<{ message: string; type: unknown }> = [];
   return {
     widgets,
+    notices,
     ctx: {
       hasUI,
+      sessionManager: { getSessionId: () => sessionId },
       ui: {
         setWidget(key: string, lines: unknown) {
           widgets.push({ key, lines });
+        },
+        notify(message: string, type: unknown) {
+          notices.push({ message, type });
         },
       },
     },
@@ -80,15 +90,20 @@ function enableHerdr(): void {
 
 describe("tau extension", () => {
   const saved = new Map<string, string | undefined>();
+  let root: string;
+  let deps: TauDependencies;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "tau-index-"));
+    deps = { agentDir: () => join(root, "agent"), now: () => "2026-01-01T00:00:00.000Z" };
     for (const name of ENV_NAMES) {
       saved.set(name, process.env[name]);
       delete process.env[name];
     }
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
     for (const name of ENV_NAMES) {
       const value = saved.get(name);
       if (value === undefined) {
@@ -114,7 +129,7 @@ describe("tau extension", () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx, widgets } = fakeCtx();
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await emit(pi, "session_start", ctx);
 
@@ -126,7 +141,7 @@ describe("tau extension", () => {
     process.env.HERDR_ENV = "1";
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx, widgets } = fakeCtx();
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await emit(pi, "session_start", ctx);
 
@@ -138,7 +153,7 @@ describe("tau extension", () => {
   it("shows the red badge and uses no other pi API when herdr is not available", async () => {
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx, widgets } = fakeCtx();
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await emit(pi, "session_start", ctx);
     await emit(pi, "session_shutdown", ctx);
@@ -155,7 +170,7 @@ describe("tau extension", () => {
     enableHerdr();
     const pi = fakePi({ code: 1, stdout: "" });
     const { ctx, widgets } = fakeCtx();
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await emit(pi, "session_start", ctx);
 
@@ -166,7 +181,7 @@ describe("tau extension", () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx, widgets } = fakeCtx();
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await emit(pi, "session_start", ctx);
     await emit(pi, "session_shutdown", ctx);
@@ -178,7 +193,7 @@ describe("tau extension", () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx, widgets } = fakeCtx(false);
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await emit(pi, "session_start", ctx);
     await emit(pi, "session_shutdown", ctx);
@@ -191,7 +206,7 @@ describe("tau extension", () => {
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const first = fakeCtx();
     const second = fakeCtx();
-    tau(pi.api);
+    createTau(pi.api, deps);
 
     await Promise.all([emit(pi, "session_start", first.ctx), emit(pi, "session_start", second.ctx)]);
     await emit(pi, "session_start", second.ctx);
@@ -210,13 +225,13 @@ describe("tau extension", () => {
     enableHerdr();
     const before = fakePi({ code: 0, stdout: PANE_REPLY });
     const beforeCtx = fakeCtx();
-    tau(before.api);
+    createTau(before.api, deps);
     await emit(before, "session_start", beforeCtx.ctx);
 
     delete process.env.HERDR_ENV;
     const after = fakePi({ code: 0, stdout: PANE_REPLY });
     const afterCtx = fakeCtx();
-    tau(after.api);
+    createTau(after.api, deps);
     await emit(after, "session_start", afterCtx.ctx);
     await emit(before, "session_start", beforeCtx.ctx);
 
@@ -225,5 +240,79 @@ describe("tau extension", () => {
       { key: "tau", lines: ["🟢 Herdr"] },
       { key: "tau", lines: ["🟢 Herdr"] },
     ]);
+  });
+
+  it("makes the task list with T0 when herdr is available", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "abc-123");
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", ctx);
+
+    const file = join(root, "tau", "tasklists", "abc-123.db");
+    const list = (await new TaskListStore(file).read())!;
+    assert.equal(list.sessionId, "abc-123");
+    assert.deepEqual(
+      list.tasks.map((task: { id: string; title: string; status: string }) => [task.id, task.title, task.status]),
+      [["T0", "Prepare task list", "waiting"]],
+    );
+    assert.deepEqual(notices, []);
+  });
+
+  it("does not change an existing task list on a later session start", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "abc-123");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const file = join(root, "tau", "tasklists", "abc-123.db");
+    const before = await new TaskListStore(file).read();
+
+    const later = { ...deps, now: () => "2027-01-01T00:00:00.000Z" };
+    const again = fakePi({ code: 0, stdout: PANE_REPLY });
+    createTau(again.api, later);
+    await emit(again, "session_start", ctx);
+
+    assert.deepEqual(await new TaskListStore(file).read(), before);
+  });
+
+  it("does not make a task list when herdr is not available", async () => {
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", fakeCtx().ctx);
+
+    await assert.rejects(readFile(join(root, "tau", "tasklists", "session-1.db")), { code: "ENOENT" });
+  });
+
+  it("shows an error when the task list cannot be opened", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices, widgets } = fakeCtx(true, "../escape");
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", ctx);
+
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]?.type, "error");
+    assert.match(notices[0]?.message ?? "", /not safe as a file name/);
+    assert.deepEqual(widgets, [{ key: "tau", lines: ["🟢 Herdr"] }]);
+  });
+
+  it("shows an error and does not overwrite a task list file that is not valid", async () => {
+    enableHerdr();
+    const directory = join(root, "tau", "tasklists");
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "abc.db"), "{ broken");
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "abc");
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", ctx);
+
+    assert.equal(notices.length, 1);
+    assert.match(notices[0]?.message ?? "", /not a database/);
+    assert.equal(await readFile(join(directory, "abc.db"), "utf8"), "{ broken");
   });
 });

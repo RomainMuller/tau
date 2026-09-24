@@ -111,12 +111,12 @@ tasks it needs.
 | `title`        | yes      | Short and descriptive.                              |
 | `type`         | yes      | One of the [task types](#task-types).               |
 | `description`  | no       | Markdown. Can be long.                              |
-| `dependencies` | no       | List of task `id`s. Only while `waiting`.           |
+| `dependencies` | yes      | List of task `id`s (can be empty). Only while `waiting`. |
 | `status`       | yes      | See [Task lifecycle](#task-lifecycle).              |
 | `owner`        | no       | The agent that claimed the task.                    |
 | `result`       | no       | Markdown. Set when the task closes.                 |
 | `retryable`    | no       | Set when the task fails. See [Rules](#rules).       |
-| `notes`        | no       | Shared findings. See [Notes](#notes).               |
+| `notes`        | yes      | Shared findings (can be empty). See [Notes](#notes). |
 | `history`      | yes      | Each change, with time and agent. See [Fork](#fork).|
 
 ### Task IDs
@@ -300,14 +300,25 @@ cancel │                                   │         │ owner gone  │ cla
    agent can try again.
 7. A parent task can close only when each sub-task is `completed`, `failed`, or
    `canceled`.
-8. Any agent that can see a `waiting` task can **cancel** it. A reason is
-   necessary.
-9. Dependencies can change only while the task is `waiting`.
-10. After a claim, only the owner can change the `title`, `description`, and
-    `status`.
+8. An agent that can change a `waiting` task can **cancel** it. A reason is
+   necessary. `tau` also cancels the `waiting` sub-tasks of the task. If a
+   sub-task is `in_progress`, the cancel fails.
+9. Dependencies can change only while the task is `waiting`. A task cannot
+   depend on itself, on its parent tasks, or on a task that waits for it (a
+   cycle). A task waits for its dependencies, and for its sub-tasks (it can
+   close only after them).
+
+An agent can **change** a task when it is the lead, or when the task is in
+the task that the agent received from its parent (the task or one of its
+sub-tasks). All agents can **see** all tasks, and can add
+[notes](#notes) to all tasks.
+10. After a claim, only the owner can change the `title`, `type`,
+    `description`, and `status`.
 11. When the owner agent stops existing, `tau` sets the task to `failed` with
     the result `owner agent exited` and `retryable: true`. See
-    [Liveness](#liveness).
+    [Liveness](#liveness). If the task has sub-tasks that are not closed, the
+    task stays `in_progress` until they close (rule 7): the lead can claim,
+    finish, or cancel them. Then `tau` fails the task.
 12. The lead decides if it retries a `failed` task.
 
 ### Claim stack example
@@ -388,7 +399,7 @@ Who can add a sub-task to task `Tn`:
 
 | Status of `Tn` | Who can add a sub-task          |
 |----------------|---------------------------------|
-| `waiting`      | Any agent that can see `Tn`.    |
+| `waiting`      | Any agent that can change `Tn`. |
 | `in_progress`  | Only the owner of `Tn`.         |
 | other          | Nobody.                         |
 
@@ -676,7 +687,7 @@ compaction, or a session resume.
 ~/.pi/tau/
 ├── config.json
 └── tasklists/
-    ├── <lead-session-id>.json
+    ├── <lead-session-id>.db
     └── <lead-session-id>.messages/
         └── <agent-name>.jsonl
 ```
@@ -692,17 +703,46 @@ directory, with `tau` added:
 | `~/.pi/agent` (default)                    | `~/.pi/tau`         |
 | `/opt/pi/agent`                            | `/opt/pi/tau`       |
 
+`tau` reads the pi agent directory from `PI_CODING_AGENT_DIR`, or uses the
+default. A program that starts pi with the SDK option `agentDir` and does not
+set `PI_CODING_AGENT_DIR` gets the default tau directory.
+
+Each task list is an SQLite database file. `tau` uses the `node:sqlite`
+module of Node.js, so it needs no dependency. Each change is one SQLite
+transaction.
+
 - Sub-agents use the task list file of their lead. `tau` gives the path to the
   sub-agent in the `TAU_TASKLIST` environment variable, and the task `id` in
   `TAU_TASK_ID`.
-- More than one agent can write to the file. `tau` uses a file lock for each
-  write.
+- More than one agent can change the task list. SQLite lets only one process
+  at a time change it. The lock is an operating system lock, so it ends
+  automatically when its process stops. While a different process has the
+  lock, `tau` waits for at most 5 seconds, and it does not block pi while it
+  waits.
+
+The `tasklists` directory is for the current user only: `tau` makes it with
+mode `0700`, and removes access for other users if it has it. The database
+files (with the SQLite `-wal` and `-shm` files) have mode `0600`: `tau`
+removes access for other users from an existing file too. `tau` does not use a task list file or directory that
+is a symbolic link. A task list can have at most 16 MiB of data, 500 tasks,
+100 notes for each task, and 1000 changes for each task. The change limit
+does not apply to a close (complete, fail, or cancel), but the 16 MiB limit
+does. `tau` checks these limits when it changes a task, and when
+it reads a task list.
+
+When a task list is not valid (the file is not a database, the data is not
+JSON, or the fields of a task do not agree with its `history`), `tau` shows
+an error and does not change the file.
 
 ### Fork
 
 When you fork a session (`/fork`), the new session gets a copy of the task
 list. `tau` uses the `history` of each task to roll the copy back to its state
 at the fork point. Changes after the fork point are not in the copy.
+
+Each change has a revision number, which is unique in the task list. The fork
+point is a revision, not a time, so two changes in the same millisecond are
+not a problem.
 
 At the fork point, a sub-agent can own an `in_progress` task. That sub-agent
 works for the original session, not for the fork. In the copy, these tasks

@@ -1,0 +1,309 @@
+/**
+ * The storage of a task list, in an SQLite database file.
+ *
+ * More than one pi process (the lead and its sub-agents) can change the same
+ * task list. SQLite serializes the changes: each change is one
+ * `BEGIN IMMEDIATE` transaction, and only one process at a time can have
+ * such a transaction on a database. The lock is an operating system lock, so
+ * it ends automatically when its process stops. There are no stale locks.
+ *
+ * The database has one table with one row. The row contains the task list as
+ * JSON text (see `codec.ts`).
+ *
+ * tau uses the built-in `node:sqlite` module, so it needs no dependency. Its
+ * calls are synchronous. To not block the event loop while a different
+ * process has the lock, tau does not use the SQLite busy timeout: when the
+ * database is busy, it waits with a timer and tries again.
+ */
+
+import { chmod, lstat, mkdir, open } from "node:fs/promises";
+import { dirname } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+import { decodeTaskList, encodeTaskList } from "./codec.ts";
+import { TauError } from "./errors.ts";
+import type { TaskList } from "./model.ts";
+
+export interface StoreOptions {
+  /** The maximum time to wait while a different process has the lock, in milliseconds. */
+  readonly lockTimeoutMs?: number;
+}
+
+export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
+/** The maximum size of the task list JSON text, in bytes. */
+export const MAX_FILE_BYTES = 16 * 1024 * 1024;
+
+/** The SQLite result code for "the database is locked by a different connection". */
+const SQLITE_BUSY = 5;
+
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS tasklist (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    json TEXT NOT NULL
+  ) STRICT;
+`;
+
+export class TaskListStore {
+  readonly file: string;
+  readonly #lockTimeoutMs: number;
+  /** Operations of this process run one at a time. */
+  #queue: Promise<unknown> = Promise.resolve();
+
+  constructor(file: string, options: StoreOptions = {}) {
+    this.file = file;
+    this.#lockTimeoutMs = options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+  }
+
+  /** Reads the task list. Returns `undefined` when there is no task list. */
+  async read(): Promise<TaskList | undefined> {
+    return this.#enqueue(async () => {
+      if (!(await checkDirectory(dirname(this.file)))) return undefined;
+      if (!(await this.#exists())) return undefined;
+      await secureFiles(this.file);
+      return this.#withDatabase((db) => readList(db, this.file));
+    });
+  }
+
+  /**
+   * Reads the task list. When there is no task list, writes the list that
+   * `seed` makes, and returns it.
+   */
+  async ensure(seed: () => TaskList): Promise<TaskList> {
+    const existing = await this.read();
+    if (existing !== undefined) return existing;
+    const { list } = await this.update((current) => ({ list: current ?? seed(), result: undefined }));
+    return list;
+  }
+
+  /**
+   * Changes the task list in one transaction. `change` receives the current
+   * list (a new object, so it can change it). If `change` throws, nothing
+   * changes.
+   *
+   * When there is no task list, `change` receives `undefined` and must return
+   * the new list.
+   */
+  async update<T>(
+    change: (list: TaskList | undefined) => { list: TaskList; result: T },
+  ): Promise<{ list: TaskList; result: T }> {
+    return this.#enqueue(async () => {
+      await this.#prepare();
+      return this.#withDatabase(async (db) => {
+        await this.#begin(db);
+        try {
+          const current = readList(db, this.file);
+          const { list, result } = change(current);
+          const text = encodeTaskList(list);
+          if (Buffer.byteLength(text) > MAX_FILE_BYTES) {
+            throw new TauError("storage", `The task list is too large to save (more than ${MAX_FILE_BYTES} bytes).`);
+          }
+          db.prepare("INSERT INTO tasklist (id, json) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET json = excluded.json").run(text);
+          db.exec("COMMIT");
+          return { list, result };
+        } catch (error) {
+          if (db.isTransaction) db.exec("ROLLBACK");
+          throw storageError(`cannot change ${this.file}`, error);
+        }
+      });
+    });
+  }
+
+  /** Changes an existing task list in one transaction. See `update`. */
+  async mutate<T>(change: (list: TaskList) => T): Promise<{ list: TaskList; result: T }> {
+    return this.update((list) => {
+      if (list === undefined) {
+        throw new TauError("storage", `The task list ${this.file} does not exist.`);
+      }
+      return { list, result: change(list) };
+    });
+  }
+
+  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(operation);
+    this.#queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Starts a write transaction. Waits while a different process has one. */
+  async #begin(db: DatabaseSync): Promise<void> {
+    const deadline = Date.now() + this.#lockTimeoutMs;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        db.exec("BEGIN IMMEDIATE");
+        return;
+      } catch (error) {
+        if (!isBusy(error)) throw storageError(`cannot start a change of ${this.file}`, error);
+      }
+      if (Date.now() >= deadline) {
+        throw new TauError("storage", `A different process changes the task list ${this.file} now. Try again later.`);
+      }
+      await sleep(Math.min(5 * 2 ** attempt, 100));
+    }
+  }
+
+  /** True when the database file exists. Rejects files that are not safe. */
+  async #exists(): Promise<boolean> {
+    let info;
+    try {
+      info = await lstat(this.file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw storageError(`cannot read ${this.file}`, error);
+    }
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new TauError("storage", `The task list ${this.file} is not a regular file. tau does not use it.`);
+    }
+    return true;
+  }
+
+  /** Makes the directory and the database file, only for the current user. */
+  async #prepare(): Promise<void> {
+    await prepareDirectory(dirname(this.file));
+    if (await this.#exists()) {
+      await secureFiles(this.file);
+      return;
+    }
+    try {
+      // Make the file before SQLite does, so that it has mode 0600. SQLite
+      // gives its WAL and SHM files the same mode.
+      const handle = await open(this.file, "wx", 0o600);
+      await handle.close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw storageError(`cannot create ${this.file}`, error);
+      }
+      await this.#exists();
+    }
+  }
+
+  async #withDatabase<T>(operation: (db: DatabaseSync) => Promise<T> | T): Promise<T> {
+    let db: DatabaseSync | undefined;
+    try {
+      try {
+        db = new DatabaseSync(this.file);
+        const opened = db;
+        opened.exec("PRAGMA busy_timeout = 0");
+        await this.#retryBusy(() => opened.exec("PRAGMA journal_mode = WAL"));
+        opened.exec("PRAGMA synchronous = FULL");
+        await this.#retryBusy(() => opened.exec(SCHEMA));
+      } catch (error) {
+        throw storageError(`cannot open ${this.file}`, error);
+      }
+      return await operation(db);
+    } finally {
+      db?.close();
+    }
+  }
+
+  async #retryBusy(operation: () => void): Promise<void> {
+    const deadline = Date.now() + this.#lockTimeoutMs;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        operation();
+        return;
+      } catch (error) {
+        if (!isBusy(error) || Date.now() >= deadline) throw error;
+      }
+      await sleep(Math.min(5 * 2 ** attempt, 100));
+    }
+  }
+}
+
+function readList(db: DatabaseSync, file: string): TaskList | undefined {
+  // One statement, so that the size and the text come from the same data.
+  // SQLite does not return the text when it is too large.
+  const row = db
+    .prepare(
+      "SELECT length(CAST(json AS BLOB)) AS size, CASE WHEN length(CAST(json AS BLOB)) <= ? THEN json END AS json FROM tasklist WHERE id = 1",
+    )
+    .get(MAX_FILE_BYTES) as { size: unknown; json: unknown } | undefined;
+  if (row === undefined) return undefined;
+  if (typeof row.size === "number" && row.size > MAX_FILE_BYTES) {
+    throw new TauError(
+      "storage",
+      `The task list ${file} has ${row.size} bytes. The maximum is ${MAX_FILE_BYTES}. tau does not use it.`,
+    );
+  }
+  if (typeof row.json !== "string") {
+    throw new TauError("storage", `The task list ${file} is not valid. tau does not change it.`);
+  }
+  return decodeTaskList(row.json, file);
+}
+
+/**
+ * Checks a directory that must exist already. Returns false when it does not
+ * exist. See `prepareDirectory` for the checks.
+ */
+async function checkDirectory(directory: string): Promise<boolean> {
+  try {
+    await lstat(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw storageError(`cannot read the directory ${directory}`, error);
+  }
+  await prepareDirectory(directory);
+  return true;
+}
+
+/**
+ * Removes access for other users from the database file and its WAL and
+ * SHM files, if they have it. An older version, or a different program, can
+ * have made them.
+ */
+async function secureFiles(file: string): Promise<void> {
+  for (const path of [file, `${file}-wal`, `${file}-shm`]) {
+    try {
+      const info = await lstat(path);
+      if (info.isSymbolicLink() || !info.isFile()) {
+        throw new TauError("storage", `${path} is not a regular file. tau does not use it.`);
+      }
+      if ((info.mode & 0o077) !== 0) {
+        await chmod(path, 0o600);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw storageError(`cannot check ${path}`, error);
+    }
+  }
+}
+
+/**
+ * Makes the directory if it does not exist, and makes sure that only the
+ * current user can use it: it must be a real directory (not a symbolic
+ * link), and the current user must own it. tau removes access for other
+ * users if the directory has it.
+ */
+async function prepareDirectory(directory: string): Promise<void> {
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const info = await lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new TauError("storage", `${directory} is not a directory. tau does not use it.`);
+    }
+    const uid = process.getuid?.();
+    if (uid !== undefined && info.uid !== uid) {
+      throw new TauError("storage", `${directory} belongs to a different user. tau does not use it.`);
+    }
+    if ((info.mode & 0o077) !== 0) {
+      await chmod(directory, 0o700);
+    }
+  } catch (error) {
+    throw storageError(`cannot prepare the directory ${directory}`, error);
+  }
+}
+
+function isBusy(error: unknown): boolean {
+  const code = (error as { errcode?: unknown } | undefined)?.errcode;
+  // The primary result code is in the low 8 bits (for example SQLITE_BUSY_SNAPSHOT).
+  return typeof code === "number" && (code & 0xff) === SQLITE_BUSY;
+}
+
+function storageError(message: string, error: unknown): TauError {
+  if (error instanceof TauError) return error;
+  const detail = error instanceof Error ? error.message : String(error);
+  return new TauError("storage", `The task list storage failed: ${message} (${detail}).`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
