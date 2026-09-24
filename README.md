@@ -48,10 +48,17 @@ not stop until all tasks are done.
 ## Herdr detection
 
 When pi starts, `tau` checks if herdr controls the current pane. The check
-passes when **both** conditions are true:
+passes when **all** conditions are true:
 
 - The environment variable `HERDR_ENV` is `1`.
-- The command `herdr pane current --current` succeeds.
+- The environment variable `HERDR_BIN_PATH` is an absolute path. Herdr sets
+  it to the path of its binary.
+- The command `herdr pane current --current` succeeds, and its reply
+  identifies a pane (the reply has a pane ID).
+
+`tau` runs only the herdr binary at `HERDR_BIN_PATH`. It does not search
+`PATH`, because a different `herdr` program in `PATH` can run with the
+permissions of pi.
 
 The result shows as a badge above the prompt box.
 
@@ -74,8 +81,13 @@ The result shows as a badge above the prompt box.
 ```
 
 When herdr is not available, `tau` does nothing else. It registers no tools, no
-commands, no keys, and no hooks. Pi runs in its standard mode. The badge is the
-only difference.
+commands, and no keys. Its only hooks are the `session_start` handler, which
+does the check and shows the badge, and the `session_shutdown` handler, which
+removes the badge. Pi runs in its standard mode. The badge is the only
+difference.
+
+`tau` does the check one time, in the first `session_start` event. The result
+stays the same until pi reloads the extension (`/reload`).
 
 ---
 

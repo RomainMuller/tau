@@ -1,0 +1,36 @@
+{
+  "name": "tau",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Opinionated pi harness: task lists, herdr sub-agents, and a do-not-stop rule.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RomainMuller/tau"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@earendil-works/pi-tui": "^0.87.1",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.3.34",
+    "typescript": "^7.0.2"
+  }
+}
