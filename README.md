@@ -18,10 +18,11 @@ not stop until all tasks are done.
 5. [Sub-tasks](#sub-tasks)
 6. [Delegation to sub-agents](#delegation-to-sub-agents)
 7. [The "do not stop" rule](#the-do-not-stop-rule)
-8. [Tools](#tools)
-9. [Commands and keys](#commands-and-keys)
-10. [Storage](#storage)
-11. [Configuration](#configuration)
+8. [Messages and notes](#messages-and-notes)
+9. [Tools](#tools)
+10. [Commands and keys](#commands-and-keys)
+11. [Storage](#storage)
+12. [Configuration](#configuration)
 
 ---
 
@@ -103,6 +104,7 @@ tasks it needs.
 | `owner`        | no       | The agent that claimed the task.                    |
 | `result`       | no       | Markdown. Set when the task closes.                 |
 | `retryable`    | no       | Set when the task fails. See [Rules](#rules).       |
+| `notes`        | no       | Shared findings. See [Notes](#notes).               |
 | `history`      | yes      | Each change, with time and agent. See [Fork](#fork).|
 
 ### Task IDs
@@ -195,6 +197,17 @@ Legend:
 | `⊘`  | `canceled`                                       |
 | `@x` | Agent `x` owns the task.                         |
 | `⧗`  | The task depends on these tasks.                 |
+| `✉n` | The owner has `n` messages that it did not read. |
+
+Example with messages that are not read yet:
+
+```text
+🟢 Herdr ─ 1 waiting · 3 running
+├─ ◐ T2    Add magic-link login endpoint         @lead ✉1
+│  ├─ ◐ T2.1  Create login_tokens table          @tau-t2-1 ✉2
+│  └─ ◐ T2.3  Add token cleanup job              @tau-t2-3
+└─ ○ T3    Update login page                     ⧗ T2
+```
 
 #### Colored ID pills
 
@@ -451,7 +464,8 @@ notifies you. You can change this limit in the
 
 Sometimes no task is ready: each open task waits for a different agent. Then
 the agent calls `tau_wait` with a list of tasks. The tool call blocks, and the
-agent uses no tokens, until each task in the list is closed.
+agent uses no tokens, until each task in the list is closed, or until a
+[message](#messages-and-notes) arrives for the agent.
 
 ```text
 ● tau_wait T2.1, T4
@@ -504,6 +518,83 @@ question" tool is available.
 
 ---
 
+## Messages and notes
+
+Agents can send messages to other agents, and add notes to tasks.
+
+- **Messages** go to one agent. Use them to steer a sub-agent, or to tell a
+  different agent about an important result now.
+- **Notes** stay on a task. Use them for findings that other agents can need
+  later.
+
+### Who can send a message to whom
+
+Messages follow the agent tree. An agent can send a message to:
+
+| Recipient                          | Typical use                          |
+|------------------------------------|--------------------------------------|
+| A sub-agent that it started, or a sub-agent of that sub-agent (any depth) | Steer the work. |
+| The agent that started it (its parent) | Report a finding or a problem.  |
+| A sibling: an agent with the same parent | Tell about a shared change.    |
+
+`tau_send` fails for all other recipients. The error tells the agent to send
+the message to its parent, which can forward it.
+
+### Priority
+
+Each message has a priority:
+
+| Priority | The recipient model gets the message                           |
+|----------|----------------------------------------------------------------|
+| `steer`  | After its current tool call. Use it to change the work now.    |
+| `info`   | At its next `tau_*` tool call, or at the end of its turn.      |
+
+With both priorities, a message stops a `tau_wait` call of the recipient. The
+message is the result of the `tau_wait` call.
+
+### How it looks
+
+The sender:
+
+```text
+● tau_send
+  to: @tau-t2-1
+  priority: steer
+  The tokens table must use the column name `expires_at`, not `expiry`.
+  T2.3 depends on that name.
+✔ Sent to @tau-t2-1 (T2.1)
+```
+
+The recipient, in its pane:
+
+```text
+✉ steer from @lead (T2)
+  The tokens table must use the column name `expires_at`, not `expiry`.
+  T2.3 depends on that name.
+```
+
+When the message reaches the model of the recipient, `tau` marks it as read,
+and the `✉` count in the tree goes down.
+
+### Notes
+
+Any agent can add a note to a task that it can see, with `tau_note`. A note has
+an author, a time, and a Markdown text. Notes do not change the task status,
+and the owner of the task does not have to be the author.
+
+```text
+● tau_note
+  task: T1
+  The session cookie is set in src/auth/session.ts:88, not in the middleware.
+✔ Added note 3 to T1
+```
+
+`tau_get` shows the notes of a task. `tau_list` shows the number of notes. Notes
+are part of the task `history`, so a [fork](#fork) keeps only the notes from
+before the fork point.
+
+---
+
 ## Tools
 
 All tools exist only when herdr is available.
@@ -520,7 +611,9 @@ All tools exist only when herdr is available.
 | `tau_cancel`    | Cancel a `waiting` task, with a reason.                       |
 | `tau_delegate`  | Start a sub-agent for a task, with a model and thinking.      |
 | `tau_abort`     | Stop a sub-agent and fail its task, with a reason.            |
-| `tau_wait`      | Wait until each task in a list is closed.                     |
+| `tau_wait`      | Wait until each task in a list is closed, or a message arrives. |
+| `tau_send`      | Send a message to an agent, with a priority.                  |
+| `tau_note`      | Add a note to a task.                                         |
 | `tau_ask_user`  | Last resort: ask the user a question, then end the turn.      |
 
 ### `tau_list`
@@ -571,8 +664,13 @@ compaction, or a session resume.
 ~/.pi/tau/
 ├── config.json
 └── tasklists/
-    └── <lead-session-id>.json
+    ├── <lead-session-id>.json
+    └── <lead-session-id>.messages/
+        └── <agent-name>.jsonl
 ```
+
+Each agent has one message file (its inbox). `tau` watches the inbox file of
+the current agent, and adds new messages to the conversation.
 
 `tau` does not hard-code this path. It uses the parent of the pi agent
 directory, with `tau` added:
