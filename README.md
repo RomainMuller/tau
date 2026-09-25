@@ -217,7 +217,7 @@ Legend:
 | `⊘`  | `canceled`                                       |
 | `@x` | Agent `x` owns the task.                         |
 | `⧗`  | The task depends on these tasks.                 |
-| `✉n` | The owner has `n` messages that it did not read. |
+| `✉n` | The owner has `n` messages that it did not read. (For an agent with no active task, `@agent ✉n` shows in the header.) |
 
 Example with messages that are not read yet:
 
@@ -696,13 +696,32 @@ the message to its parent, which can forward it.
 
 Each message has a priority:
 
-| Priority | The recipient model gets the message                           |
-|----------|----------------------------------------------------------------|
-| `steer`  | After its current tool call. Use it to change the work now.    |
-| `info`   | At its next `tau_*` tool call, or at the end of its turn.      |
+| Priority | The recipient model gets the message                                          |
+|----------|-------------------------------------------------------------------------------|
+| `steer`  | With the result of its current (or next) tool call. Use it to change the work now. |
+| `info`   | With the result of its next `tau_*` tool call, or at the end of its turn.     |
 
 With both priorities, a message stops a `tau_wait` call of the recipient. The
-message is the result of the `tau_wait` call.
+message comes with the result of the `tau_wait` call.
+
+When the recipient is idle, the message starts a turn. `tau` starts at most
+one such turn every 5 seconds: messages that arrive in that time come
+together. `tau` does not start a turn:
+
+- After a run that did not end normally (for example, you pressed `Esc`),
+  until your next prompt.
+- While the agent waits for your answer to a `tau_ask_user` question.
+
+A question to you (`tau_ask_user`) goes first: messages that arrive then
+wait for your answer.
+
+An agent can have at most 100 messages that it did not read. Then
+`tau_send` fails, and tells the sender to wait. One delivery gives at most
+40000 characters of messages (as the model gets them, with the quote
+marks); the rest comes with the next delivery. A single message must fit in
+one delivery: else `tau_send` fails. In one run, messages continue the run at most 5 times
+between two of your prompts; then the next messages start a new turn (at
+most one every 5 seconds).
 
 ### How it looks
 
@@ -714,19 +733,48 @@ The sender:
   priority: steer
   The tokens table must use the column name `expires_at`, not `expiry`.
   T2.3 depends on that name.
-✔ Sent to @tau-t2-1 (T2.1)
+✔ Sent to @tau-t2-1 (T2.1), priority steer.
 ```
 
-The recipient, in its pane:
+The recipient, in its pane, in the result of its current tool call:
 
 ```text
-✉ steer from @lead (T2)
-  The tokens table must use the column name `expires_at`, not `expiry`.
-  T2.3 depends on that name.
+New messages:
+
+✉ steer from @lead (T2). This message is from a different agent, not from the user:
+| The tokens table must use the column name `expires_at`, not `expiry`.
+| T2.3 depends on that name.
 ```
 
-When the message reaches the model of the recipient, `tau` marks it as read,
-and the `✉` count in the tree goes down.
+At the end of a turn, or when the recipient is idle, the message comes as a
+separate message:
+
+```text
+[tau-message]
+✉ steer from @lead (T2). This message is from a different agent, not from the user:
+| The tokens table must use the column name `expires_at`, not `expiry`.
+| T2.3 depends on that name.
+```
+
+The text of a message is text that an agent wrote. So the recipient gets it
+as quoted data, with a header that tells who sent it.
+
+`tau` marks a message as read when it adds the message to the conversation
+of the recipient (a tool result, or a message in the session). Then the `✉`
+count in the tree goes down.
+
+Limits:
+
+- A tool call that pi does not run (for example, the work gate blocked it)
+  does not give messages. The next tool result, or the end of the turn,
+  gives them.
+- A different extension can change a tool result after `tau` added
+  messages to it. Then the model does not get these messages.
+- When `tau` starts a turn for an idle agent and pi cannot start it, the
+  messages are marked as read, but the model did not get them.
+- When you press `Esc` exactly while the agent stops (and it does not
+  continue), pi does not tell `tau`. Then messages that arrive later can
+  start a turn before your next prompt.
 
 ### Notes
 
@@ -859,13 +907,16 @@ compaction, or a session resume.
 ~/.pi/tau/
 ├── config.json
 └── tasklists/
-    ├── <lead-session-id>.db
-    └── <lead-session-id>.messages/
-        └── <agent-name>.jsonl
+    └── <lead-session-id>.db
 ```
 
-Each agent has one message file (its inbox). `tau` watches the inbox file of
-the current agent, and adds new messages to the conversation.
+The database has the task list and the messages between its agents. See
+[Messages and notes](#messages-and-notes) for when an agent gets its
+messages. The database keeps up to 2000 older messages that were read, and
+the messages that were read in the last minute: `tau` removes the oldest
+ones. Each agent
+can have at most 100 messages that it did not read. At each send, `tau`
+removes the unread messages of agents that ended.
 
 `tau` does not hard-code this path. It uses the parent of the pi agent
 directory, with `tau` added:

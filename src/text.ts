@@ -16,9 +16,14 @@ const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu;
 // characters with no width, which can hide text.
 const BIDI = /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/gu;
 
-/** Removes control characters. Keeps line feeds and tabs. */
+// Unicode line and paragraph separators. A model or a terminal can show them
+// as a new line, so tau makes them line feeds: then each quoted line gets its
+// quote mark.
+const LINE_SEPARATOR = /[\u2028\u2029]/gu;
+
+/** Removes control characters. Keeps line feeds and tabs. Makes Unicode line separators line feeds. */
 export function cleanText(text: string): string {
-  return text.replace(ESCAPE_SEQUENCE, "").replace(CONTROL, "").replace(BIDI, "");
+  return text.replace(ESCAPE_SEQUENCE, "").replace(CONTROL, "").replace(BIDI, "").replace(LINE_SEPARATOR, "\n");
 }
 
 /** Removes control characters, and makes the text one line. */

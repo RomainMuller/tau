@@ -8,7 +8,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import { childrenOf, findTask, parentId, type Task, type TaskList, type TaskStatus } from "./tasks/model.ts";
+import { activeTask, childrenOf, findTask, parentId, type Task, type TaskList, type TaskStatus } from "./tasks/model.ts";
 import { cleanLine } from "./text.ts";
 
 export interface TreeOptions {
@@ -24,6 +24,8 @@ export interface TreeOptions {
   readonly width: number;
   /** The text of the badge, for example `🟢 Herdr`. */
   readonly badge: string;
+  /** The number of messages that each agent did not read. Shows as `✉n` on its active task. */
+  readonly unread?: ReadonlyMap<string, number>;
 }
 
 export const DEFAULT_MAX_TREE_LINES = 6;
@@ -111,7 +113,12 @@ function headerLine(list: TaskList | undefined, options: TreeOptions): string {
     const count = list.tasks.filter((task) => task.status === status).length;
     return count === 0 ? undefined : `${count} ${label}`;
   }).filter((item) => item !== undefined);
-  return `${options.badge} ${dim("─", options)} ${counts.join(dim(" · ", options))}`;
+  // An agent with unread messages and no active task: its count cannot show
+  // on a task line, so it shows here.
+  const mail = [...(options.unread ?? new Map<string, number>())]
+    .filter(([agent, count]) => count > 0 && activeTask(list, agent) === undefined)
+    .map(([agent, count]) => style(`@${cleanLine(agent)} ✉${count}`, "accent", options));
+  return `${options.badge} ${dim("─", options)} ${[...counts, ...mail].join(dim(" · ", options))}`;
 }
 
 /**
@@ -149,7 +156,9 @@ function visibleRows(list: TaskList, showClosed: boolean): Row[] {
 function extrasText(list: TaskList, task: Task, options: TreeOptions): string {
   const parts: string[] = [];
   if (task.owner !== undefined && task.status !== "waiting" && task.status !== "canceled") {
-    parts.push(style(`@${cleanLine(task.owner)}`, "accent", options));
+    const unread = options.unread?.get(task.owner) ?? 0;
+    const mail = unread > 0 && activeTask(list, task.owner)?.id === task.id ? ` ✉${unread}` : "";
+    parts.push(style(`@${cleanLine(task.owner)}${mail}`, "accent", options));
   }
   const shownDependencies = options.showClosed
     ? task.dependencies

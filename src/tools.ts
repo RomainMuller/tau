@@ -28,6 +28,8 @@ import {
 import type { TaskListStore } from "./tasks/store.ts";
 import type { TaskTypeDefinition } from "./tasks/types.ts";
 import { ASK_TOOL } from "./stop.ts";
+import { checkMessageText, checkRecipient, messagesText, PRIORITIES, type Priority } from "./messages.ts";
+import { MAX_DELIVERY_CHARS, type StoredMessage } from "./tasks/store.ts";
 import { cleanLine, cleanText } from "./text.ts";
 
 /** The state that the tools use. */
@@ -53,6 +55,14 @@ export interface TaskSession {
    * end, so no liveness check stops them later.
    */
   readonly stopAgents?: (agents: readonly AgentRecord[]) => Promise<readonly UnclosedPane[]>;
+  /**
+   * The inbox of this agent: `tau_wait` returns when a message arrives. (pi
+   * adds the messages to the tool result, see `index.ts`.) Without it,
+   * `tau_send` fails.
+   */
+  readonly inbox?: {
+    readonly hasMessages: () => Promise<boolean>;
+  };
   /** Called when the agent asks the user a question with `tau_ask_user`. */
   readonly onAskUser?: (question: string, ctx: ExtensionContext | undefined) => void;
 }
@@ -294,6 +304,64 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
   ];
 }
 
+function sendSpec(): ToolSpec {
+  return {
+    name: "tau_send",
+    label: "tau send",
+    description: [
+      "Send a message to a different agent: a sub-agent that you started (or one of its sub-agents), your parent agent, or a sibling (an agent with the same parent).",
+      'Priority "steer": the recipient gets it after its current tool call. Use it to change the work now.',
+      'Priority "info": the recipient gets it at its next tau tool call, or at the end of its turn.',
+      "A message also stops a tau_wait call of the recipient. Use tau_note for findings that other agents can need later.",
+    ].join("\n"),
+    promptSnippet: "Send a message to a different agent",
+    parameters: Type.Object({
+      to: Type.String({ description: 'The agent name, for example "lead" or "tau-t2-1".' }),
+      priority: Type.String({ description: 'The priority: "steer" or "info".' }),
+      text: Type.String({ description: "The message, in Markdown.", minLength: 1 }),
+    }),
+    run: async (session, params) => {
+      if (session.inbox === undefined) {
+        throw new TauError("invalid_state", "tau cannot send messages in this session.");
+      }
+      const to = String(params.to).replace(/^@/u, "");
+      const priority = String(params.priority);
+      if (!(PRIORITIES as readonly string[]).includes(priority)) {
+        throw new TauError("invalid_argument", `${JSON.stringify(priority)} is not a priority. Use "steer" or "info".`);
+      }
+      const text = checkMessageText(String(params.text));
+      let recipientTask: string | undefined;
+      const sender = session.actor.name;
+      await session.store.sendMessage(
+        { sender, recipient: to, priority: priority as Priority, text, sentAt: session.now() },
+        (list) => {
+          recipientTask = checkRecipient(list, sender, to);
+          const senderTask = activeTask(list, sender)?.id;
+          checkQuotedSize({ id: 0, sender, recipient: to, priority: priority as Priority, text, sentAt: "", ...(senderTask === undefined ? {} : { senderTask }) });
+          return { senderTask };
+        },
+      );
+      session.onChange?.();
+      return `Sent to @${to}${recipientTask === undefined ? "" : ` (${recipientTask})`}, priority ${priority}.`;
+    },
+  };
+}
+
+/**
+ * One delivery gives at most `MAX_DELIVERY_CHARS` characters, as the model
+ * gets them (the header, and quote marks on each line). So a message must fit
+ * alone. The size includes the sender task that the header shows.
+ */
+function checkQuotedSize(message: StoredMessage): void {
+  const size = messagesText([message]).length + 2;
+  if (size > MAX_DELIVERY_CHARS) {
+    throw new TauError(
+      "invalid_argument",
+      `The message is too long: with its header and quote marks it has ${size} characters, and the maximum is ${MAX_DELIVERY_CHARS}. Make it shorter (for example, use fewer lines), or put the details in a task note.`,
+    );
+  }
+}
+
 function abortSpec(): ToolSpec {
   return {
     name: "tau_abort",
@@ -435,7 +503,7 @@ function delegationSpecs(): ToolSpec[] {
       name: "tau_wait",
       label: "tau wait",
       description:
-        "Wait until each task in the list is closed. The call uses no tokens while it waits. It returns at once when one task fails, so that you can react. Use it to wait for sub-agents, or for tasks of other agents that your work depends on.",
+        "Wait until each task in the list is closed. The call uses no tokens while it waits. It returns at once when one task fails, or when a message for you arrives (the result gives the message), so that you can react. Use it to wait for sub-agents, or for tasks of other agents that your work depends on.",
       promptSnippet: "Wait for tasks to close",
       parameters: Type.Object({
         ids: Type.Array(ID("A task ID."), { description: "The tasks to wait for.", minItems: 1 }),
@@ -475,7 +543,9 @@ export async function waitForTasks(
     const done = tasks.every((task) => isClosed(task));
     const timedOut = deadline !== undefined && Date.now() >= deadline;
     const aborted = options.signal?.aborted === true;
-    if (done || failed.length > 0 || timedOut || aborted) {
+    // A message for this agent stops the wait. The tool result gives it.
+    const message = (await session.inbox?.hasMessages().catch(() => false)) === true;
+    if (done || failed.length > 0 || timedOut || aborted || message) {
       const seconds = Math.round((Date.now() - started) / 1_000);
       const header = done
         ? `All ${tasks.length} tasks are closed (after ${seconds} s).`
@@ -483,7 +553,9 @@ export async function waitForTasks(
           ? `${failed.map((task) => task.id).join(", ")} failed (after ${seconds} s). Other tasks can still be open.`
           : aborted
             ? "The wait was stopped."
-            : `The time ended (after ${seconds} s). Some tasks are still open.`;
+            : message
+              ? `A message arrived (after ${seconds} s). Read it below, then call tau_wait again if necessary.`
+              : `The time ended (after ${seconds} s). Some tasks are still open.`;
       const lines = tasks.map((task) => {
         const extra =
           task.status === "failed"
@@ -501,7 +573,7 @@ export async function waitForTasks(
 
 /** The names of all task tools. */
 export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set(
-  [...specs({}), ...delegationSpecs(), abortSpec(), askSpec()].map((spec) => spec.name),
+  [...specs({}), ...delegationSpecs(), sendSpec(), abortSpec(), askSpec()].map((spec) => spec.name),
 );
 
 /**
@@ -518,7 +590,7 @@ export function conflictingTools(pi: ExtensionAPI): string[] {
 
 /** Registers the task tools. */
 export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void {
-  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), abortSpec(), askSpec()]) {
+  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), sendSpec(), abortSpec(), askSpec()]) {
     pi.registerTool({
       name: spec.name,
       label: spec.label,

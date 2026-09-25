@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { badgeText, WIDGET_KEY, widgetLines } from "./badge.ts";
+import { Inbox } from "./inbox.ts";
+import { MESSAGE_TYPE, messagesText } from "./messages.ts";
 import { registerCommands } from "./commands.ts";
 import { checkGate } from "./gate.ts";
 import { HerdrClient } from "./herdr-client.ts";
@@ -30,6 +32,8 @@ export interface TauDependencies {
   readonly env?: NodeJS.ProcessEnv;
   /** The time between two liveness checks, in milliseconds. */
   readonly superviseMs?: number;
+  /** The time between two polls of the inbox, in milliseconds. */
+  readonly inboxMs?: number;
 }
 
 const DEFAULT_DEPENDENCIES: TauDependencies = {
@@ -66,6 +70,7 @@ export interface TauHandle {
   readonly widget: TreeWidget | undefined;
   readonly supervisor: Supervisor | undefined;
   readonly identity: Identity | undefined;
+  readonly inbox: Inbox | undefined;
 }
 
 export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
@@ -74,6 +79,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   let session: TaskSession | undefined;
   let widget: TreeWidget | undefined;
   let supervisor: Supervisor | undefined;
+  let messageInbox: Inbox | undefined;
   let identity: Identity | undefined;
   let herdrClient: HerdrClient | undefined;
   let paneOfThisAgent: string | undefined;
@@ -148,6 +154,16 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       ...(deps.superviseMs === undefined ? {} : { intervalMs: deps.superviseMs }),
     });
     supervisor = watcher;
+    const inbox = new Inbox({
+      store,
+      agent: identity.actor.name,
+      now: deps.now,
+      isIdle: () => ctx.isIdle(),
+      deliver: (text) => pi.sendMessage({ customType: MESSAGE_TYPE, content: text, display: true }, { triggerTurn: true }),
+      onChange: () => void tree.refresh(),
+      ...(deps.inboxMs === undefined ? {} : { intervalMs: deps.inboxMs }),
+    });
+    messageInbox = inbox;
     const guard = new StopGuard({
       actor: identity.actor,
       read: () => store.read(),
@@ -182,6 +198,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
           return outcome === "closed" ? [] : [{ agent: agent.name, pane: agent.pane, outcome }];
         });
       },
+      inbox,
       onAskUser: (_question, toolCtx) => {
         const target = toolCtx ?? ctx;
         if (target.hasUI) {
@@ -191,7 +208,13 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     };
     registerTaskTools(pi, session);
     registerWorkGate(pi, session);
+    // The tracker must see the final decision of the settle boundary, but
+    // the delivery reads it in agent_settled: register the tracker last, and
+    // give the delivery a function that reads its state.
+    let continuationPending: () => boolean = () => false;
+    registerMessageDelivery(pi, inbox, guard, () => continuationPending());
     registerStopRule(pi, guard, identity.actor);
+    continuationPending = registerContinuationTracker(pi);
     registerCommands(pi, store, tree, badgeLabel(status, identity));
     await tree.refresh();
     if (shutDown) {
@@ -203,6 +226,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     }
     tree.start();
     watcher.start();
+    inbox.start();
     void watcher.check();
     reporting = reportPane(herdr, status.pane.paneId, identity, store);
   });
@@ -211,6 +235,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     shutDown = true;
     widget?.stop();
     supervisor?.stop();
+    messageInbox?.stop();
+    // A poll can run now: wait for it before the store closes.
+    await messageInbox?.drain();
     session?.store.close();
     if (herdrClient !== undefined && paneOfThisAgent !== undefined && identity !== undefined) {
       // The pane can stay open after pi stops: remove the tau metadata. Wait
@@ -234,6 +261,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     },
     get identity() {
       return identity;
+    },
+    get inbox() {
+      return messageInbox;
     },
   };
 }
@@ -266,6 +296,102 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
     return reason === undefined ? undefined : { block: true, reason };
   });
 }
+
+/**
+ * The delivery of messages while the agent works (see `inbox.ts`):
+ *
+ * - Each tool result gets the `steer` messages; a `tau_*` tool result gets
+ *   all messages.
+ * - At the end of a run, tau adds all messages to the conversation, and asks
+ *   pi for one more model request. This handler runs before the stop rule,
+ *   which then does nothing (the run continues). When the agent waits for an
+ *   answer of the user, the messages wait too.
+ *
+ * pi writes these into the session, so the messages reach the model. After a
+ * run that did not end normally (for example `Esc`), and while the agent
+ * waits for an answer, the inbox does not start turns until the next input
+ * of the user.
+ */
+function registerMessageDelivery(
+  pi: ExtensionAPI,
+  inbox: Inbox,
+  guard: StopGuard,
+  continuationPending: () => boolean,
+): void {
+  /** Continuations for messages since the last user input. See `MAX_MESSAGE_CONTINUATIONS`. */
+  let continuations = 0;
+  pi.on("input", (event) => {
+    if (event.source !== "extension") {
+      inbox.resume();
+      continuations = 0;
+    }
+    return undefined;
+  });
+  pi.on("tool_result", async (event) => {
+    // A successful tau_ask_user ends the turn: the model sees nothing more
+    // before the answer of the user. The messages wait.
+    if (event.toolName === ASK_TOOL && !event.isError) return undefined;
+    const messages = await inbox.take(TASK_TOOL_NAMES.has(event.toolName) ? undefined : "steer").catch(() => []);
+    if (messages.length === 0) return undefined;
+    return { content: [...event.content, { type: "text", text: `\n\nNew messages:\n\n${messagesText(messages)}` }] };
+  });
+  // True after a settle boundary with the outcome `completed`, until the next
+  // turn ends. pi skips the boundary after an abort: then this stays false.
+  let settledNormally = false;
+  pi.on("turn_end", () => {
+    settledNormally = false;
+    return undefined;
+  });
+  pi.on("agent_before_settle", async (event) => {
+    settledNormally = event.outcome === "completed";
+    if (event.outcome !== "completed" || event.continue) return undefined;
+    if (guard.awaitingAnswer) {
+      inbox.pause();
+      return undefined;
+    }
+    // Many messages must not make many model requests in one run: after the
+    // limit, the idle inbox gives the rest (at most one turn in its gap).
+    if (continuations >= MAX_MESSAGE_CONTINUATIONS) return undefined;
+    const messages = await inbox.take().catch(() => []);
+    if (messages.length === 0) return undefined;
+    continuations += 1;
+    return {
+      entries: [...event.entries, { type: "custom_message", customType: MESSAGE_TYPE, content: messagesText(messages), display: true }],
+      continue: true,
+    };
+  });
+  pi.on("agent_settled", () => {
+    if (!settledNormally || continuationPending()) inbox.pause();
+    settledNormally = false;
+  });
+}
+
+/**
+ * Records if the last settle boundary asked pi to continue the run. Register
+ * it after all other `agent_before_settle` handlers of tau, so that it sees
+ * the final decision. When the run settles and the continuation did not start
+ * (no `turn_start` after the boundary), the user stopped the run during the
+ * boundary (Esc). pi emits no event for that abort.
+ */
+function registerContinuationTracker(pi: ExtensionAPI): () => boolean {
+  let pending = false;
+  pi.on("agent_before_settle", (event) => {
+    pending = event.continue;
+    return undefined;
+  });
+  pi.on("turn_start", () => {
+    pending = false;
+  });
+  pi.on("agent_settled", () => {
+    // After the other agent_settled handlers of tau (they run in the order
+    // of registration).
+    pending = false;
+  });
+  return () => pending;
+}
+
+/** The maximum number of continuations for messages between two user inputs. */
+export const MAX_MESSAGE_CONTINUATIONS = 5;
 
 /**
  * The "do not stop" rule. See `stop.ts`. Each input from the user starts

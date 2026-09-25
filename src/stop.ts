@@ -264,6 +264,11 @@ export class StopGuard {
     this.#asked = only !== undefined && only.toolName === ASK_TOOL && !only.isError;
   }
 
+  /** True when the last turn was a question to the user (`tau_ask_user`): the next stop waits for the answer. */
+  get awaitingAnswer(): boolean {
+    return this.#asked;
+  }
+
   /**
    * A different extension continued the run. The next stop is not the stop
    * for the question, so the rule applies to it.

@@ -77,6 +77,7 @@ describe("task tools", () => {
       "tau_get",
       "tau_list",
       "tau_note",
+      "tau_send",
       "tau_update",
       "tau_wait",
     ]);

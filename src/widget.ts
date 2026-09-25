@@ -29,6 +29,7 @@ export class TreeWidget {
   readonly #store: TaskListStore;
   readonly #options: Required<TreeWidgetOptions>;
   #list: TaskList | undefined;
+  #unread: ReadonlyMap<string, number> = new Map();
   #showClosed = false;
   #tui: TUI | undefined;
   #timer: ReturnType<typeof setInterval> | undefined;
@@ -58,6 +59,7 @@ export class TreeWidget {
       color: this.#options.color,
       width,
       badge: this.#options.badge,
+      unread: this.#unread,
     });
   }
 
@@ -87,8 +89,12 @@ export class TreeWidget {
     this.#refreshing ??= (async () => {
       try {
         const list = await this.#store.read();
-        if (list?.revision !== this.#list?.revision || list?.sessionId !== this.#list?.sessionId) {
+        const unread = await this.#store.unreadCounts().catch(() => this.#unread);
+        const unreadChanged =
+          unread.size !== this.#unread.size || [...unread].some(([agent, count]) => this.#unread.get(agent) !== count);
+        if (list?.revision !== this.#list?.revision || list?.sessionId !== this.#list?.sessionId || unreadChanged) {
           this.#list = list;
+          this.#unread = unread;
           this.#tui?.requestRender();
         }
       } catch {
