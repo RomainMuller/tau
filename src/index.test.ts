@@ -17,6 +17,7 @@ interface FakePi {
   readonly execCalls: string[][];
   /** The names of all other API members that the extension used. */
   readonly otherCalls: string[];
+  readonly tools: Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>;
 }
 
 /**
@@ -28,7 +29,12 @@ function fakePi(reply: { code: number; stdout: string }): FakePi {
   const handlers = new Map<string, Handler[]>();
   const execCalls: string[][] = [];
   const otherCalls: string[] = [];
+  const tools = new Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>();
   const known = {
+    getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+    registerTool(tool: { name: string; execute: (id: string, params: unknown) => Promise<unknown> }) {
+      tools.set(tool.name, tool);
+    },
     on(event: string, handler: Handler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
       return () => undefined;
@@ -48,7 +54,7 @@ function fakePi(reply: { code: number; stdout: string }): FakePi {
       };
     },
   }) as unknown as ExtensionAPI;
-  return { api, handlers, execCalls, otherCalls };
+  return { api, handlers, execCalls, otherCalls, tools };
 }
 
 function fakeCtx(hasUI = true, sessionId = "session-1") {
@@ -314,5 +320,82 @@ describe("tau extension", () => {
     assert.equal(notices.length, 1);
     assert.match(notices[0]?.message ?? "", /not a database/);
     assert.equal(await readFile(join(directory, "abc.db"), "utf8"), "{ broken");
+  });
+
+  it("registers the task tools and the work gate when herdr is available", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "gate-1");
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", ctx);
+
+    assert.ok(pi.tools.has("tau_claim"));
+    const gate = pi.handlers.get("tool_call")?.[0];
+    assert.ok(gate, "a tool_call handler is registered");
+    const blocked = (await gate({ type: "tool_call", toolName: "bash", toolCallId: "1", input: {} }, ctx)) as {
+      block: boolean;
+      reason: string;
+    };
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /no active task/);
+    assert.equal(await gate({ type: "tool_call", toolName: "tau_list", toolCallId: "2", input: {} }, ctx), undefined);
+
+    await pi.tools.get("tau_claim")!.execute("3", { id: "T0" });
+    assert.equal(await gate({ type: "tool_call", toolName: "bash", toolCallId: "4", input: {} }, ctx), undefined);
+  });
+
+  it("registers the tools only one time for sessions that start later", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", fakeCtx(true, "once").ctx);
+    await emit(pi, "session_start", fakeCtx(true, "once").ctx);
+
+    assert.equal(pi.handlers.get("tool_call")?.length, 1);
+  });
+
+  it("registers no tools and no gate when the task list cannot be opened", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", fakeCtx(true, "../bad").ctx);
+
+    assert.equal(pi.tools.size, 0);
+    assert.equal(pi.handlers.get("tool_call"), undefined);
+  });
+
+  it("blocks tools when the task list cannot be read", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "broken-later");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    await rm(join(root, "tau", "tasklists", "broken-later.db"));
+    await writeFile(join(root, "tau", "tasklists", "broken-later.db"), "not a database");
+
+    const gate = pi.handlers.get("tool_call")![0]!;
+    const result = (await gate({ type: "tool_call", toolName: "bash", toolCallId: "1", input: {} }, ctx)) as {
+      block: boolean;
+      reason: string;
+    };
+    assert.equal(result.block, true);
+    assert.match(result.reason, /cannot read the task list/);
+  });
+
+  it("registers no tools and no gate when a different extension uses a tau tool name", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    pi.tools.set("tau_get", { execute: async () => undefined });
+    const { ctx, notices } = fakeCtx(true, "conflict");
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", ctx);
+
+    assert.equal(pi.handlers.get("tool_call"), undefined);
+    assert.equal(pi.tools.size, 1);
+    assert.match(notices[0]?.message ?? "", /tau_get/);
   });
 });

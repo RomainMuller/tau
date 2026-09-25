@@ -132,6 +132,14 @@ export function updateTask(list: TaskList, ctx: RuleContext, id: string, changes
     checked.title = checkTitle(changes.title);
   }
   if (changes.type !== undefined && changes.type !== task.type) {
+    if (task.status !== "waiting") {
+      // The type selects the rules of the work gate (for example read-only),
+      // so the owner cannot change it after the claim.
+      throw new TauError(
+        "invalid_state",
+        `Task ${task.id} is ${task.status}. You can change the type only while a task is waiting. Create a new task for a different type of work.`,
+      );
+    }
     checked.type = checkType(ctx, changes.type);
   }
   if (changes.description !== undefined && changes.description !== (task.description ?? "")) {

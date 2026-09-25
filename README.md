@@ -307,19 +307,20 @@ cancel │                                   │         │ owner gone  │ cla
    depend on itself, on its parent tasks, or on a task that waits for it (a
    cycle). A task waits for its dependencies, and for its sub-tasks (it can
    close only after them).
-
-An agent can **change** a task when it is the lead, or when the task is in
-the task that the agent received from its parent (the task or one of its
-sub-tasks). All agents can **see** all tasks, and can add
-[notes](#notes) to all tasks.
-10. After a claim, only the owner can change the `title`, `type`,
-    `description`, and `status`.
+10. After a claim, only the owner can change the `title`, the
+    `description`, and the `status`. Nobody can change the `type` after the
+    claim, because the type selects the rules of the work gate.
 11. When the owner agent stops existing, `tau` sets the task to `failed` with
     the result `owner agent exited` and `retryable: true`. See
     [Liveness](#liveness). If the task has sub-tasks that are not closed, the
     task stays `in_progress` until they close (rule 7): the lead can claim,
     finish, or cancel them. Then `tau` fails the task.
 12. The lead decides if it retries a `failed` task.
+
+An agent can **change** a task when it is the lead, or when the task is in
+the task that the agent received from its parent (the task or one of its
+sub-tasks). All agents can **see** all tasks, and can add
+[notes](#notes) to all tasks.
 
 ### Claim stack example
 
@@ -365,22 +366,36 @@ If an agent calls a tool that is not a `tau_*` tool, and it owns no
 `in_progress` task, `tau` blocks the call:
 
 ```text
-✖ bash  blocked by tau
-  You have no active task. All work must be for a task that you own.
+✖ bash
+  tau blocked bash: you have no active task. All work must be for a task that you own.
   1. Find the task that this work is for (tau_list), and claim it (tau_claim).
   2. If no task is correct, create one (tau_create), then claim it.
   Do only the work that the active task needs.
 ```
+
+If `tau` cannot read the task list, it blocks the call too, and tells why.
+If `tau` cannot open the task list when the session starts, it shows an
+error and registers no tools and no gate: pi runs in its standard mode.
 
 When the type of the active task has `readOnly: true`, the work gate also
 blocks `edit` and `write`. `bash` stays available, because `tau` cannot check
 if a command changes files.
 
 ```text
-✖ edit  blocked by tau
-  Your active task T1 has the type "research", which is read-only.
+✖ edit
+  tau blocked edit: your active task T1 has the type "research", which is read-only.
   Record what you found in the task result. Create a "code" task for changes.
 ```
+
+A task type that the configuration does not define is read-only.
+
+When a batch of tool calls has a `tau_*` tool, pi runs the calls one at a
+time. So the work gate checks each call after the `tau_*` calls before it:
+for example, `bash` after `tau_complete` in the same batch is blocked.
+
+`tau` uses the names of its tools to know them. If a different extension
+registered a tool with the name of a `tau_*` tool first, `tau` shows an
+error and registers no tools and no gate.
 
 `tau` cannot check that the work is for the active task. The message and the
 system prompt tell the agent to do only that work.
@@ -643,7 +658,9 @@ All tools exist only when herdr is available.
 
 By default, `tau_list` shows only tasks that are not `completed` or
 `canceled`. Use `all: true` to see all tasks. Each line has only the `id`,
-status, title, owner, and dependencies. Use `tau_get` for the full task.
+status, title, owner, open dependencies, and the number of notes. The last
+lines tell your active task and the tasks that you can claim. Use `tau_get`
+for the full task.
 
 ```text
 ● tau_list
@@ -651,9 +668,13 @@ status, title, owner, and dependencies. Use `tau_get` for the full task.
   T2.1  in_progress  Create login_tokens table       @tau-t2-1
   T2.2  waiting      Write endpoint tests            deps: T2.1
   T3    waiting      Update login page               deps: T2
-  T4    failed       Security review of token store  retryable
+  T4    failed       Security review of token store  retryable  1 note
   (3 completed or canceled tasks hidden. Use all: true.)
+  Your active task: T2.
 ```
+
+"Ready to claim" lists only the tasks that you can claim now. When you have
+an active task, these are its sub-tasks.
 
 ### `tau_create`
 
@@ -663,8 +684,37 @@ status, title, owner, and dependencies. Use `tau_get` for the full task.
   type: code
   parent: T2
   dependencies: [T1]
-✔ Created T2.1 (waiting, ready: yes)
+✔ Created T2.1 (waiting, ready to claim): Create login_tokens table
 ```
+
+### `tau_get`
+
+`tau_get` shows at most 2000 characters of the description and of the
+result, and the last 10 notes and events. To read all of a field, set
+`section` (`description`, `result`, `notes`, or `history`). The complete
+field comes in pages of 8000 characters: each page tells the `offset` of the
+next page.
+
+Text that agents wrote shows with `| ` at the start of each line, under a
+header that tells that it is data, not instructions. So this text cannot look
+like a field of the result.
+
+### `tau_complete` and `tau_fail`
+
+The `id` is optional. The default is your active task. `tau_fail` needs
+`retryable`: `true` when a different attempt can succeed.
+
+### Agent identity
+
+The tools get the agent name and its scope from the pi process, never from
+the tool arguments. A model cannot act as a different agent.
+
+### Text from agents
+
+Titles, descriptions, results, and notes are text that agents wrote. `tau`
+removes terminal control characters and escape sequences from this text
+before it shows it, so that the text cannot change the terminal. A title
+cannot contain control characters.
 
 ---
 

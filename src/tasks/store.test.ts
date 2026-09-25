@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -334,6 +334,62 @@ describe("TaskListStore transactions", () => {
     db.prepare("UPDATE tasklist SET json = ? WHERE id = 1").run(" ".repeat(MAX_FILE_BYTES + 1));
     db.close();
     await assert.rejects(store.read(), /maximum/);
+  });
+});
+
+describe("TaskListStore read cache", () => {
+  it("sees changes of the same store, of a different store, and of a different connection", async () => {
+    const reader = new TaskListStore(file);
+    await reader.ensure(() => seedTaskList("s1", NOW));
+    assert.equal((await reader.read())?.tasks.length, 1);
+
+    await reader.mutate((list) => createTask(list, LEAD, { title: "A", type: "code" }));
+    assert.equal((await reader.read())?.tasks.length, 2);
+
+    await new TaskListStore(file).mutate((list) => createTask(list, LEAD, { title: "B", type: "code" }));
+    assert.equal((await reader.read())?.tasks.length, 3);
+
+    const raw = new DatabaseSync(file);
+    const json = (raw.prepare("SELECT json FROM tasklist").get() as { json: string }).json;
+    raw.prepare("UPDATE tasklist SET json = ?").run(json.replace('"title": "B"', '"title": "B!"'));
+    raw.close();
+    // The raw change makes the list invalid (the title does not agree with the history), and the cache must not hide that.
+    await assert.rejects(reader.read(), /not the result of their history/);
+    reader.close();
+  });
+
+  it("reads the new file when a different program replaces the database file", async () => {
+    const store = new TaskListStore(file);
+    await store.ensure(() => seedTaskList("s1", NOW));
+    assert.equal((await store.read())?.tasks.length, 1);
+
+    const other = join(dir, "other.db");
+    const replacement = new TaskListStore(other);
+    await replacement.ensure(() => seedTaskList("s1", NOW));
+    await replacement.mutate((list) => createTask(list, LEAD, { title: "New", type: "code" }));
+    await rename(other, file);
+
+    assert.equal((await store.read())?.tasks.length, 2);
+    store.close();
+  });
+
+  it("returns a copy, so that a caller cannot change the cache", async () => {
+    const store = new TaskListStore(file);
+    await store.ensure(() => seedTaskList("s1", NOW));
+    const first = await store.read();
+    first!.tasks.length = 0;
+    assert.equal((await store.read())?.tasks.length, 1);
+    store.close();
+  });
+
+  it("opens the connection again after close", async () => {
+    const store = new TaskListStore(file);
+    await store.ensure(() => seedTaskList("s1", NOW));
+    await store.read();
+    store.close();
+    store.close();
+    assert.equal((await store.read())?.tasks.length, 1);
+    store.close();
   });
 });
 

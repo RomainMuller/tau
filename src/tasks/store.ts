@@ -48,6 +48,18 @@ export class TaskListStore {
   readonly #lockTimeoutMs: number;
   /** Operations of this process run one at a time. */
   #queue: Promise<unknown> = Promise.resolve();
+  /**
+   * A connection that stays open for reads, and the last list that it read.
+   * SQLite increments `PRAGMA data_version` of a connection when a different
+   * connection (in this process or in a different process) commits a change.
+   * When the version did not change, `read` returns the cached list, and
+   * does not decode the data again. The work gate reads the list before each
+   * tool call, so this keeps that cheap.
+   */
+  #reader: DatabaseSync | undefined;
+  /** The device and inode of the file that `#reader` opened. */
+  #readerFile: { dev: number; ino: number } | undefined;
+  #cache: { version: number; list: TaskList } | undefined;
 
   constructor(file: string, options: StoreOptions = {}) {
     this.file = file;
@@ -57,11 +69,72 @@ export class TaskListStore {
   /** Reads the task list. Returns `undefined` when there is no task list. */
   async read(): Promise<TaskList | undefined> {
     return this.#enqueue(async () => {
-      if (!(await checkDirectory(dirname(this.file)))) return undefined;
-      if (!(await this.#exists())) return undefined;
-      await secureFiles(this.file);
-      return this.#withDatabase((db) => readList(db, this.file));
+      const reader = await this.#openReader();
+      if (reader === undefined) return undefined;
+      let version: number;
+      let list: TaskList | undefined;
+      try {
+        version = Number((reader.prepare("PRAGMA data_version").get() as { data_version: number }).data_version);
+        if (this.#cache?.version === version) {
+          return structuredClone(this.#cache.list);
+        }
+        const table = reader.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'tasklist'").get();
+        list = table === undefined ? undefined : readList(reader, this.file);
+      } catch (error) {
+        this.close();
+        throw storageError(`cannot read ${this.file}`, error);
+      }
+      this.#cache = list === undefined ? undefined : { version, list: structuredClone(list) };
+      return list;
     });
+  }
+
+  /** Closes the read connection. The next `read` opens it again. */
+  close(): void {
+    this.#cache = undefined;
+    try {
+      this.#reader?.close();
+    } catch {
+      // It is closed already.
+    }
+    this.#reader = undefined;
+    this.#readerFile = undefined;
+  }
+
+  /**
+   * Opens the read connection if it is not open. Checks the directory and
+   * the files first. Returns `undefined` when the database does not exist.
+   */
+  async #openReader(): Promise<DatabaseSync | undefined> {
+    if (this.#reader !== undefined) {
+      // A different program can replace or remove the file. Then the open
+      // connection reads the old file: open the new file.
+      const now = await lstat(this.file).catch(() => undefined);
+      if (now !== undefined && now.dev === this.#readerFile?.dev && now.ino === this.#readerFile.ino) {
+        return this.#reader;
+      }
+      this.close();
+    }
+    if (!(await checkDirectory(dirname(this.file)))) return undefined;
+    if (!(await this.#exists())) return undefined;
+    await secureFiles(this.file);
+    // Keep the identity of the file from before the open. If a different
+    // program replaces the file after this lstat, the identity does not
+    // agree with the file at the next read, and that read opens it again.
+    const info = await lstat(this.file).catch(() => undefined);
+    let db: DatabaseSync | undefined;
+    try {
+      db = new DatabaseSync(this.file);
+      db.exec("PRAGMA busy_timeout = 0");
+      const opened = db;
+      await this.#retryBusy(() => opened.exec("PRAGMA journal_mode = WAL"));
+    } catch (error) {
+      db?.close();
+      throw storageError(`cannot open ${this.file}`, error);
+    }
+    this.#reader = db;
+    this.#readerFile = info === undefined ? undefined : { dev: info.dev, ino: info.ino };
+    return db;
   }
 
   /**
