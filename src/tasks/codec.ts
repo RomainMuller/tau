@@ -88,6 +88,7 @@ function checkList(value: unknown): TaskList {
     }
     names.add(agent.name);
   }
+  checkAgentTree(agents);
   return {
     version: 1,
     sessionId: string(list.sessionId, "sessionId"),
@@ -129,6 +130,29 @@ function checkAgent(value: unknown, where: string): AgentRecord {
   if (agent.session !== undefined) result.session = string(agent.session, `${where}.session`);
   if (agent.endedAt !== undefined) result.endedAt = string(agent.endedAt, `${where}.endedAt`);
   return result;
+}
+
+/**
+ * Checks that the parent links of the agent records make a tree under the
+ * lead: each chain of parents ends at the lead, with no cycle. A parent that
+ * is not the lead must have a record. Else `tau_abort` and the liveness
+ * check cannot know who started whom.
+ */
+function checkAgentTree(agents: readonly { readonly name: string; readonly parent: string }[]): void {
+  const parents = new Map(agents.map((agent) => [agent.name, agent.parent]));
+  for (const agent of agents) {
+    const seen = new Set<string>();
+    for (let current = agent.name; current !== LEAD_AGENT; current = parents.get(current)!) {
+      if (seen.has(current)) {
+        throw new ShapeError(`the agent records have a cycle of parents at ${agent.name}`);
+      }
+      seen.add(current);
+      const parent = parents.get(current)!;
+      if (parent !== LEAD_AGENT && !parents.has(parent)) {
+        throw new ShapeError(`the parent ${parent} of agent ${current} does not exist`);
+      }
+    }
+  }
 }
 
 /**

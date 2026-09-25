@@ -67,6 +67,7 @@ export interface CreateInput {
 }
 
 export function createTask(list: TaskList, ctx: RuleContext, input: CreateInput): Task {
+  checkNotEnded(list, ctx);
   const title = checkTitle(input.title);
   const type = checkType(ctx, input.type);
   const description = checkOptionalText("description", input.description);
@@ -116,6 +117,7 @@ export function createTask(list: TaskList, ctx: RuleContext, input: CreateInput)
 }
 
 export function updateTask(list: TaskList, ctx: RuleContext, id: string, changes: TaskChanges): Task {
+  checkNotEnded(list, ctx);
   const task = getTask(list, checkId(id));
   checkScope(ctx, task.id);
   if (task.status === "in_progress") {
@@ -261,10 +263,22 @@ export function setAgentSession(list: TaskList, name: string, session: string): 
   return agent;
 }
 
-/** Records that a sub-agent started and is ready for input. */
+/**
+ * Records that a sub-agent started and is ready for input. Throws when the
+ * agent ended while it started (for example, a different agent aborted it).
+ */
 export function markAgentRunning(list: TaskList, name: string): AgentRecord {
-  const agent = getAgent(list, name);
+  const agent = checkAgentNotEnded(list, name);
   if (agent.state === "starting") agent.state = "running";
+  return agent;
+}
+
+/** Returns the record of a sub-agent. Throws when the agent ended (for example, an agent aborted it). */
+export function checkAgentNotEnded(list: TaskList, name: string): AgentRecord {
+  const agent = getAgent(list, name);
+  if (agent.state === "ended") {
+    throw new TauError("invalid_state", `The sub-agent @${name} ended while it started.`);
+  }
   return agent;
 }
 
@@ -283,11 +297,18 @@ export function liveChildAgents(list: TaskList, parent: string): AgentRecord[] {
   return list.agents.filter((agent) => agent.parent === parent && agent.state !== "ended");
 }
 
-/** The sub-agents of `name`, at all depths, that did not end. Deepest first. */
+/**
+ * The sub-agents of `name`, at all depths, that did not end. Deepest first.
+ * Each agent is in the result one time, also when the records have a
+ * cycle (the codec rejects cycles, but this function does not trust it).
+ */
 export function liveDescendantAgents(list: TaskList, name: string): AgentRecord[] {
   const result: AgentRecord[] = [];
+  const seen = new Set<string>([name]);
   const visit = (parent: string) => {
     for (const child of liveChildAgents(list, parent)) {
+      if (seen.has(child.name)) continue;
+      seen.add(child.name);
       visit(child.name);
       result.push(child);
     }
@@ -298,13 +319,13 @@ export function liveDescendantAgents(list: TaskList, name: string): AgentRecord[
 
 /**
  * Checks that the agent did not end. The parent of an ended sub-agent does
- * not watch it anymore, so it must not claim or delegate work.
+ * not watch it anymore, so it must not change tasks (notes are permitted).
  */
 function checkNotEnded(list: TaskList, ctx: RuleContext): void {
   if (list.agents.some((agent) => agent.name === ctx.actor.name && agent.state === "ended")) {
     throw new TauError(
       "permission_denied",
-      `The sub-agent @${ctx.actor.name} ended. It cannot claim or delegate tasks. Stop now.`,
+      `The sub-agent @${ctx.actor.name} ended. It cannot change tasks. Stop now.`,
     );
   }
 }
@@ -371,6 +392,7 @@ export function failTask(
  * tasks, the given task first.
  */
 export function cancelTask(list: TaskList, ctx: RuleContext, id: string, reason: string): Task[] {
+  checkNotEnded(list, ctx);
   const task = getTask(list, checkId(id));
   checkScope(ctx, task.id);
   const text = checkText("reason", reason);
@@ -445,6 +467,107 @@ export function failTasksOfAgent(
   return { failed, blocked };
 }
 
+/** The result of an aborted task: `aborted by @<agent>: <reason>`. */
+export function abortResult(agent: string, reason: string): string {
+  return `aborted by @${agent}: ${reason}`;
+}
+
+/** What `abortTask` did. */
+export interface Abort {
+  /** The sub-agent that owned the task. */
+  readonly owner: AgentRecord;
+  /** The stopped agents: the sub-agents of the owner (deepest first), then the owner. */
+  readonly stopped: readonly AgentRecord[];
+  /** The tasks that failed. */
+  readonly failed: readonly Task[];
+  /**
+   * Tasks of stopped agents that stay in progress, because they have open
+   * sub-tasks (rule 7). The liveness check fails them when the sub-tasks
+   * close.
+   */
+  readonly blocked: readonly Task[];
+}
+
+/**
+ * Aborts the sub-agent that owns task `id`, and all the sub-agents that it
+ * started, at all depths. Each task that a stopped agent owned fails, with
+ * the result `aborted by @<actor>: <reason>`, and is retryable. A task that
+ * has open sub-tasks stays in progress (rule 7, see `Abort.blocked`). The
+ * agent records end. The caller must then close the panes of the stopped
+ * agents.
+ *
+ * The actor can abort a sub-agent that it started, or a sub-agent that one
+ * of its sub-agents started, at any depth. The agent records tell who
+ * started whom. The actor comes from the process, never from tool
+ * arguments.
+ */
+export function abortTask(list: TaskList, ctx: RuleContext, id: string, reason: string): Abort {
+  const text = checkText("reason", reason);
+  // Check the length of the complete result now, before tau changes the list.
+  checkText("reason", abortResult(ctx.actor.name, text));
+  checkNotEnded(list, ctx);
+  const task = getTask(list, checkId(id));
+  if (task.status !== "in_progress" || task.owner === undefined) {
+    throw new TauError("invalid_state", `Task ${task.id} is ${task.status}. You can abort only a task in progress.`);
+  }
+  if (task.owner === ctx.actor.name) {
+    throw new TauError(
+      "invalid_state",
+      `You own task ${task.id}. To stop your own work, close it with tau_fail (retryable: true when a different attempt can succeed).`,
+    );
+  }
+  const owner = list.agents.find((agent) => agent.name === task.owner);
+  if (owner === undefined || !isAgentUnder(list, owner, ctx.actor.name)) {
+    throw new TauError(
+      "permission_denied",
+      `@${task.owner} owns task ${task.id}, and you did not start it (directly or through your sub-agents). You can abort only your sub-agents.`,
+    );
+  }
+  if (owner.state === "ended") {
+    throw new TauError(
+      "invalid_state",
+      `The sub-agent @${owner.name} ended already. tau fails its tasks when their sub-tasks close.`,
+    );
+  }
+  const result = abortResult(ctx.actor.name, text);
+  const stopped = [...liveDescendantAgents(list, owner.name), owner];
+  const failed: Task[] = [];
+  const blocked: Task[] = [];
+  // Deepest agents first: a parent task can close only after its sub-tasks.
+  for (const agent of stopped) {
+    const outcome = failTasksOfAgent(list, ctx, agent.name, result);
+    failed.push(...outcome.failed);
+    blocked.push(...outcome.blocked);
+  }
+  // A task can be blocked by a task that a later agent in the list failed.
+  // Try the blocked tasks again.
+  for (let retry = blocked.length > 0; retry; ) {
+    retry = false;
+    for (const item of [...blocked]) {
+      if (childrenOf(list, item.id).some((child) => !isClosed(child))) continue;
+      recordEvent(list, item, { kind: "failed", at: ctx.now, actor: ctx.actor.name, result, retryable: true });
+      failed.push(item);
+      blocked.splice(blocked.indexOf(item), 1);
+      retry = true;
+    }
+  }
+  for (const agent of stopped) endAgent(list, agent.name, ctx.now);
+  return { owner, stopped, failed, blocked };
+}
+
+/** True when `ancestor` started `agent`, directly or through other agents. */
+export function isAgentUnder(list: TaskList, agent: AgentRecord, ancestor: string): boolean {
+  const seen = new Set<string>();
+  for (let current: AgentRecord | undefined = agent; current !== undefined; ) {
+    if (current.parent === ancestor) return true;
+    if (seen.has(current.name)) return false;
+    seen.add(current.name);
+    const next: string = current.parent;
+    current = list.agents.find((item) => item.name === next);
+  }
+  return false;
+}
+
 /**
  * The tasks that an agent with no active task can claim now: waiting or
  * retryable tasks, with all dependencies complete and no closed ancestor.
@@ -463,6 +586,9 @@ export function readyTasks(list: TaskList, scope?: string): Task[] {
 // Checks
 
 function checkClose(list: TaskList, ctx: RuleContext, id: string): Task {
+  // An ended agent cannot close its tasks: an aborted task must keep the
+  // abort result. The liveness check closes such tasks.
+  checkNotEnded(list, ctx);
   const task = getTask(list, checkId(id));
   if (task.status !== "in_progress") {
     throw new TauError("invalid_state", `Task ${task.id} is ${task.status}. You can close only a task in progress.`);

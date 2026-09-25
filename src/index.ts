@@ -165,12 +165,23 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
         cwd: ctx.cwd,
         extensionPath: EXTENSION_PATH,
         createdPanes,
-        closeLater: (pane, agent) => watcher.scheduleClose(pane, agent),
+        closeLater: (pane, agent, session) => watcher.scheduleClose(pane, agent, session),
       },
       current: () => ({
         ...(ctx.model === undefined ? {} : { model: `${ctx.model.provider}/${ctx.model.id}` }),
         thinking: pi.getThinkingLevel(),
       }),
+      stopAgents: async (agents) => {
+        for (const agent of agents) {
+          if (agent.pane !== undefined) watcher.scheduleClose(agent.pane, agent.name, agent.session);
+        }
+        await watcher.checkAgain();
+        return agents.flatMap((agent) => {
+          if (agent.pane === undefined) return [];
+          const outcome = watcher.closeOutcome(agent.pane);
+          return outcome === "closed" ? [] : [{ agent: agent.name, pane: agent.pane, outcome }];
+        });
+      },
       onAskUser: (_question, toolCtx) => {
         const target = toolCtx ?? ctx;
         if (target.hasUI) {

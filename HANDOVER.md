@@ -5,11 +5,11 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 335
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 366
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. Ask Romain which next step to start (see section 8). The proposal is
-   `tau_abort` (section 8, item 1).
+   messages and notes: `tau_send` (section 8, item 1).
 
 ## 2. What tau is
 
@@ -60,7 +60,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `tltkpzyk` | `bd9b13df` | feat: show the task tree under the herdr badge            |
 | `ykktntvt` | `380c457f` | feat: delegate tasks to pi sub-agents in herdr panes      |
 | `lklwxowt` | `dc93e269` | docs: add a hand-over document for the next session       |
-| `tmrzoyxo` | (see log)  | feat: add the do-not-stop rule and tau_ask_user           |
+| `tmrzoyxo` | `2676a1d7` | feat: add the do-not-stop rule and tau_ask_user           |
+| `xnnzlppn` | (see log)  | feat: add tau_abort to stop sub-agents                    |
 
 The working copy after that is empty.
 
@@ -72,10 +73,10 @@ The working copy after that is empty.
 | `herdr.ts` | `detectHerdr`: needs `HERDR_ENV=1`, absolute `HERDR_BIN_PATH` (no PATH search), and `herdr pane current --current` with a pane ID. |
 | `herdr-client.ts` | Wrapper for herdr CLI: split, start pi (retries `agent_pane_busy`), prompt, list agents (with pi session), list/close panes, report/clear metadata. `HerdrError.herdrCode`. |
 | `identity.ts` | Lead vs sub-agent. Sub-agent env: `TAU_TASKLIST`, `TAU_TASK_ID`, `TAU_AGENT_NAME`, `TAU_PARENT_AGENT`. `checkSubAgent` needs record name/task/parent/pane to agree. Cooperative, not a security boundary. |
-| `delegate.ts` | `delegate()`: reserve (claim for the new agent name), split pane with env, record pane, `herdr agent start … -- --model --thinking --extension <tau>`, mark running, first prompt. Cleanup on failure. |
-| `supervisor.ts` | Liveness every 5 s for the children of this agent. Knows a child by its pi session (name+pane only in the 2-min start grace). Dead child → fail tasks of it and its descendants (`owner agent exited`). Finished child (task closed, no live sub-agents, idle or 2 min after the close) → end. Safe pane close rule. Dry run on a copy, so no write without a change. |
+| `delegate.ts` | `delegate()`: reserve (claim for the new agent name), split pane with env, record pane, `herdr agent start … -- --model --thinking --extension <tau>`, mark running, first prompt, then a check that the agent did not end (an abort; a fast completion by the same agent is a correct start). Cleanup on failure: keeps an abort result, reports the real task status, and closes the new pane only with proof (`closeNewPane`), else `closeLater` with the session. |
+| `supervisor.ts` | Liveness every 5 s for the children of this agent. Knows a child by its pi session (name+pane only in the 2-min start grace). Dead child → fail tasks of it and its descendants (`owner agent exited`). Finished child (task closed, no live sub-agents, idle or 2 min after the close) → end. Safe pane close rule: an occupied pane needs name + session; an empty pane must be one this process made; a moved agent (found by name + session) gets its current pane closed; the request stays when the agent moved between the two herdr lists. `checkAgain()` (a fresh check after the running one), `closeOutcome(pane)` (`closed`/`pending`/`kept`). Dry run on a copy, so no write without a change. |
 | `names.ts` | Agent names `tau-t2-1`, `-2` suffix for retries, hash names for deep IDs. |
-| `tools.ts` | 12 tools: `tau_list/get/create/update/claim/complete/fail/cancel/note/delegate/wait/ask_user`. `tau_ask_user` returns `terminate: true`. All `executionMode: "sequential"`. Identity from the process, never from args. `conflictingTools` (another extension with a tau name → tau registers nothing). |
+| `tools.ts` | 13 tools: `tau_list/get/create/update/claim/complete/fail/cancel/note/delegate/wait/abort/ask_user`. `tau_ask_user` returns `terminate: true`. `tau_abort` needs `TaskSession.stopAgents` (else it fails and changes nothing), and reports panes that are `pending` or `kept`. All `executionMode: "sequential"`. Identity from the process, never from args. `conflictingTools` (another extension with a tau name → tau registers nothing). |
 | `stop.ts` | "Do not stop" rule. `openWork` (lead: all open tasks; sub-agent: its scope while its task is in progress), `continuationText` (task IDs, statuses, and tau-made agent names only: no agent text, because it is a user-role message; never a `tau_wait` for own tasks), `promptSection` (the `<tau>` system prompt section), `StopGuard` (idle count by list `revision`, give up after 3, ask exemption). |
 | `gate.ts` | Work gate on `tool_call`: no active task → block non-tau tools; read-only type (or unknown type) → block `edit`/`write`. |
 | `format.ts` | Model-facing text. Agent text is quoted with `| ` and labeled as data. `tau_get` previews (2000 chars, last 10 notes/events) and `section`+`offset` paging by code points. |
@@ -85,8 +86,8 @@ The working copy after that is empty.
 | `commands.ts` | `ctrl+shift+t` toggle, `/tau`, `/tau show <id>` (scrollable `TextView`). |
 | `badge.ts` | `🟢 Herdr` / `🔴 Herdr unavailable`. |
 | `tasks/model.ts` | Types, hierarchical IDs, `applyEvent`/`recordEvent` (event sourcing with a list `revision` and event `seq`), `rollback(list, revision)`, agent records, limits (500 tasks, 100 notes, 1000 non-close events). |
-| `tasks/rules.ts` | State machine: create/update/claim (claim stack)/complete/fail/cancel (cascade)/note, `delegateTask`, `failTasksOfAgent` (returns `{failed, blocked}`), agent record helpers, cycle check through sub-tasks. |
-| `tasks/codec.ts` | Strict decode of the stored JSON (shape, relations, revisions 1..N, replay equals fields, limits). |
+| `tasks/rules.ts` | State machine: create/update/claim (claim stack)/complete/fail/cancel (cascade)/note, `delegateTask`, `failTasksOfAgent` (returns `{failed, blocked}`), `abortTask` (permission by `isAgentUnder`, fails tasks of the owner and its live descendants, deepest first, then ends their records), agent record helpers, cycle check through sub-tasks. An ended agent cannot change tasks (notes are permitted). |
+| `tasks/codec.ts` | Strict decode of the stored JSON (shape, relations, revisions 1..N, replay equals fields, limits, agent parents make a tree under the lead with no cycle). |
 | `tasks/store.ts` | SQLite (`node:sqlite`) per list: `<parent of PI_CODING_AGENT_DIR>/tau/tasklists/<lead-session-id>.db`. `BEGIN IMMEDIATE` per change with async retry (no event-loop block). Read cache by `PRAGMA data_version`, reopen when the file identity changes. 0700 dir, 0600 files, no symlinks. |
 | `tasks/types.ts` | Default task types with `readOnly` (research, review). |
 
@@ -135,18 +136,15 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 
 ## 8. What is left (from README), in the proposed order
 
-1. **`tau_abort`** (next; about 1.5–2 h with review): stop a sub-agent (and all its sub-agents), fail their
-   tasks `aborted by @x: reason`, retryable. Allowed for own sub-agents at
-   any depth. Use agent records (parent chain) and the safe pane close.
-2. **Messages and notes**: `tau_send` (tree-scoped: descendants, parent,
+1. **Messages and notes** (next; about 2–3 h with review): `tau_send` (tree-scoped: descendants, parent,
    siblings; priority `steer` via `pi.sendMessage` deliverAs `steer`, `info`
    at the next tau call or turn end), inbox per agent, messages stop
    `tau_wait`, `✉n` in the tree. Notes exist already (`tau_note`).
-3. **Configuration** `~/.pi/tau/config.json`: `toggleCompletedKey`, `idPills`,
+2. **Configuration** `~/.pi/tau/config.json`: `toggleCompletedKey`, `idPills`,
    `maxTreeLines`, `maxParallelSubAgents`, `maxIdleContinuations`,
    `taskTypes` (with `readOnly`). Code already accepts most of these as
    options (`TreeWidgetOptions`, `maxAgents`, `taskTypes`).
-4. **Fork**: on `session_start` with reason `fork`, copy the list rolled back
+3. **Fork**: on `session_start` with reason `fork`, copy the list rolled back
    to the fork point (`rollback` by revision exists; need to map the fork
    entry to a revision, for example with `pi.appendEntry` after each change),
    new session ID, in-progress tasks of other-session owners → failed
@@ -174,3 +172,18 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 - A mixed batch with `tau_ask_user` is unit-tested only: in live tests the
   model follows the description and calls it alone.
 - The idle limit (3) is hard-coded until the configuration step.
+- `tau_abort` limits (accepted, documented in README):
+  - An empty pane of a grandchild that exited before the abort stays open:
+    only the process that made a pane can close it empty, and that process
+    is stopped too.
+  - An abort while a descendant splits a pane (before it records the pane
+    ID) can leave that new pane open.
+  - A task that stays in progress (open sub-tasks) later fails with `owner
+    agent exited`, not with the abort reason.
+  - A `kept` pane (no proof of its occupant) is not retried: `tau_abort`
+    tells the model to ask the user to check it.
+  - The pane rule is not a security boundary: a same-user program that
+    writes a false name and session in the list can make tau close a pane.
+- Not tested: `index.ts` passes the session to `closeLater` (one line, no
+  end-to-end test); the `checkAgain` concurrency test uses the test copy of
+  the stop hook, not the `index.ts` one.

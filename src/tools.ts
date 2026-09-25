@@ -11,8 +11,9 @@ import { Type, type TSchema } from "typebox";
 import { checkModel, checkThinking, delegate, delegationText, THINKING_LEVELS, type DelegationContext } from "./delegate.ts";
 import { agentSummary, formatChange, formatList, formatSection, formatTask, TASK_SECTIONS, type TaskSection } from "./format.ts";
 import { TauError } from "./tasks/errors.ts";
-import { activeTask, findTask, getTask, isClosed, isTaskId, type TaskList } from "./tasks/model.ts";
+import { activeTask, findTask, getTask, isClosed, isTaskId, type AgentRecord, type TaskList } from "./tasks/model.ts";
 import {
+  abortTask,
   addNote,
   cancelTask,
   claimTask,
@@ -20,6 +21,7 @@ import {
   createTask,
   failTask,
   updateTask,
+  type Abort,
   type Actor,
   type RuleContext,
 } from "./tasks/rules.ts";
@@ -42,10 +44,26 @@ export interface TaskSession {
   readonly current?: () => { readonly model?: string; readonly thinking: string };
   /** The time between two reads of `tau_wait`, in milliseconds. */
   readonly waitPollMs?: number;
+  /**
+   * Stops the processes of aborted agents: closes their panes when it is
+   * safe (see `supervisor.ts`). Returns the agents whose panes are not
+   * closed: `pending` (tau tries again at the next check) or `kept` (not
+   * safe to close). Without it,
+   * `tau_abort` fails and changes nothing: the records of aborted agents
+   * end, so no liveness check stops them later.
+   */
+  readonly stopAgents?: (agents: readonly AgentRecord[]) => Promise<readonly UnclosedPane[]>;
   /** Called when the agent asks the user a question with `tau_ask_user`. */
   readonly onAskUser?: (question: string, ctx: ExtensionContext | undefined) => void;
 }
 
+
+/** A pane of an aborted agent that tau did not close. */
+export interface UnclosedPane {
+  readonly agent: string;
+  readonly pane: string;
+  readonly outcome: "pending" | "kept";
+}
 
 /** The maximum number of characters of a `tau_ask_user` question. */
 export const MAX_QUESTION_LENGTH = 4_000;
@@ -276,6 +294,67 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
   ];
 }
 
+function abortSpec(): ToolSpec {
+  return {
+    name: "tau_abort",
+    label: "tau abort",
+    description: [
+      "Stop the sub-agent that owns a task, and all the sub-agents that it started. Each task that these agents own fails with the result \"aborted by @you: <reason>\", and is retryable. A task with open sub-tasks stays in progress. When its sub-tasks close, tau fails it with the result \"owner agent exited\". tau closes the panes of the stopped agents.",
+      "You can abort a sub-agent that you started, or a sub-agent that one of your sub-agents started. Use this when a sub-agent does wrong or unnecessary work. To stop your own task, use tau_fail.",
+    ].join("\n"),
+    promptSnippet: "Stop a sub-agent and fail its tasks",
+    parameters: Type.Object({
+      id: ID("A task in progress that a sub-agent owns."),
+      reason: Type.String({ description: "Why you stop the sub-agent. The failed tasks show it.", minLength: 1 }),
+    }),
+    run: async (session, params) => {
+      const stopAgents = session.stopAgents;
+      if (stopAgents === undefined) {
+        throw new TauError("invalid_state", "tau cannot stop sub-agents in this session.");
+      }
+      const ctx: RuleContext = { actor: session.actor, now: session.now(), taskTypes: Object.keys(session.taskTypes) };
+      const { result: abort } = await session.store.mutate((list) => abortTask(list, ctx, String(params.id), String(params.reason)));
+      session.onChange?.();
+      const pending = await stopAgents(abort.stopped);
+      return abortText(String(params.id), abort, pending);
+    },
+  };
+}
+
+/** A short text about an abort, for the model. */
+export function abortText(id: string, abort: Abort, unclosed: readonly UnclosedPane[] = []): string {
+  const others = abort.stopped.filter((agent) => agent.name !== abort.owner.name);
+  const lines = [
+    `Aborted ${id}: tau ended @${abort.owner.name}${
+      others.length === 0 ? "" : ` and ${others.length} of its sub-agents (${others.map((agent) => `@${agent.name}`).join(", ")})`
+    }${unclosed.length === 0 ? `, and closed ${others.length === 0 ? "its pane" : "their panes"}` : ""}.`,
+  ];
+  if (abort.failed.length > 0) {
+    lines.push(`Failed (retryable): ${abort.failed.map((task) => task.id).join(", ")}.`);
+  }
+  if (abort.blocked.length > 0) {
+    lines.push(
+      `These tasks stay in progress, because they have open sub-tasks: ${abort.blocked.map((task) => task.id).join(", ")}. When the sub-tasks close (or you cancel them), tau fails these tasks with the result "owner agent exited".`,
+    );
+  }
+  const pending = unclosed.filter((item) => item.outcome === "pending");
+  const kept = unclosed.filter((item) => item.outcome === "kept");
+  if (pending.length > 0) {
+    lines.push(
+      `tau could not close the panes of ${pending.map((item) => `@${item.agent}`).join(", ")} yet: these agents can still run. tau tries again at each liveness check.`,
+    );
+  }
+  if (kept.length > 0) {
+    lines.push(
+      `tau did not close the panes ${kept.map((item) => `${item.pane} (@${item.agent})`).join(", ")}: it cannot prove that the ended agent is in them, and it does not try again. These agents can still run. Tell the user to check these panes.`,
+    );
+  }
+  lines.push(
+    "The lead decides if a failed task is tried again. To retry a task, use tau_delegate. You can also use tau_claim, if the claim rules permit it. Use tau_list to see the tasks that are ready.",
+  );
+  return lines.join("\n");
+}
+
 function askSpec(): ToolSpec {
   return {
     name: ASK_TOOL,
@@ -422,7 +501,7 @@ export async function waitForTasks(
 
 /** The names of all task tools. */
 export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set(
-  [...specs({}), ...delegationSpecs(), askSpec()].map((spec) => spec.name),
+  [...specs({}), ...delegationSpecs(), abortSpec(), askSpec()].map((spec) => spec.name),
 );
 
 /**
@@ -439,7 +518,7 @@ export function conflictingTools(pi: ExtensionAPI): string[] {
 
 /** Registers the task tools. */
 export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void {
-  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), askSpec()]) {
+  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), abortSpec(), askSpec()]) {
     pi.registerTool({
       name: spec.name,
       label: spec.label,

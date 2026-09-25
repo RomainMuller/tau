@@ -10,7 +10,10 @@ import {
   completeTask,
   createTask,
   failTask,
+  delegateTask,
   failTasksOfAgent,
+  isAgentUnder,
+  liveDescendantAgents,
   MAX_EVENTS,
   MAX_NOTES,
   MAX_TASKS,
@@ -522,5 +525,19 @@ describe("limits", () => {
 
   it("rejects a text that is too long", () => {
     throwsTau(() => addNote(list, ctx(), "T0", "x".repeat(MAX_TEXT_LENGTH + 1)), "invalid_argument");
+  });
+});
+
+describe("agent tree", () => {
+  it("walks each agent one time, also with a cycle of parents", () => {
+    delegateTask(list, ctx(), { id: "T0", agent: "tau-a" });
+    list.agents.push({ name: "tau-b", parent: "tau-a", task: "T0", state: "running", startedAt: ctx().now });
+    // A cycle that the codec rejects: tau-a started by tau-b.
+    (list.agents[0] as { parent: string }).parent = "tau-b";
+    assert.deepEqual(
+      liveDescendantAgents(list, "tau-a").map((agent) => agent.name),
+      ["tau-b"],
+    );
+    assert.equal(isAgentUnder(list, list.agents[0]!, "lead"), false);
   });
 });

@@ -357,6 +357,27 @@ When a task is aborted:
 An aborted task has no special status. It is `failed`, with
 `retryable: true`. The lead can retry it.
 
+An agent cannot abort its own task: it uses `tau_fail`. It cannot abort a
+sub-agent that ended already. If a task of a stopped agent has sub-tasks
+that are not closed (for example, `waiting` sub-tasks), the task stays
+`in_progress` (rule 7). When its sub-tasks close, the liveness check fails
+it with the result `owner agent exited`. If you abort a sub-agent while it
+starts, `tau` stops the start and closes the new pane.
+
+`tau` closes a pane only when this is safe (see [Liveness](#liveness)). So
+in rare cases a pane stays open: for example, when a sub-agent of a stopped
+sub-agent exited before the abort, its empty pane stays open, because the
+agent that made the pane is stopped too. `tau_abort` tells you about each
+pane that it did not close:
+
+- When herdr did not reply, or the close failed, `tau` tries again at each
+  liveness check.
+- When `tau` cannot prove that the stopped agent is in the pane, it does not
+  close the pane, and it does not try again. Check the pane yourself.
+
+A rare case: if an agent aborts a sub-agent while that sub-agent splits a
+pane for its own new sub-agent, the new pane can stay open.
+
 ### Liveness
 
 Each agent watches the sub-agents that it started. It runs `herdr agent list`
@@ -372,12 +393,14 @@ records its new pane.
 
 A sub-agent ends when its task is closed, it has no live sub-agents, and it
 is idle. If it is not idle 2 minutes after its task closed, it ends too. An
-ended sub-agent cannot claim or delegate tasks.
+ended sub-agent cannot change tasks (it can still add notes).
 
 `tau` closes the pane of an ended sub-agent only when herdr shows that
-sub-agent in the pane, or when this pi made the pane and no agent is in it.
-So a wrong record cannot close a different pane, for example yours. When a
-close fails, `tau` tries again at the next check.
+sub-agent in the pane (the same name and pi session), or when this pi made
+the pane and no agent is in it. When the sub-agent moved, `tau` closes its
+current pane. So an old record cannot close a different pane, for example
+yours. (This is not a security boundary: a program of your user that writes
+false records in the task list can make `tau` close a pane.) When a close fails, `tau` tries again at the next check.
 
 The lead can also stop existing (for example, you close its pane). When you
 resume the lead session, `tau` compares the task owners with
@@ -739,7 +762,7 @@ All tools exist only when herdr is available.
 | `tau_fail`      | Close the active task as `failed`, with a result and `retryable`. |
 | `tau_cancel`    | Cancel a `waiting` task, with a reason.                       |
 | `tau_delegate`  | Start a sub-agent for a task, with a model and thinking.      |
-| `tau_abort`     | Stop a sub-agent and fail its task, with a reason.            |
+| `tau_abort`     | Stop a sub-agent and its sub-agents, and fail their tasks, with a reason. |
 | `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). |
 | `tau_send`      | Send a message to an agent, with a priority.                  |
 | `tau_note`      | Add a note to a task.                                         |

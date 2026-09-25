@@ -12,8 +12,14 @@
  *   and the child is idle (or `FINISH_GRACE_MS` went by), the child ends.
  *
  * tau closes the pane of an ended child only when this is safe: herdr shows
- * the child in the pane, or this process made the pane and herdr shows no
- * agent in it. So a wrong agent record cannot close a different pane (for
+ * the child in the pane (the same name and pi session), or this process made
+ * the pane and herdr shows no agent in it. When herdr shows the child (by
+ * its name and pi session) in a different pane, tau closes that pane.
+ *
+ * This protects against old records and errors. It is not a security
+ * boundary: a program of the same user can write a false name and session
+ * in the task list. Then tau can close the pane of the agent with that name
+ * and session. So a wrong agent record cannot close a different pane (for
  * example the pane of the lead). When a close fails, tau tries again at the
  * next check.
  *
@@ -26,6 +32,7 @@ import { findTask, type AgentRecord, type TaskList } from "./tasks/model.ts";
 import {
   endAgent,
   failTasksOfAgent,
+  isAgentUnder,
   liveChildAgents,
   liveDescendantAgents,
   setAgentPane,
@@ -77,6 +84,8 @@ export class Supervisor {
   #running: Promise<void> | undefined;
   /** Panes to close. A failed close stays here for the next check. */
   #toClose = new Map<string, PaneToClose>();
+  /** Requested panes that tau did not close, because it was not safe (at most the last 100). */
+  #kept = new Set<string>();
 
   constructor(options: SupervisorOptions) {
     this.#options = options;
@@ -96,6 +105,31 @@ export class Supervisor {
 
   get running(): boolean {
     return this.#timer !== undefined;
+  }
+
+  /**
+   * Runs a new check after the check that runs now (if one runs). Use it
+   * after `scheduleClose`: a check that started before the close was
+   * scheduled can have passed its pane closes already.
+   */
+  async checkAgain(): Promise<void> {
+    await this.#running;
+    await this.check();
+  }
+
+  /**
+   * What occurred to a close that `scheduleClose` asked for (by the pane of
+   * the request):
+   *
+   * - `closed`: tau closed the pane, or the pane does not exist.
+   * - `pending`: the close did not occur yet, or it failed. tau tries again
+   *   at the next check.
+   * - `kept`: tau did not close the pane, because this is not safe (a
+   *   different agent is in it, or tau cannot prove whose pane it is).
+   */
+  closeOutcome(pane: string): "closed" | "pending" | "kept" {
+    if (this.#toClose.has(pane)) return "pending";
+    return this.#kept.has(pane) ? "kept" : "closed";
   }
 
   /** Runs one check. Two calls at the same time share one check. */
@@ -198,6 +232,7 @@ export class Supervisor {
    * module comment.
    */
   scheduleClose(pane: string, agent: string, session?: string): void {
+    this.#kept.delete(pane);
     this.#toClose.set(pane, { pane, agent, session });
   }
 
@@ -206,28 +241,49 @@ export class Supervisor {
     if (this.#toClose.size === 0) return;
     const panes = await this.#options.herdr.listPanes().catch(() => undefined);
     if (panes === undefined) return;
-    for (const item of [...this.#toClose.values()]) {
+    for (const scheduled of [...this.#toClose.values()]) {
+      // herdr knows the agent by its name and pi session. When it is in a
+      // different pane (the pane moved after the last record), close its
+      // current pane.
+      const found =
+        scheduled.session === undefined
+          ? undefined
+          : agents.find(
+              (agent) =>
+                agent.name === scheduled.agent &&
+                agent.session !== undefined &&
+                sameSession(agent.session, scheduled.session!),
+            );
+      const item = found === undefined ? scheduled : { ...scheduled, pane: found.paneId };
       if (!panes.has(item.pane)) {
-        this.#toClose.delete(item.pane);
+        // The pane does not exist. When the agent list showed the agent, it
+        // moved between the two lists: keep the request, and find its pane
+        // again at the next check.
+        if (found === undefined) this.#toClose.delete(scheduled.pane);
         continue;
       }
       const occupant = agents.find((agent) => agent.paneId === item.pane);
-      // An agent in the pane must be the same agent: the same name, and the
-      // same pi session when tau knows it.
+      // An agent in the pane must be the same agent: the same name and the
+      // same pi session. The name alone is not proof (herdr names can be used
+      // again), so without a known session tau does not close an occupied
+      // pane.
       const safe =
         occupant === undefined
           ? this.#createdPanes.has(item.pane)
           : occupant.name === item.agent &&
-            (item.session === undefined ||
-              (occupant.session !== undefined && sameSession(occupant.session, item.session)));
+            item.session !== undefined &&
+            occupant.session !== undefined &&
+            sameSession(occupant.session, item.session);
       if (!safe) {
         // A different agent is in the pane, or tau did not make it: keep it.
-        this.#toClose.delete(item.pane);
+        this.#toClose.delete(scheduled.pane);
+        this.#kept.add(scheduled.pane);
+        if (this.#kept.size > 100) this.#kept.delete(this.#kept.values().next().value!);
         continue;
       }
       try {
         await this.#options.herdr.closePane(item.pane);
-        this.#toClose.delete(item.pane);
+        this.#toClose.delete(scheduled.pane);
         this.#createdPanes.delete(item.pane);
       } catch {
         // Try again at the next check.
@@ -255,7 +311,7 @@ function findLive(agents: readonly HerdrAgent[], record: AgentRecord, nowMs: num
 }
 
 /** herdr reports a session file path or a session ID. A file name contains the ID. */
-function sameSession(a: string, b: string): boolean {
+export function sameSession(a: string, b: string): boolean {
   return a === b || a.endsWith(`_${b}.jsonl`) || b.endsWith(`_${a}.jsonl`);
 }
 
@@ -266,20 +322,7 @@ function sameSession(a: string, b: string): boolean {
  */
 function stuckAgents(list: TaskList, parent: string): string[] {
   return list.agents
-    .filter((agent) => agent.state === "ended" && isUnder(list, agent, parent))
+    .filter((agent) => agent.state === "ended" && isAgentUnder(list, agent, parent))
     .filter((agent) => list.tasks.some((task) => task.status === "in_progress" && task.owner === agent.name))
     .map((agent) => agent.name);
-}
-
-/** True when `parent` started `agent`, directly or through other agents. */
-function isUnder(list: TaskList, agent: AgentRecord, parent: string): boolean {
-  const seen = new Set<string>();
-  for (let current: AgentRecord | undefined = agent; current !== undefined; ) {
-    if (current.parent === parent) return true;
-    if (seen.has(current.name)) return false;
-    seen.add(current.name);
-    const next: string = current.parent;
-    current = list.agents.find((item) => item.name === next);
-  }
-  return false;
 }

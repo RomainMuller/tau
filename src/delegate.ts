@@ -9,18 +9,23 @@
  *    the thinking level. herdr knows the new agent by its name.
  * 4. Send the first prompt to the sub-agent.
  *
- * If a step after step 1 fails, the task fails (retryable), the agent record
- * ends, and tau closes the new pane.
+ * If a step after step 1 fails, the agent record ends, and tau closes the
+ * new pane when this is safe (else the supervisor tries later). The task
+ * fails (retryable). Exceptions:
+ *
+ * - A task with open sub-tasks stays in progress until they close.
+ * - When a different agent aborts the new sub-agent while it starts, the
+ *   start stops too, and the task keeps the result of the abort.
  */
 
 import type { HerdrClient } from "./herdr-client.ts";
 import { ENV_AGENT_NAME, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
 import { agentNameFor } from "./names.ts";
 import { TauError } from "./tasks/errors.ts";
-import type { Task } from "./tasks/model.ts";
-import { delegateTask, endAgent, failTasksOfAgent, markAgentRunning, setAgentPane, type Actor } from "./tasks/rules.ts";
+import { findTask, type Task, type TaskList } from "./tasks/model.ts";
+import { checkAgentNotEnded, delegateTask, endAgent, failTasksOfAgent, markAgentRunning, setAgentPane, type Actor } from "./tasks/rules.ts";
 import type { TaskListStore } from "./tasks/store.ts";
-import { START_GRACE_MS } from "./supervisor.ts";
+import { sameSession, START_GRACE_MS } from "./supervisor.ts";
 import { cleanLine } from "./text.ts";
 
 /** The thinking levels of pi. */
@@ -43,7 +48,7 @@ export interface DelegationContext {
   /** tau adds each pane that it makes. The supervisor can close them. */
   readonly createdPanes?: Set<string>;
   /** Asks the supervisor to close a pane later, when a close now fails. */
-  readonly closeLater?: (pane: string, agent: string) => void;
+  readonly closeLater?: (pane: string, agent: string, session?: string) => void;
 }
 
 export interface DelegateRequest {
@@ -111,7 +116,12 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
     });
     const paneId = pane;
     ctx.createdPanes?.add(paneId);
-    await ctx.store.mutate((list) => setAgentPane(list, reserved.agent, paneId));
+    // A different agent can abort the new sub-agent while it starts. Then
+    // stop here: the catch block closes the new pane.
+    await ctx.store.mutate((list) => {
+      checkAgentNotEnded(list, reserved.agent);
+      setAgentPane(list, reserved.agent, paneId);
+    });
     await ctx.herdr.startPiAgent(reserved.agent, pane, [
       "--model",
       model,
@@ -122,36 +132,100 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
     ]);
     await ctx.store.mutate((list) => markAgentRunning(list, reserved.agent));
     await ctx.herdr.prompt(reserved.agent, firstPrompt(reserved.agent, ctx.actor.name, reserved.task, reserved.title));
+    // An abort can come while the prompt is sent. Do not report a start
+    // then. A fast sub-agent can also complete its task and end before this
+    // read: that is a correct start.
+    const after = await ctx.store.read();
+    const record = after?.agents.find((agent) => agent.name === reserved.agent);
+    if (after !== undefined && record?.state === "ended" && !completedBy(after, reserved.task, reserved.agent)) {
+      checkAgentNotEnded(after, reserved.agent);
+    }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    let session: string | undefined;
     const cleaned = await ctx.store
       .mutate((list) => {
+        const record = list.agents.find((agent) => agent.name === reserved.agent);
+        session = record?.session;
+        // When the agent ended (for example, an agent aborted it), its tasks
+        // have their result already, or stay in progress until their
+        // sub-tasks close. Do not replace that.
+        if (record?.state === "ended") return findTask(list, reserved.task);
         failTasksOfAgent(list, { actor: ctx.actor, now: ctx.now() }, reserved.agent, `The sub-agent did not start: ${reason}`);
         endAgent(list, reserved.agent, ctx.now());
+        return findTask(list, reserved.task);
       })
       .then(
-        () => true,
-        () => false,
+        ({ result }) => ({ ok: true as const, task: result }),
+        () => ({ ok: false as const, task: undefined }),
       );
     let paneOpen = false;
     if (pane !== undefined) {
-      const paneId = pane;
-      paneOpen = await ctx.herdr.closePane(paneId).then(
-        () => false,
-        () => true,
-      );
-      if (paneOpen) ctx.closeLater?.(paneId, reserved.agent);
+      paneOpen = !(await closeNewPane(ctx, pane, reserved.agent, session));
+      if (paneOpen) ctx.closeLater?.(pane, reserved.agent, session);
     }
     const parts = [`tau could not start a sub-agent for ${reserved.task}: ${reason}`];
+    const task = cleaned.task;
     parts.push(
-      cleaned
-        ? "The task failed, and you can retry it."
-        : `tau could not record the failure either. The liveness check fails the task when the sub-agent does not run (at most ${Math.round(START_GRACE_MS / 60_000)} minutes); then you can retry it.`,
+      !cleaned.ok
+        ? `tau could not record the failure either. The liveness check fails the task when the sub-agent does not run (at most ${Math.round(START_GRACE_MS / 60_000)} minutes); then the lead can retry it.`
+        : task?.status === "failed"
+          ? `The task failed (retryable: ${task.retryable === true ? "yes" : "no"}). Read its result with tau_get.`
+          : task?.status === "in_progress"
+            ? "The task stays in progress until its sub-tasks close. Then tau fails it."
+            : `The task is ${task?.status ?? "unknown"}.`,
     );
-    if (paneOpen) parts.push(`The pane ${pane} is still open; tau tries to close it later.`);
+    if (paneOpen) {
+      parts.push(
+        ctx.closeLater === undefined
+          ? `The pane ${pane} is still open. Tell the user to check it.`
+          : `The pane ${pane} is still open. tau tries to close it later, when this is safe; if it cannot, tell the user to check it.`,
+      );
+    }
     throw new TauError("storage", parts.join(" "));
   }
   return { agent: reserved.agent, task: reserved.task, pane };
+}
+
+/**
+ * Closes the new pane of a start that failed, when this is safe: herdr
+ * shows the pane, and no agent is in it, or the new sub-agent is (the same
+ * name and pi session). Returns true when the pane is closed or does not
+ * exist. Returns false when tau cannot close it safely now (for example,
+ * herdr does not reply): then the supervisor must try later.
+ */
+async function closeNewPane(ctx: DelegationContext, pane: string, agent: string, session: string | undefined): Promise<boolean> {
+  const agents = await ctx.herdr.listAgents().catch(() => undefined);
+  const panes = await ctx.herdr.listPanes().catch(() => undefined);
+  if (agents === undefined || panes === undefined) return false;
+  if (!panes.has(pane)) {
+    // An abort can have closed the pane already. But when herdr shows the
+    // new sub-agent (same name and session) in a different pane, it moved:
+    // the supervisor must close its current pane.
+    const moved =
+      session !== undefined &&
+      agents.some((item) => item.name === agent && item.session !== undefined && sameSession(item.session, session));
+    return !moved;
+  }
+  const occupant = agents.find((item) => item.paneId === pane);
+  const safe =
+    occupant === undefined ||
+    (occupant.name === agent && session !== undefined && occupant.session !== undefined && sameSession(occupant.session, session));
+  if (!safe) return false;
+  return ctx.herdr.closePane(pane).then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
+ * True when `agent` completed task `id`: the last event of the task is a
+ * completion by that agent. (A retry by a different agent does not count.)
+ */
+function completedBy(list: TaskList, id: string, agent: string): boolean {
+  const task = findTask(list, id);
+  const last = task?.history.at(-1);
+  return task?.status === "completed" && last?.kind === "completed" && last.actor === agent;
 }
 
 /** The first prompt of a sub-agent. */

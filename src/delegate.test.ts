@@ -12,10 +12,10 @@ import { TauError } from "./tasks/errors.ts";
 import { findTask, rollback, seedTaskList, type TaskList } from "./tasks/model.ts";
 import { taskListFile } from "./tasks/paths.ts";
 import * as rules from "./tasks/rules.ts";
-import { claimTask, createTask, delegateTask, liveDescendantAgents } from "./tasks/rules.ts";
+import { claimTask, completeTask, createTask, delegateTask, liveDescendantAgents } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { OWNER_EXITED, Supervisor } from "./supervisor.ts";
-import { waitForTasks, type TaskSession } from "./tools.ts";
+import { registerTaskTools, waitForTasks, type TaskSession } from "./tools.ts";
 import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -545,7 +545,7 @@ describe("delegation, more cases", () => {
     });
     await assert.rejects(
       store.mutate((list) => rules.claimTask(list, { actor: { name: "tau-t0" }, now: NOW }, "T0")),
-      /ended\. It cannot claim/,
+      /ended\. It cannot change tasks/,
     );
   });
 
@@ -652,7 +652,7 @@ describe("delegation, more cases", () => {
     const later: string[] = [];
     await assert.rejects(
       delegate({ ...context(), closeLater: (pane) => later.push(pane) }, { id: "T0", model: "p/m", thinking: "low" }),
-      /The pane w1:p10 is still open; tau tries to close it later\./,
+      /The pane w1:p10 is still open\. tau tries to close it later, when this is safe/,
     );
     assert.deepEqual(later, ["w1:p10"]);
   });
@@ -676,11 +676,503 @@ describe("agent records in the file", () => {
       [(v) => (v.agents[0].state = "zombie"), /not an agent state/],
       [(v) => v.agents.push(structuredClone(v.agents[0])), /used two times/],
       [(v) => (v.agents[0].parent = "x y"), /not an agent name/],
+      [(v) => (v.agents[0].parent = "tau-t0"), /cycle of parents/],
+      [
+        (v) => {
+          v.agents.push({ ...structuredClone(v.agents[0]), name: "tau-t1", parent: "tau-t0" });
+          v.agents[0].parent = "tau-t1";
+        },
+        /cycle of parents/,
+      ],
+      [(v) => (v.agents[0].parent = "tau-nobody"), /the parent tau-nobody of agent tau-t0 does not exist/],
     ];
     for (const [change, message] of cases) {
       const value = JSON.parse(encodeTaskList(list));
       change(value);
       assert.throws(() => decodeTaskList(JSON.stringify(value), "f"), message);
     }
+  });
+});
+
+describe("tau_abort", () => {
+  type Tool = { execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }> };
+
+  /** The tools of an agent, with a supervisor that closes the panes of aborted agents. */
+  /**
+   * The tools of an agent process. Each process has its own set of panes
+   * that it made (the default is none: the panes of the sub-agents were made
+   * by other processes, as in a real tree).
+   */
+  function toolsOf(
+    name: string,
+    scope?: string,
+    panes: Set<string> = new Set(),
+    stop = true,
+  ): { tools: Map<string, Tool>; supervisor: Supervisor } {
+    const supervisor = new Supervisor({ store, herdr: herdr as unknown as HerdrClient, actor: { name }, now: () => NOW, createdPanes: panes });
+    const session: TaskSession = {
+      store,
+      actor: scope === undefined ? { name } : { name, scope },
+      now: () => NOW,
+      taskTypes: DEFAULT_TASK_TYPE_DEFINITIONS,
+      ...(stop
+        ? {
+            stopAgents: async (agents) => {
+              for (const agent of agents) {
+                if (agent.pane !== undefined) supervisor.scheduleClose(agent.pane, agent.name, agent.session);
+              }
+              await supervisor.checkAgain();
+              return agents.flatMap((agent) => {
+                if (agent.pane === undefined) return [];
+                const outcome = supervisor.closeOutcome(agent.pane);
+                return outcome === "closed" ? [] : [{ agent: agent.name, pane: agent.pane, outcome }];
+              });
+            },
+          }
+        : {}),
+    };
+    const tools = new Map<string, Tool>();
+    registerTaskTools({ registerTool: (tool: Tool & { name: string }) => tools.set(tool.name, tool) } as never, session);
+    return { tools, supervisor };
+  }
+
+  async function abort(tools: Map<string, Tool>, params: Record<string, unknown>): Promise<string> {
+    const result = await tools.get("tau_abort")!.execute("1", params);
+    return result.content.map((item) => item.text).join("\n");
+  }
+
+  /** T0 delegated to tau-t0, which delegated its sub-task T0.1 to tau-t0-1. */
+  async function twoLevels(): Promise<void> {
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T0" });
+    });
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await delegate(context("tau-t0"), { id: "T0.1", model: "p/m", thinking: "low" });
+  }
+
+  it("stops the sub-agent and its sub-agents, fails their tasks, and closes their panes", async () => {
+    await twoLevels();
+    const text = await abort(toolsOf("lead").tools, { id: "T0", reason: "wrong approach" });
+
+    assert.match(text, /^Aborted T0: tau ended @tau-t0 and 1 of its sub-agents \(@tau-t0-1\), and closed their panes\./);
+    assert.match(text, /Failed \(retryable\): T0\.1, T0\./);
+    const list = await read();
+    for (const id of ["T0", "T0.1"]) {
+      const task = findTask(list, id)!;
+      assert.equal(task.status, "failed", id);
+      assert.equal(task.result, "aborted by @lead: wrong approach", id);
+      assert.equal(task.retryable, true, id);
+    }
+    assert.ok(list.agents.every((agent) => agent.state === "ended"));
+    assert.deepEqual(herdr.closed.sort(), ["w1:p10", "w1:p11"]);
+  });
+
+  it("lets an agent abort a sub-agent of its sub-agent", async () => {
+    await twoLevels();
+    await abort(toolsOf("lead").tools, { id: "T0.1", reason: "not necessary" });
+    const list = await read();
+    assert.equal(findTask(list, "T0.1")?.status, "failed");
+    assert.equal(findTask(list, "T0")?.status, "in_progress");
+    assert.equal(list.agents.find((agent) => agent.name === "tau-t0")?.state, "running");
+    assert.deepEqual(herdr.closed, ["w1:p11"]);
+  });
+
+  it("refuses an agent that did not start the owner, a task of the agent, and a task that is not in progress", async () => {
+    await twoLevels();
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Other", type: "code" });
+    });
+    // tau-t0-1 did not start tau-t0 (its parent).
+    await assert.rejects(abort(toolsOf("tau-t0-1", "T0.1").tools, { id: "T0", reason: "x" }), /you did not start it/);
+    await assert.rejects(abort(toolsOf("tau-t0", "T0").tools, { id: "T0", reason: "x" }), /You own task T0\. .*tau_fail/);
+    await assert.rejects(abort(toolsOf("lead").tools, { id: "T1", reason: "x" }), /Task T1 is waiting\. You can abort only a task in progress/);
+    await assert.rejects(abort(toolsOf("lead").tools, { id: "T0", reason: " " }), /The reason is empty/);
+    assert.deepEqual(herdr.closed, []);
+    assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+  });
+
+  it("refuses a task that the lead owns", async () => {
+    await store.mutate((list) => {
+      claimTask(list, LEAD, "T0");
+    });
+    await assert.rejects(abort(toolsOf("tau-x").tools, { id: "T0", reason: "x" }), /@lead owns task T0, and you did not start it/);
+  });
+
+  it("keeps a task with open sub-tasks in progress, tells it, and refuses a second abort", async () => {
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T0" });
+    });
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const text = await abort(toolsOf("lead").tools, { id: "T0", reason: "stop" });
+    assert.match(text, /^Aborted T0: tau ended @tau-t0/);
+    assert.match(text, /These tasks stay in progress, because they have open sub-tasks: T0\./);
+    assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+    assert.equal((await read()).agents[0]?.state, "ended");
+    // The owner ended: a second abort cannot stop it again.
+    await assert.rejects(abort(toolsOf("lead").tools, { id: "T0", reason: "again" }), /@tau-t0 ended already/);
+  });
+
+  it("fails a task whose sub-task an agent later in the order owns", async () => {
+    // tau-t0 owns T0 and claims T0.1.1 (a sub-task of its active task);
+    // tau-t0-1 owns T0.1. T0.1 can close only after T0.1.1.
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T0" });
+      createTask(list, LEAD, { title: "Sub sub", type: "code", parent: "T0.1" });
+    });
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await delegate(context("tau-t0"), { id: "T0.1", model: "p/m", thinking: "low" });
+    await store.mutate((list) => {
+      claimTask(list, { actor: { name: "tau-t0", scope: "T0" }, now: NOW }, "T0.1.1");
+    });
+    const text = await abort(toolsOf("lead").tools, { id: "T0", reason: "stop" });
+    assert.doesNotMatch(text, /stay in progress/);
+    const list = await read();
+    for (const id of ["T0", "T0.1", "T0.1.1"]) assert.equal(findTask(list, id)?.status, "failed", id);
+  });
+
+  it("stops a delegation that an abort ends while the sub-agent starts", async () => {
+    const { tools } = toolsOf("lead");
+    const original = herdr.splitPane.bind(herdr);
+    herdr.splitPane = async (from, options) => {
+      const pane = await original(from, options);
+      // A different agent aborts the new sub-agent now.
+      await abort(tools, { id: "T0", reason: "changed plan" });
+      return pane;
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /ended while it started/);
+    const list = await read();
+    assert.equal(findTask(list, "T0")?.result, "aborted by @lead: changed plan");
+    assert.deepEqual(herdr.closed, ["w1:p10"]);
+    assert.ok(!herdr.calls.some((call) => call.startsWith("start ")));
+  });
+  it("lets a sub-agent abort its own sub-agent, but not a sibling", async () => {
+    await twoLevels();
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Other", type: "code" });
+    });
+    await delegate(context(), { id: "T1", model: "p/m", thinking: "low" });
+    const child = toolsOf("tau-t0", "T0").tools;
+    await assert.rejects(abort(child, { id: "T1", reason: "x" }), /@tau-t1 owns task T1, and you did not start it/);
+    assert.equal(findTask(await read(), "T1")?.status, "in_progress");
+    assert.match(await abort(child, { id: "T0.1", reason: "x" }), /^Aborted T0\.1: tau ended @tau-t0-1, and closed its pane\./);
+    assert.equal(findTask(await read(), "T0.1")?.result, "aborted by @tau-t0: x");
+  });
+
+  it("closes the current pane of a sub-agent that moved", async () => {
+    await twoLevels();
+    // herdr moved tau-t0-1 to a new pane (a moved pane gets a new ID).
+    herdr.panes.delete("w1:p11");
+    herdr.panes.add("w1:p99");
+    herdr.agents = herdr.agents.map((agent) => (agent.name === "tau-t0-1" ? { ...agent, paneId: "w1:p99" } : agent));
+    await abort(toolsOf("lead").tools, { id: "T0.1", reason: "x" });
+    assert.deepEqual(herdr.closed, ["w1:p99"]);
+  });
+
+  it("does not close a pane where a different agent with the same name runs", async () => {
+    await twoLevels();
+    herdr.agents = herdr.agents.map((agent) =>
+      agent.name === "tau-t0-1" ? { ...agent, session: "/s/2026_someone-else.jsonl" } : agent,
+    );
+    await abort(toolsOf("lead").tools, { id: "T0.1", reason: "x" });
+    assert.deepEqual(herdr.closed, []);
+  });
+
+  it("does not close a pane from the name alone, when the pane is not its own", async () => {
+    herdr.recordSession = false;
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    // No session is recorded: the name is not proof. This process did not make the pane.
+    await abort(toolsOf("lead").tools, { id: "T0", reason: "x" });
+    assert.deepEqual(herdr.closed, []);
+  });
+
+  it("does not close an occupied pane without a known session, also when this process made it, and tells it", async () => {
+    herdr.recordSession = false;
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const text = await abort(toolsOf("lead", undefined, createdPanes).tools, { id: "T0", reason: "x" });
+    assert.deepEqual(herdr.closed, []);
+    assert.match(text, /tau did not close the panes w1:p10 \(@tau-t0\): it cannot prove that the ended agent is in them, and it does not try again\./);
+  });
+
+  it("tells when herdr fails and the pane is not closed yet", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    herdr.listAgents = async () => {
+      throw new Error("herdr is busy");
+    };
+    const text = await abort(toolsOf("lead").tools, { id: "T0", reason: "x" });
+    assert.match(text, /could not close the panes of @tau-t0 yet/);
+    assert.equal(findTask(await read(), "T0")?.status, "failed");
+  });
+
+  it("runs a new check when a check runs while tau_abort schedules the close", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const lead = toolsOf("lead", undefined, new Set(["w1:p50"]));
+    herdr.panes.add("w1:p50");
+    // A check that runs now, and waits in the close of a different pane.
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    let reached!: () => void;
+    const inClose = new Promise<void>((resolve) => (reached = resolve));
+    const close = herdr.closePane.bind(herdr);
+    herdr.closePane = async (pane) => {
+      if (pane === "w1:p50") {
+        reached();
+        await blocked;
+      }
+      await close(pane);
+    };
+    lead.supervisor.scheduleClose("w1:p50", "tau-old");
+    const running = lead.supervisor.check();
+    // The check passed its list of closes, and waits in the close of w1:p50.
+    await inClose;
+    const aborting = abort(lead.tools, { id: "T0", reason: "x" });
+    // tau_abort changes the list, then schedules its close and waits.
+    for (let i = 0; i < 100 && lead.supervisor.closeOutcome("w1:p10") !== "pending"; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(lead.supervisor.closeOutcome("w1:p10"), "pending");
+    release();
+    await running;
+    const text = await aborting;
+    assert.deepEqual(herdr.closed, ["w1:p50", "w1:p10"]);
+    assert.doesNotMatch(text, /could not close/);
+  });
+
+  it("keeps a close request when the agent moved again before the pane list", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const lead = toolsOf("lead");
+    const agents = herdr.agents;
+    // herdr shows the agent in w1:p98, but the pane list (a moment later) has w1:p99.
+    herdr.agents = agents.map((agent) => ({ ...agent, paneId: "w1:p98" }));
+    herdr.panes.delete("w1:p10");
+    herdr.panes.add("w1:p99");
+    const text = await abort(lead.tools, { id: "T0", reason: "x" });
+    assert.match(text, /could not close the panes of @tau-t0 yet/);
+    assert.equal(lead.supervisor.closeOutcome("w1:p10"), "pending");
+    // The next check finds the agent in its current pane.
+    herdr.agents = agents.map((agent) => ({ ...agent, paneId: "w1:p99" }));
+    await lead.supervisor.check();
+    assert.deepEqual(herdr.closed, ["w1:p99"]);
+    assert.equal(lead.supervisor.closeOutcome("w1:p10"), "closed");
+  });
+
+  it("stops a delegation that an abort ends after pi started, and sends no prompt", async () => {
+    const { tools } = toolsOf("lead", undefined, createdPanes);
+    const original = herdr.startPiAgent.bind(herdr);
+    herdr.startPiAgent = async (name, pane, args) => {
+      await original(name, pane, args);
+      await abort(tools, { id: "T0", reason: "changed plan" });
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /ended while it started/);
+    assert.equal(findTask(await read(), "T0")?.result, "aborted by @lead: changed plan");
+    assert.ok(!herdr.calls.some((call) => call.startsWith("prompt ")));
+    assert.deepEqual(herdr.closed, ["w1:p10"]);
+  });
+
+  it("does not report a start when an abort comes while the first prompt is sent", async () => {
+    const { tools } = toolsOf("lead", undefined, createdPanes);
+    const original = herdr.prompt.bind(herdr);
+    herdr.prompt = async (name, text) => {
+      await original(name, text);
+      await abort(tools, { id: "T0", reason: "late" });
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /ended while it started/);
+    assert.equal(findTask(await read(), "T0")?.result, "aborted by @lead: late");
+  });
+
+  it("keeps the abort result when a stopped agent tries to close its blocked task", async () => {
+    // T0 is delegated to tau-t0. The lead claimed the sub-task T0.1 itself.
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T0" });
+    });
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await store.mutate((list) => {
+      claimTask(list, LEAD, "T0.1");
+    });
+    const lead = toolsOf("lead");
+    const text = await abort(lead.tools, { id: "T0", reason: "stop" });
+    assert.match(text, /These tasks stay in progress, because they have open sub-tasks: T0\./);
+    assert.equal(findTask(await read(), "T0.1")?.owner, "lead");
+
+    // The stopped process still runs for a short time. It cannot close T0.
+    const stopped = toolsOf("tau-t0", "T0").tools;
+    await assert.rejects(
+      stopped.get("tau_complete")!.execute("1", { id: "T0", result: "finished anyway" }),
+      /ended\. It cannot change tasks/,
+    );
+    // When the lead closes T0.1, the liveness check fails T0.
+    await store.mutate((list) => {
+      completeTask(list, LEAD, "T0.1", "done");
+    });
+    await lead.supervisor.check();
+    const task = findTask(await read(), "T0")!;
+    assert.equal(task.status, "failed");
+    assert.equal(task.result, OWNER_EXITED);
+    assert.equal(task.retryable, true);
+  });
+
+  it("changes nothing when the session cannot stop agents", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await assert.rejects(abort(toolsOf("lead", undefined, new Set(), false).tools, { id: "T0", reason: "x" }), /cannot stop sub-agents/);
+    assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+  });
+
+  it("refuses a reason that makes the result too long, and changes nothing", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await assert.rejects(abort(toolsOf("lead").tools, { id: "T0", reason: "x".repeat(19_995) }), /The reason has \d+ characters/);
+    assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+    assert.equal((await read()).agents[0]?.state, "running");
+  });
+  it("does not close the new pane in the cleanup when herdr cannot list the agents", async () => {
+    const later: string[] = [];
+    let lists = 0;
+    herdr.listAgents = async () => {
+      lists += 1;
+      if (lists > 1) throw new Error("herdr is busy");
+      return [];
+    };
+    herdr.failStart = new Error("no pi");
+    await assert.rejects(
+      delegate({ ...context(), closeLater: (pane) => later.push(pane) }, { id: "T0", model: "p/m", thinking: "low" }),
+      /The pane w1:p10 is still open\. tau tries to close it later, when this is safe/,
+    );
+    assert.deepEqual(herdr.closed, []);
+    assert.deepEqual(later, ["w1:p10"]);
+  });
+
+  it("does not close the new pane in the cleanup when a different agent with the same name is in it", async () => {
+    const later: string[] = [];
+    herdr.startPiAgent = async (name, pane) => {
+      await store.mutate((list) => rules.setAgentSession(list, name, "/s/2026_mine.jsonl"));
+      herdr.agents.push({ name, paneId: pane, status: "idle", session: "/s/2026_other.jsonl" });
+      throw new Error("no pi");
+    };
+    await assert.rejects(delegate({ ...context(), closeLater: (pane) => later.push(pane) }, { id: "T0", model: "p/m", thinking: "low" }));
+    assert.deepEqual(herdr.closed, []);
+    assert.deepEqual(later, ["w1:p10"]);
+  });
+
+  it("closes the new pane in the cleanup when the new sub-agent is in it", async () => {
+    herdr.startPiAgent = async (name, pane) => {
+      await store.mutate((list) => rules.setAgentSession(list, name, "/s/2026_mine.jsonl"));
+      herdr.agents.push({ name, paneId: pane, status: "idle", session: "/s/2026_mine.jsonl" });
+      throw new Error("no pi");
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /The task failed \(retryable: yes\)/);
+    assert.deepEqual(herdr.closed, ["w1:p10"]);
+  });
+
+  it("reports a correct start when a fast sub-agent completed its task before the check", async () => {
+    const original = herdr.prompt.bind(herdr);
+    herdr.prompt = async (name, text) => {
+      await original(name, text);
+      // The sub-agent completes T0, and its parent ends it.
+      await store.mutate((list) => {
+        completeTask(list, { actor: { name, scope: "T0" }, now: NOW }, "T0", "fast");
+        rules.endAgent(list, name, NOW);
+      });
+    };
+    const result = await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    assert.equal(result.agent, "tau-t0");
+  });
+
+  it("keeps a blocked task of an aborted start in progress, also when its sub-task closes before the cleanup", async () => {
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T0" });
+    });
+    const { tools } = toolsOf("lead", undefined, createdPanes);
+    const original = herdr.startPiAgent.bind(herdr);
+    herdr.startPiAgent = async (name, pane, args) => {
+      await original(name, pane, args);
+      await abort(tools, { id: "T0", reason: "changed plan" });
+      // The lead cancels the waiting sub-task before the start cleanup runs.
+      await store.mutate((list) => {
+        rules.cancelTask(list, LEAD, "T0.1", "not needed");
+      });
+    };
+    await assert.rejects(
+      delegate(context(), { id: "T0", model: "p/m", thinking: "low" }),
+      /The task stays in progress until its sub-tasks close\. Then tau fails it\./,
+    );
+    const task = findTask(await read(), "T0")!;
+    assert.equal(task.status, "in_progress");
+    assert.ok(!task.history.some((event) => event.kind === "failed"));
+  });
+
+  it("refuses all task changes of a stopped agent, and permits notes", async () => {
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T0" });
+    });
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await abort(toolsOf("lead").tools, { id: "T0", reason: "stop" });
+    const stopped = toolsOf("tau-t0", "T0").tools;
+    const call = (name: string, params: Record<string, unknown>) => stopped.get(name)!.execute("1", params);
+    for (const [name, params] of [
+      ["tau_create", { title: "More", type: "code", parent: "T0" }],
+      ["tau_update", { id: "T0.1", title: "Changed" }],
+      ["tau_cancel", { id: "T0.1", reason: "x" }],
+      ["tau_fail", { id: "T0", result: "x", retryable: true }],
+      ["tau_claim", { id: "T0.1" }],
+    ] as const) {
+      await assert.rejects(call(name, params), /ended\. It cannot change tasks/, name);
+    }
+    await call("tau_note", { task: "T0", text: "a finding" });
+    const list = await read();
+    assert.equal(findTask(list, "T0.1")?.status, "waiting");
+    assert.equal(findTask(list, "T0.1")?.title, "Sub");
+    assert.equal(findTask(list, "T0")?.notes.length, 1);
+  });
+  it("keeps a close request when the agent moves between the agent list and the pane list", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const lead = toolsOf("lead");
+    // The agent list shows the agent in its recorded pane w1:p10; then herdr
+    // moves it to w1:p99 before the pane list.
+    herdr.listPanes = async () => new Set(["w1:p1", "w1:p99"]);
+    const text = await abort(lead.tools, { id: "T0", reason: "x" });
+    assert.match(text, /could not close the panes of @tau-t0 yet/);
+    herdr.agents = herdr.agents.map((agent) => ({ ...agent, paneId: "w1:p99" }));
+    await lead.supervisor.check();
+    assert.deepEqual(herdr.closed, ["w1:p99"]);
+  });
+
+  it("asks the supervisor to close the current pane of a new sub-agent that moved before the cleanup", async () => {
+    const later: Array<[string, string, string | undefined]> = [];
+    herdr.startPiAgent = async (name, pane) => {
+      await store.mutate((list) => rules.setAgentSession(list, name, "/s/2026_mine.jsonl"));
+      // The new pi runs, then herdr moves its pane.
+      herdr.panes.delete(pane);
+      herdr.panes.add("w1:p77");
+      herdr.agents.push({ name, paneId: "w1:p77", status: "idle", session: "/s/2026_mine.jsonl" });
+      throw new Error("no pi");
+    };
+    await assert.rejects(
+      delegate({ ...context(), closeLater: (pane, agent, session) => later.push([pane, agent, session]) }, {
+        id: "T0",
+        model: "p/m",
+        thinking: "low",
+      }),
+      /is still open/,
+    );
+    assert.deepEqual(later, [["w1:p10", "tau-t0", "/s/2026_mine.jsonl"]]);
+    // The supervisor finds the agent by its session, and closes its current pane.
+    const supervisor = new Supervisor({ store, herdr: herdr as unknown as HerdrClient, actor: { name: "lead" }, now: () => NOW, createdPanes });
+    const [pane, agent, session] = later[0]!;
+    supervisor.scheduleClose(pane, agent, session);
+    await supervisor.check();
+    assert.deepEqual(herdr.closed, ["w1:p77"]);
+  });
+
+  it("does not report a start when a different agent completed a retry of the task", async () => {
+    const original = herdr.prompt.bind(herdr);
+    herdr.prompt = async (name, text) => {
+      await original(name, text);
+      // An abort, then a retry by a different agent that completes at once.
+      await store.mutate((list) => {
+        rules.abortTask(list, LEAD, "T0", "restart");
+        rules.delegateTask(list, LEAD, { id: "T0", agent: "tau-t0-2" });
+        completeTask(list, { actor: { name: "tau-t0-2", scope: "T0" }, now: NOW }, "T0", "done by the retry");
+      });
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /ended while it started/);
+    assert.equal(findTask(await read(), "T0")?.result, "done by the retry");
   });
 });

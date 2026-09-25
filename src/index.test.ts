@@ -9,7 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import tau, { createTau, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { seedTaskList } from "./tasks/model.ts";
-import { createTask, delegateTask, setAgentPane } from "./tasks/rules.ts";
+import { createTask, delegateTask, setAgentPane, setAgentSession } from "./tasks/rules.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -29,7 +29,9 @@ interface FakePi {
  * records its name, so that a test can prove that the extension did not use
  * it.
  */
-function fakePi(reply: { code: number; stdout: string }): FakePi {
+type Reply = { code: number; stdout: string };
+
+function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
   const handlers = new Map<string, Handler[]>();
   const execCalls: string[][] = [];
   const otherCalls: string[] = [];
@@ -47,7 +49,8 @@ function fakePi(reply: { code: number; stdout: string }): FakePi {
     },
     async exec(command: string, args: string[]) {
       execCalls.push([command, ...args]);
-      return { stdout: reply.stdout, stderr: "", code: reply.code, killed: false };
+      const answer = typeof reply === "function" ? reply(args) : reply;
+      return { stdout: answer.stdout, stderr: "", code: answer.code, killed: false };
     },
   };
   const api = new Proxy(known, {
@@ -454,6 +457,48 @@ describe("tau extension", () => {
     await pi.tools.get("tau_claim")!.execute("2", { id: "T0" });
     await pi.tools.get("tau_complete")!.execute("3", { result: "done" });
     assert.equal(await boundary(), undefined);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("tau_abort closes the pane of the stopped sub-agent through the supervisor", async () => {
+    enableHerdr();
+    const leadDeps = { ...deps };
+    // The lead list: T0 was delegated to tau-t0, which runs in pane w1:p2.
+    const file = join(root, "tau", "tasklists", "abort-1.db");
+    const store = new TaskListStore(file);
+    await store.ensure(() => seedTaskList("abort-1", "2026-01-01T00:00:00.000Z"));
+    await store.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p2");
+      setAgentSession(list, "tau-t0", "/s/2026_sub.jsonl");
+    });
+    store.close();
+    let closed = false;
+    const pi = fakePi((args) => {
+      if (args[0] === "agent" && args[1] === "list") {
+        const agents = closed ? [] : [{ name: "tau-t0", pane_id: "w1:p2", agent_status: "working", agent_session: { value: "/s/2026_sub.jsonl" } }];
+        return { code: 0, stdout: JSON.stringify({ result: { agents } }) };
+      }
+      if (args[0] === "pane" && args[1] === "list") {
+        return { code: 0, stdout: JSON.stringify({ result: { panes: closed ? [{ pane_id: "w1:p1" }] : [{ pane_id: "w1:p1" }, { pane_id: "w1:p2" }] } }) };
+      }
+      if (args[0] === "pane" && args[1] === "close") closed = true;
+      return { code: 0, stdout: PANE_REPLY };
+    });
+    const { ctx } = fakeCtx(true, "abort-1");
+    createTau(pi.api, leadDeps);
+    await emit(pi, "session_start", ctx);
+
+    const result = (await pi.tools.get("tau_abort")!.execute("1", { id: "T0", reason: "stop it" })) as {
+      content: Array<{ text: string }>;
+    };
+
+    assert.match(result.content[0]!.text, /^Aborted T0: tau ended @tau-t0/);
+    assert.ok(pi.execCalls.some((call) => call[1] === "pane" && call[2] === "close" && call[3] === "w1:p2"));
+    const reread = new TaskListStore(file);
+    const list = (await reread.read())!;
+    reread.close();
+    assert.equal(list.tasks[0]?.result, "aborted by @lead: stop it");
     await emit(pi, "session_shutdown", ctx);
   });
 

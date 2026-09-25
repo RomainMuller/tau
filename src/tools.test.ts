@@ -66,6 +66,7 @@ describe("task tools", () => {
   it("registers all task tools with the tau_ prefix", () => {
     assert.deepEqual([...tools.keys()].sort(), [...TASK_TOOL_NAMES].sort());
     assert.deepEqual([...TASK_TOOL_NAMES].sort(), [
+      "tau_abort",
       "tau_ask_user",
       "tau_cancel",
       "tau_claim",
