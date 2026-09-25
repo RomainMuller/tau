@@ -166,23 +166,31 @@ sub-task for each deliverable:
 The task list shows as a tree under the herdr badge. The root tasks stem from
 the 🟢 badge.
 
-**Default view.** `completed` and `canceled` tasks are hidden. `⧗` shows only
-the dependencies that are not complete.
+By default, task IDs show as [colored pills](#colored-id-pills). The previews
+in this section show the status marks instead (the `idPills: false` option),
+because a text preview cannot show colors.
+
+**Default view.** `completed` and `canceled` tasks are hidden. A closed task
+shows only when one of its sub-tasks shows (for example, a `failed` sub-task
+of a `completed` task). `⧗` shows only the dependencies that are not
+complete.
 
 ```text
-🟢 Herdr ─ 2 waiting · 2 running · 2 done · 1 failed
+🟢 Herdr ─ 2 waiting · 2 running · 2 done · 1 failed · 1 canceled
 ├─ ◐ T2    Add magic-link login endpoint         @lead
 │  ├─ ◐ T2.1  Create login_tokens table          @tau-t2-1
 │  └─ ○ T2.2  Write endpoint tests               ⧗ T2.1
 ├─ ○ T3    Update login page                     ⧗ T2
-└─ ✖ T4    Security review of token storage      @tau-t4 · agent exited
+└─ ✖ T4    Security review of token storage      @tau-t4 · owner agent exited
 ╭──────────────────────────────────────────────────────────────╮
 │ >                                                            │
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
 **All tasks view** (after `ctrl+shift+t`). `⧗` shows all dependencies. A
-dependency that is complete has a `✔`.
+dependency that is complete has a `✔` (with pills, the green pill shows it).
+The line limit of [Tall trees](#tall-trees) applies to this view too: this
+preview shows 8 lines, as with `maxTreeLines: 8`.
 
 ```text
 🟢 Herdr ─ 2 waiting · 2 running · 2 done · 1 failed · 1 canceled
@@ -192,7 +200,7 @@ dependency that is complete has a `✔`.
 │  ├─ ◐ T2.1  Create login_tokens table          @tau-t2-1     ⧗ T1✔
 │  └─ ○ T2.2  Write endpoint tests               ⧗ T1✔ T2.1
 ├─ ○ T3    Update login page                     ⧗ T2
-├─ ✖ T4    Security review of token storage      @tau-t4 · agent exited
+├─ ✖ T4    Security review of token storage      @tau-t4 · owner agent exited
 └─ ⊘ T5    Add SMS login                         canceled
 ```
 
@@ -234,7 +242,7 @@ in the [configuration](#configuration).
 │  ├─ T2.1  Create login_tokens table        @tau-t2-1
 │  └─ T2.2  Write endpoint tests             ⧗ T2.1
 ├─ T3    Update login page                   ⧗ T2
-└─ T4    Security review of token storage    @tau-t4 · agent exited
+└─ T4    Security review of token storage    @tau-t4 · owner agent exited
 ```
 
 | Status        | Pill color                  |
@@ -257,7 +265,7 @@ tells how many tasks are not shown. You can change the limit in the
 │  ├─ ◐ T2.1  Create login_tokens table          @tau-t2-1
 │  └─ ○ T2.2  Write endpoint tests               ⧗ T2.1
 ├─ ○ T3    Update login page                     ⧗ T2
-├─ ✖ T4    Security review of token storage      @tau-t4 · agent exited
+├─ ✖ T4    Security review of token storage      @tau-t4 · owner agent exited
 ├─ ◐ T6    Add rate limit to login               @tau-t6
 └─ … 7 more (/tau to see all)
 ```
@@ -724,7 +732,13 @@ cannot contain control characters.
 |-------------------|------------------------------------------------------|
 | `ctrl+shift+t`    | Show or hide `completed` and `canceled` tasks.       |
 | `/tau`            | Show the full task list in a dialog.                 |
-| `/tau show <id>`  | Show one task with all fields.                       |
+| `/tau show <id>`  | Show one task with all fields, complete.             |
+
+`/tau` shows all tasks, with no line limit. `/tau show <id>` shows the
+complete text of each field, with all notes and all history events. Long
+lines wrap. When the text is taller than the screen, use `Up`, `Down`,
+`Page Up`, `Page Down`, `Home`, and `End` to move it. Press `Esc`, `Enter`,
+or `q` to close the dialog.
 
 ---
 

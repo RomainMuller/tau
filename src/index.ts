@@ -1,6 +1,7 @@
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { WIDGET_KEY, widgetLines } from "./badge.ts";
+import { badgeText, WIDGET_KEY, widgetLines } from "./badge.ts";
+import { registerCommands } from "./commands.ts";
 import { checkGate } from "./gate.ts";
 import { detectHerdr, type Exec, type HerdrStatus } from "./herdr.ts";
 import { TauError } from "./tasks/errors.ts";
@@ -10,6 +11,7 @@ import type { Actor } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
+import { TreeWidget } from "./widget.ts";
 
 /** Things that tests can replace. */
 export interface TauDependencies {
@@ -45,17 +47,34 @@ export default function tau(pi: ExtensionAPI): void {
   createTau(pi, DEFAULT_DEPENDENCIES);
 }
 
-export function createTau(pi: ExtensionAPI, deps: TauDependencies): void {
+/** The state of a tau runtime. Only for tests. */
+export interface TauHandle {
+  readonly widget: TreeWidget | undefined;
+}
+
+export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   const exec: Exec = (command, args, options) => pi.exec(command, args, options);
   let detection: Promise<HerdrStatus> | undefined;
   let session: TaskSession | undefined;
+  let widget: TreeWidget | undefined;
+  /** True after session_shutdown. A session_start that still waits then stops. */
+  let shutDown = false;
 
   pi.on("session_start", async (_event, ctx) => {
     // Keep the promise, not the result, so that two events that start at the
     // same time share one herdr call.
     detection ??= detectHerdr(exec);
     const status = await detection;
+    if (shutDown) return;
 
+    if (widget !== undefined) {
+      // A later session_start of the same runtime: show the tree again.
+      // pi disposes the old component when a widget is set again.
+      if (ctx.hasUI) {
+        ctx.ui.setWidget(WIDGET_KEY, widget.factory);
+      }
+      return;
+    }
     if (ctx.hasUI) {
       ctx.ui.setWidget(WIDGET_KEY, widgetLines(status));
     }
@@ -71,25 +90,61 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): void {
       return;
     }
     const store = await openTaskList(ctx, deps);
-    if (store === undefined || session !== undefined) {
+    if (shutDown) {
+      store?.close();
       return;
     }
+    if (session !== undefined) {
+      // A different session_start of this runtime registered tau while this
+      // one waited. Show its tree, and close the second store.
+      store?.close();
+      // TypeScript does not see that `widget` can change during the await.
+      const current = widget as TreeWidget | undefined;
+      if (ctx.hasUI && current !== undefined) {
+        ctx.ui.setWidget(WIDGET_KEY, current.factory);
+      }
+      return;
+    }
+    if (store === undefined) {
+      return;
+    }
+    const tree = new TreeWidget(store, { badge: badgeText(status) });
+    widget = tree;
     session = {
       store,
       actor: LEAD,
       now: deps.now,
       taskTypes: DEFAULT_TASK_TYPE_DEFINITIONS,
+      onChange: () => void tree.refresh(),
     };
     registerTaskTools(pi, session);
     registerWorkGate(pi, session);
+    registerCommands(pi, store, tree, badgeText(status));
+    await tree.refresh();
+    if (shutDown) {
+      store.close();
+      return;
+    }
+    if (ctx.hasUI) {
+      ctx.ui.setWidget(WIDGET_KEY, tree.factory);
+    }
+    tree.start();
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    shutDown = true;
+    widget?.stop();
     session?.store.close();
     if (ctx.hasUI) {
       ctx.ui.setWidget(WIDGET_KEY, undefined);
     }
   });
+
+  return {
+    get widget() {
+      return widget;
+    },
+  };
 }
 
 /** The agent of the lead pi session. Sub-agents get their own name later. */

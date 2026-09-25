@@ -78,6 +78,11 @@ function fakeCtx(hasUI = true, sessionId = "session-1") {
   };
 }
 
+/** The widget calls with text lines (the badge), without the tree factory calls. */
+function badges(widgets: Array<{ key: string; lines: unknown }>): Array<{ key: string; lines: unknown }> {
+  return widgets.filter((widget) => typeof widget.lines !== "function");
+}
+
 async function emit(pi: FakePi, event: string, ctx: unknown): Promise<void> {
   for (const handler of pi.handlers.get(event) ?? []) {
     await handler({ type: event, reason: "startup" }, ctx);
@@ -139,7 +144,8 @@ describe("tau extension", () => {
 
     await emit(pi, "session_start", ctx);
 
-    assert.deepEqual(widgets, [{ key: "tau", lines: ["🟢 Herdr"] }]);
+    assert.deepEqual(badges(widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
+    assert.equal(typeof widgets.at(-1)?.lines, "function", "the tree widget replaces the badge");
     assert.deepEqual(pi.execCalls, [[HERDR_BIN, "pane", "current", "--current"]]);
   });
 
@@ -218,11 +224,10 @@ describe("tau extension", () => {
     await emit(pi, "session_start", second.ctx);
 
     assert.equal(pi.execCalls.length, 1);
-    assert.deepEqual(first.widgets, [{ key: "tau", lines: ["🟢 Herdr"] }]);
-    assert.deepEqual(second.widgets, [
-      { key: "tau", lines: ["🟢 Herdr"] },
-      { key: "tau", lines: ["🟢 Herdr"] },
-    ]);
+    assert.deepEqual(badges(first.widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
+    // The badge shows one time; the later start shows the tree again.
+    assert.deepEqual(badges(second.widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
+    assert.equal(typeof second.widgets.at(-1)?.lines, "function");
   });
 
   it("runs the herdr check again after a reload", async () => {
@@ -242,10 +247,8 @@ describe("tau extension", () => {
     await emit(before, "session_start", beforeCtx.ctx);
 
     assert.deepEqual(afterCtx.widgets, [{ key: "tau", lines: ["🔴 Herdr unavailable"] }]);
-    assert.deepEqual(beforeCtx.widgets, [
-      { key: "tau", lines: ["🟢 Herdr"] },
-      { key: "tau", lines: ["🟢 Herdr"] },
-    ]);
+    assert.deepEqual(badges(beforeCtx.widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
+    assert.equal(typeof beforeCtx.widgets.at(-1)?.lines, "function");
   });
 
   it("makes the task list with T0 when herdr is available", async () => {
@@ -397,5 +400,56 @@ describe("tau extension", () => {
     assert.equal(pi.handlers.get("tool_call"), undefined);
     assert.equal(pi.tools.size, 1);
     assert.match(notices[0]?.message ?? "", /tau_get/);
+  });
+
+  it("keeps the tree when a later session_start comes", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, widgets } = fakeCtx(true, "again");
+    createTau(pi.api, deps);
+
+    await emit(pi, "session_start", ctx);
+    await emit(pi, "session_start", ctx);
+
+    assert.equal(typeof widgets.at(-1)?.lines, "function", "the last widget is the tree");
+    assert.equal(badges(widgets).length, 1, "the badge shows only before the first tree");
+  });
+
+  it("draws the tree again after a tool changes the task list, and stops at shutdown", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, widgets } = fakeCtx(true, "draw");
+    const handle = createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+
+    let renders = 0;
+    const factory = widgets.at(-1)?.lines as (tui: unknown) => { render(width: number): string[] };
+    const component = factory({ requestRender: () => (renders += 1) });
+    assert.equal(component.render(80).length, 2);
+
+    await pi.tools.get("tau_create")!.execute("1", { title: "New task", type: "code" });
+    await handle.widget!.refresh();
+    assert.ok(renders >= 1);
+    assert.match(component.render(80).join("\n"), /New task/);
+
+    assert.equal(handle.widget?.running, true);
+    await emit(pi, "session_shutdown", ctx);
+    assert.equal(handle.widget?.running, false);
+    assert.deepEqual(widgets.at(-1), { key: "tau", lines: undefined });
+  });
+
+  it("does not start the tree when shutdown comes while session_start waits", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, widgets } = fakeCtx(true, "early-shutdown");
+    const handle = createTau(pi.api, deps);
+
+    const starting = emit(pi, "session_start", ctx);
+    await emit(pi, "session_shutdown", ctx);
+    await starting;
+
+    assert.equal(handle.widget?.running ?? false, false);
+    assert.equal(pi.handlers.get("tool_call"), undefined);
+    assert.ok(widgets.every((widget) => typeof widget.lines !== "function"));
   });
 });

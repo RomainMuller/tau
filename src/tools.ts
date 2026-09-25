@@ -31,6 +31,8 @@ export interface TaskSession {
   readonly actor: Actor;
   readonly now: () => string;
   readonly taskTypes: Readonly<Record<string, TaskTypeDefinition>>;
+  /** Called after each change of the task list by a tool. */
+  readonly onChange?: () => void;
 }
 
 interface ToolSpec {
@@ -316,6 +318,7 @@ async function change(
     taskTypes: Object.keys(session.taskTypes),
   };
   const { result } = await session.store.mutate((list) => operation(list, ctx));
+  session.onChange?.();
   return result;
 }
 
