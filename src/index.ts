@@ -1,16 +1,22 @@
+import { fileURLToPath } from "node:url";
+
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { badgeText, WIDGET_KEY, widgetLines } from "./badge.ts";
 import { registerCommands } from "./commands.ts";
 import { checkGate } from "./gate.ts";
+import { HerdrClient } from "./herdr-client.ts";
 import { detectHerdr, type Exec, type HerdrStatus } from "./herdr.ts";
+import { checkSubAgent, resolveIdentity, type Identity } from "./identity.ts";
+import { Supervisor } from "./supervisor.ts";
 import { TauError } from "./tasks/errors.ts";
 import { seedTaskList } from "./tasks/model.ts";
-import { taskListFile, tauDir } from "./tasks/paths.ts";
-import type { Actor } from "./tasks/rules.ts";
+import { tauDir } from "./tasks/paths.ts";
+import { setAgentSession } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
+import { cleanLine } from "./text.ts";
 import { TreeWidget } from "./widget.ts";
 
 /** Things that tests can replace. */
@@ -19,12 +25,19 @@ export interface TauDependencies {
   readonly agentDir: () => string;
   /** The current time, as an ISO 8601 text. */
   readonly now: () => string;
+  /** The environment (for the sub-agent identity). The default is `process.env`. */
+  readonly env?: NodeJS.ProcessEnv;
+  /** The time between two liveness checks, in milliseconds. */
+  readonly superviseMs?: number;
 }
 
 const DEFAULT_DEPENDENCIES: TauDependencies = {
   agentDir: getAgentDir,
   now: () => new Date().toISOString(),
 };
+
+/** The path of this extension. A sub-agent loads the same file. */
+const EXTENSION_PATH = fileURLToPath(import.meta.url);
 
 /**
  * The tau extension.
@@ -50,6 +63,8 @@ export default function tau(pi: ExtensionAPI): void {
 /** The state of a tau runtime. Only for tests. */
 export interface TauHandle {
   readonly widget: TreeWidget | undefined;
+  readonly supervisor: Supervisor | undefined;
+  readonly identity: Identity | undefined;
 }
 
 export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
@@ -57,6 +72,12 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   let detection: Promise<HerdrStatus> | undefined;
   let session: TaskSession | undefined;
   let widget: TreeWidget | undefined;
+  let supervisor: Supervisor | undefined;
+  let identity: Identity | undefined;
+  let herdrClient: HerdrClient | undefined;
+  let paneOfThisAgent: string | undefined;
+  /** The metadata report of session_start. Shutdown waits for it, then clears the metadata. */
+  let reporting: Promise<void> | undefined;
   /** True after session_shutdown. A session_start that still waits then stops. */
   let shutDown = false;
 
@@ -89,7 +110,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       );
       return;
     }
-    const store = await openTaskList(ctx, deps);
+    const opened = await openTaskList(ctx, deps, status.pane.paneId);
+    const store = opened?.store;
     if (shutDown) {
       store?.close();
       return;
@@ -108,18 +130,45 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     if (store === undefined) {
       return;
     }
-    const tree = new TreeWidget(store, { badge: badgeText(status) });
+    identity = opened!.identity;
+    const herdr = new HerdrClient(exec, status.binary);
+    herdrClient = herdr;
+    paneOfThisAgent = status.pane.paneId;
+    const createdPanes = new Set<string>();
+    const tree = new TreeWidget(store, { badge: badgeLabel(status, identity) });
     widget = tree;
+    const watcher = new Supervisor({
+      store,
+      herdr,
+      actor: identity.actor,
+      now: deps.now,
+      onChange: () => void tree.refresh(),
+      createdPanes,
+      ...(deps.superviseMs === undefined ? {} : { intervalMs: deps.superviseMs }),
+    });
+    supervisor = watcher;
     session = {
       store,
-      actor: LEAD,
+      actor: identity.actor,
       now: deps.now,
       taskTypes: DEFAULT_TASK_TYPE_DEFINITIONS,
       onChange: () => void tree.refresh(),
+      delegation: {
+        herdr,
+        paneId: status.pane.paneId,
+        cwd: ctx.cwd,
+        extensionPath: EXTENSION_PATH,
+        createdPanes,
+        closeLater: (pane, agent) => watcher.scheduleClose(pane, agent),
+      },
+      current: () => ({
+        ...(ctx.model === undefined ? {} : { model: `${ctx.model.provider}/${ctx.model.id}` }),
+        thinking: pi.getThinkingLevel(),
+      }),
     };
     registerTaskTools(pi, session);
     registerWorkGate(pi, session);
-    registerCommands(pi, store, tree, badgeText(status));
+    registerCommands(pi, store, tree, badgeLabel(status, identity));
     await tree.refresh();
     if (shutDown) {
       store.close();
@@ -129,12 +178,24 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       ctx.ui.setWidget(WIDGET_KEY, tree.factory);
     }
     tree.start();
+    watcher.start();
+    void watcher.check();
+    reporting = reportPane(herdr, status.pane.paneId, identity, store);
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     shutDown = true;
     widget?.stop();
+    supervisor?.stop();
     session?.store.close();
+    if (herdrClient !== undefined && paneOfThisAgent !== undefined && identity !== undefined) {
+      // The pane can stay open after pi stops: remove the tau metadata. Wait
+      // for the report first, so that it cannot set the metadata again.
+      await reporting;
+      await herdrClient
+        .clearMetadata(paneOfThisAgent, metadataSource(identity), ["tau_role", "tau_task", "tau_parent"])
+        .catch(() => undefined);
+    }
     if (ctx.hasUI) {
       ctx.ui.setWidget(WIDGET_KEY, undefined);
     }
@@ -144,11 +205,14 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     get widget() {
       return widget;
     },
+    get supervisor() {
+      return supervisor;
+    },
+    get identity() {
+      return identity;
+    },
   };
 }
-
-/** The agent of the lead pi session. Sub-agents get their own name later. */
-const LEAD: Actor = { name: "lead" };
 
 /**
  * Blocks tool calls that are not for an active task. See `gate.ts`. If tau
@@ -180,18 +244,79 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
 }
 
 /**
- * Opens the task list of the current session. Makes it with the task `T0`
- * when it does not exist. Returns `undefined` when the storage fails.
+ * Opens the task list of this process. A lead opens the list of its session,
+ * and makes it with the task `T0` if it does not exist. A sub-agent opens the
+ * list of its lead, and checks that the list gave it its task. Returns
+ * `undefined` when this fails.
  */
-async function openTaskList(ctx: ExtensionContext, deps: TauDependencies): Promise<TaskListStore | undefined> {
+async function openTaskList(
+  ctx: ExtensionContext,
+  deps: TauDependencies,
+  paneId: string,
+): Promise<{ store: TaskListStore; identity: Identity } | undefined> {
+  let store: TaskListStore | undefined;
   try {
     const sessionId = ctx.sessionManager.getSessionId();
-    const store = new TaskListStore(taskListFile(tauDir(deps.agentDir()), sessionId));
-    await store.ensure(() => seedTaskList(sessionId, deps.now()));
-    return store;
+    const identity = resolveIdentity(deps.env ?? process.env, tauDir(deps.agentDir()), sessionId);
+    store = new TaskListStore(identity.file);
+    if (identity.role === "lead") {
+      await store.ensure(() => seedTaskList(sessionId, deps.now()));
+    } else {
+      const list = await store.read();
+      if (list === undefined) {
+        throw new TauError("storage", `The task list ${identity.file} of the lead does not exist.`);
+      }
+      checkSubAgent(list, identity, paneId);
+      // Record the pi session, so that the parent knows this agent in herdr
+      // also after a pane move.
+      const session = ctx.sessionManager.getSessionFile() ?? sessionId;
+      await store.mutate((current) => setAgentSession(current, identity.actor.name, session));
+    }
+    return { store, identity };
   } catch (error) {
+    store?.close();
     report(ctx, error instanceof TauError ? error.message : `tau cannot open the task list: ${String(error)}`);
     return undefined;
+  }
+}
+
+/** The text of the badge: for a sub-agent, it tells its name and its task. */
+function badgeLabel(status: HerdrStatus, identity: Identity): string {
+  const badge = badgeText(status);
+  return identity.role === "lead" ? badge : `${badge} @${identity.actor.name} (${identity.actor.scope})`;
+}
+
+/** The herdr metadata source of this agent. */
+function metadataSource(identity: Identity): string {
+  return identity.role === "lead" ? "tau:lead" : `tau:${identity.actor.name}`;
+}
+
+/**
+ * Tells herdr what this pane is: the title, the agent label, and tokens.
+ * herdr shows this metadata. It is display-only: tau does not trust it.
+ */
+async function reportPane(herdr: HerdrClient, paneId: string, identity: Identity, store: TaskListStore): Promise<void> {
+  try {
+    if (identity.role === "lead") {
+      await herdr.reportMetadata(paneId, {
+        source: metadataSource(identity),
+        title: "tau lead",
+        displayAgent: "tau lead",
+        tokens: { tau_role: "lead" },
+      });
+      return;
+    }
+    const list = await store.read();
+    const task = list?.tasks.find((item) => item.id === identity.actor.scope);
+    const title = `${identity.actor.name} · ${identity.actor.scope}${task === undefined ? "" : ` ${cleanLine(task.title)}`}`;
+    await herdr.reportMetadata(paneId, {
+      source: metadataSource(identity),
+      title: [...title].slice(0, 80).join(""),
+      displayAgent: "tau sub-agent",
+      tokens: { tau_role: "subagent", tau_task: identity.actor.scope, tau_parent: identity.parent },
+    });
+  } catch {
+    // The metadata is only for display.
   }
 }
 

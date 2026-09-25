@@ -70,11 +70,13 @@ describe("task tools", () => {
       "tau_claim",
       "tau_complete",
       "tau_create",
+      "tau_delegate",
       "tau_fail",
       "tau_get",
       "tau_list",
       "tau_note",
       "tau_update",
+      "tau_wait",
     ]);
   });
 
@@ -325,5 +327,42 @@ describe("text cleaning", () => {
     assert.equal(cleanText("x\u001b]0;evil title\u0007y\u001b]8;;http://x\u001b\\z"), "xyz");
     assert.equal(cleanLine("one\ntwo\tthree"), "one two three");
     assert.equal(cleanText("a\u200bb\u2060c\ufeffd"), "abcd");
+  });
+});
+
+describe("tau_delegate and tau_wait tools", () => {
+  it("fails tau_delegate without a delegation context", async () => {
+    await assert.rejects(call("tau_delegate", { id: "T0" }), /cannot start sub-agents in this session/);
+  });
+
+  it("uses the model and the thinking level of the agent by default", async () => {
+    const seen: string[][] = [];
+    const herdr = {
+      listAgents: async () => [],
+      splitDirection: async () => "right",
+      splitPane: async () => "w1:p5",
+      startPiAgent: async (_name: string, _pane: string, args: string[]) => {
+        seen.push(args);
+      },
+      prompt: async () => undefined,
+      closePane: async () => undefined,
+    };
+    const withDelegation: TaskSession = {
+      ...session,
+      delegation: { herdr: herdr as never, paneId: "w1:p1", cwd: "/", extensionPath: "/tau.ts" },
+      current: () => ({ model: "prov/model-a", thinking: "high" }),
+    };
+    const map = register(withDelegation);
+    assert.match(await call("tau_delegate", { id: "T0" }, map), /Started @tau-t0 in pane w1:p5 for T0/);
+    assert.deepEqual(seen[0]?.slice(0, 4), ["--model", "prov/model-a", "--thinking", "high"]);
+    await assert.rejects(call("tau_delegate", { id: "T0", thinking: "huge" }, map), /not a thinking level/);
+  });
+
+  it("validates the tau_wait arguments", async () => {
+    await assert.rejects(call("tau_wait", { ids: ["x"] }), /is not a task ID/);
+    await assert.rejects(call("tau_wait", { ids: ["T9"] }), /Task T9 does not exist/);
+    await call("tau_claim", { id: "T0" });
+    await call("tau_complete", { result: "done" });
+    assert.match(await call("tau_wait", { ids: ["T0", "T0"] }), /^All 1 tasks are closed/);
   });
 });

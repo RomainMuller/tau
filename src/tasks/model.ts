@@ -106,6 +106,39 @@ export interface Task {
   history: TaskEvent[];
 }
 
+/** The name of the lead agent of each task list. */
+export const LEAD_AGENT = "lead";
+
+/** The state of a sub-agent. */
+export type AgentState = "starting" | "running" | "ended";
+
+/**
+ * A sub-agent that an agent started with `tau_delegate`. The record lets the
+ * parent agent watch its sub-agents (liveness), and close their panes.
+ */
+export interface AgentRecord {
+  /** The herdr agent name. For example `tau-t2-1`. */
+  readonly name: string;
+  /** The agent that started this sub-agent. */
+  readonly parent: string;
+  /** The task that the sub-agent received. */
+  readonly task: string;
+  /** The herdr pane of the sub-agent. Not set before the pane exists. */
+  pane?: string;
+  /**
+   * The pi session of the sub-agent (its session file, or its ID). The
+   * sub-agent records it when it starts. The parent uses it to know the
+   * sub-agent in herdr, also after a pane move.
+   */
+  session?: string;
+  state: AgentState;
+  readonly startedAt: string;
+  endedAt?: string;
+}
+
+/** The maximum number of agent records in a task list. */
+export const MAX_AGENTS = 1_000;
+
 export interface TaskList {
   /** The version of the file format. */
   readonly version: 1;
@@ -116,6 +149,11 @@ export interface TaskList {
   revision: number;
   /** All tasks, in the order of creation. Tasks are never removed. */
   tasks: Task[];
+  /**
+   * The sub-agents, in the order of start. These records are not part of the
+   * task history: a rollback keeps them.
+   */
+  agents: AgentRecord[];
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +347,16 @@ export function rollback(list: TaskList, revision: number): TaskList {
   if (!Number.isSafeInteger(revision) || revision < 0) {
     throw new TauError("invalid_argument", `The revision ${revision} is not valid.`);
   }
-  return { ...list, revision: Math.min(revision, list.revision), tasks: replay(list, revision) };
+  const tasks = replay(list, revision);
+  // Keep only the agents that got their task at or before `revision`.
+  const agents = list.agents
+    .filter((agent) =>
+      list.tasks
+        .find((task) => task.id === agent.task)
+        ?.history.some((event) => event.kind === "claimed" && event.actor === agent.name && event.seq <= revision),
+    )
+    .map((agent) => ({ ...agent }));
+  return { ...list, revision: Math.min(revision, list.revision), tasks, agents };
 }
 
 /** Makes the tasks again from their events, up to and with `revision`. */
@@ -332,7 +379,7 @@ export function replay(list: TaskList, revision: number = list.revision): Task[]
 
 /** Makes a new task list with the task `T0 Prepare task list`. */
 export function seedTaskList(sessionId: string, now: string): TaskList {
-  const list: TaskList = { version: 1, sessionId, createdAt: now, revision: 0, tasks: [] };
+  const list: TaskList = { version: 1, sessionId, createdAt: now, revision: 0, tasks: [], agents: [] };
   addTask(list, "T0", {
         kind: "created",
         at: now,

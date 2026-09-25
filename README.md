@@ -360,8 +360,24 @@ An aborted task has no special status. It is `failed`, with
 ### Liveness
 
 Each agent watches the sub-agents that it started. It runs `herdr agent list`
-every 5 seconds. When the owner of a task is not in the list, `tau` fails the
-task (rule 11).
+every 5 seconds (only when it has sub-agents). When a sub-agent starts, it
+records its pi session in its agent record. `tau` knows a sub-agent in the
+herdr list by this pi session, which stays the same when the pane moves or
+when a different agent gets the same name. (While a sub-agent starts, `tau`
+uses its name and its pane.) When a sub-agent is not in the list, `tau` fails
+its task (rule 11), and closes its pane. It does the same for the sub-agents of that sub-agent, at all depths,
+because nobody watches them now. A sub-agent that is still starting has 2
+minutes before `tau` checks it. When you move the pane of a sub-agent, `tau`
+records its new pane.
+
+A sub-agent ends when its task is closed, it has no live sub-agents, and it
+is idle. If it is not idle 2 minutes after its task closed, it ends too. An
+ended sub-agent cannot claim or delegate tasks.
+
+`tau` closes the pane of an ended sub-agent only when herdr shows that
+sub-agent in the pane, or when this pi made the pane and no agent is in it.
+So a wrong record cannot close a different pane, for example yours. When a
+close fails, `tau` tries again at the next check.
 
 The lead can also stop existing (for example, you close its pane). When you
 resume the lead session, `tau` compares the task owners with
@@ -437,19 +453,67 @@ sub-agents do the work.
 
 1. The lead calls `tau_delegate` with a task that nobody owns, a model, and a
    thinking level.
-2. `tau` splits the lead's herdr pane and starts a new pi agent in it:
-   `herdr agent start tau-t2-1 --kind pi --pane <new-pane> -- --model … --thinking …`
-3. `tau` sets the new agent as the task owner, and the status to `in_progress`.
-4. The sub-agent receives a prompt with the task and its context.
+2. `tau` gives the task to a new agent name, for example `tau-t2-1` for
+   `T2.1`. The new agent is the task owner, and the status is `in_progress`.
+   If the name is used (for example for a retry), `tau` adds a number:
+   `tau-t2-1-2`.
+3. `tau` splits the pane of the agent that delegates (to the right for a wide
+   pane, down for a narrow pane), and starts pi in the new pane:
+   `herdr agent start tau-t2-1 --kind pi --pane <new-pane> -- --model … --thinking … --extension <tau>`
+4. The sub-agent receives a first prompt: its task ID and title, and what to
+   do when the work is done.
 5. The sub-agent can see the full task list. It can change only its task and
    the sub-tasks of its task.
 6. The sub-agent can delegate its own sub-tasks to more sub-agents.
-7. When the sub-agent closes its task, `tau` closes its pane. The task
-   `result` keeps the output.
+7. When the sub-agent closed its task and is idle, `tau` closes its pane. The
+   task `result` keeps the output.
+
+If a step after step 2 fails (for example, pi does not start), the task
+becomes `failed` with `retryable: true`, and `tau` closes the new pane.
 
 Sub-agents are always pi agents. The new pane is a sibling of the pane of the
 agent that delegates, in the same tab. `tau` does not move the focus to the new
-pane.
+pane. The sub-agent loads the pi extensions of your pi settings, and tau.
+Extensions that you gave to the lead with `-e` only are not loaded.
+
+An agent can delegate a task while it works on a different task: delegation
+is not work. When the parent task is `in_progress`, only its owner can
+delegate its sub-tasks.
+
+### The identity of a sub-agent
+
+The new pane gets these environment variables:
+
+| Variable           | Value                                               |
+|--------------------|-----------------------------------------------------|
+| `TAU_TASKLIST`     | The path of the task list database of the lead.     |
+| `TAU_TASK_ID`      | The task of the sub-agent, for example `T2.1`.      |
+| `TAU_AGENT_NAME`   | The herdr name of the sub-agent: `tau-t2-1`.        |
+| `TAU_PARENT_AGENT` | The agent that started it: `lead` or `tau-…`.       |
+
+`tau` does not trust these values alone. The database must be in the tau
+directory, and the task list must have a record of this sub-agent, with the
+same task, parent, and herdr pane. The task must be `in_progress`, with the
+sub-agent as owner. If not, `tau` shows an error and registers nothing in
+that pi.
+
+These checks keep the agents of one user in order. They are not a security
+boundary between agents: a program of the same user (for example a `bash`
+command of a model) can change the environment and the database.
+
+### What herdr shows
+
+Each tau pi tells herdr what its pane is (`herdr pane report-metadata`):
+
+| Pane      | Title                         | Agent label     | Tokens                                          |
+|-----------|-------------------------------|-----------------|-------------------------------------------------|
+| lead      | `tau lead`                    | `tau lead`      | `tau_role=lead`                                 |
+| sub-agent | `tau-t2-1 · T2.1 <task title>` | `tau sub-agent` | `tau_role=subagent`, `tau_task=T2.1`, `tau_parent=lead` |
+
+herdr knows each sub-agent by its name (`herdr agent list`), and the herdr
+pi integration reports its state (`working`, `idle`, `blocked`). The badge of
+a sub-agent tells its name and its task: `🟢 Herdr @tau-t2-1 (T2.1)`. When pi
+stops, `tau` removes its metadata from the pane.
 
 At most 4 sub-agents run at the same time, for the full task list. You can
 change this limit in the [configuration](#configuration). When the limit is
@@ -480,9 +544,10 @@ user-wide `AGENTS.md` file or in skills (for example a `model-routing` skill).
 
 The description of the `tau_delegate` tool tells the agent this:
 
-> Before you call this tool, select the model and thinking level for the task
-> type. Use the model routing rules from `AGENTS.md` or skills. If no rule
-> applies, use the current model and thinking level.
+> Before you call this tool, select the model and the thinking level for the
+> task type. Use the model routing rules from AGENTS.md or from skills. If no
+> rule applies, omit model and thinking: the sub-agent then uses your model
+> and thinking level.
 
 ---
 
@@ -657,7 +722,7 @@ All tools exist only when herdr is available.
 | `tau_cancel`    | Cancel a `waiting` task, with a reason.                       |
 | `tau_delegate`  | Start a sub-agent for a task, with a model and thinking.      |
 | `tau_abort`     | Stop a sub-agent and fail its task, with a reason.            |
-| `tau_wait`      | Wait until each task in a list is closed, or a message arrives. |
+| `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). |
 | `tau_send`      | Send a message to an agent, with a priority.                  |
 | `tau_note`      | Add a note to a task.                                         |
 | `tau_ask_user`  | Last resort: ask the user a question, then end the turn.      |
@@ -715,7 +780,9 @@ The `id` is optional. The default is your active task. `tau_fail` needs
 ### Agent identity
 
 The tools get the agent name and its scope from the pi process, never from
-the tool arguments. A model cannot act as a different agent.
+the tool arguments. A model cannot act as a different agent through the tau
+tools. (See [The identity of a sub-agent](#the-identity-of-a-sub-agent) for
+the limits of this.)
 
 ### Text from agents
 

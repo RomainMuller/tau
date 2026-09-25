@@ -7,8 +7,13 @@
 import { isDeepStrictEqual } from "node:util";
 
 import { TauError } from "./errors.ts";
+import { isAgentName } from "../names.ts";
 import {
   isTaskId,
+  LEAD_AGENT,
+  MAX_AGENTS,
+  type AgentRecord,
+  type AgentState,
   MAX_HISTORY,
   MAX_NOTES,
   MAX_TASKS,
@@ -67,13 +72,63 @@ function checkList(value: unknown): TaskList {
     }
     ids.add(task.id);
   }
+  // Files from before the agent records have no `agents` field.
+  const rawAgents = list.agents === undefined ? [] : array(list.agents, "agents");
+  if (rawAgents.length > MAX_AGENTS) {
+    throw new ShapeError(`it has ${rawAgents.length} agents, and the maximum is ${MAX_AGENTS}`);
+  }
+  const agents = rawAgents.map((agent, index) => checkAgent(agent, `agents[${index}]`));
+  const names = new Set<string>();
+  for (const agent of agents) {
+    if (names.has(agent.name)) {
+      throw new ShapeError(`the agent name ${agent.name} is used two times`);
+    }
+    if (!ids.has(agent.task)) {
+      throw new ShapeError(`the task ${agent.task} of agent ${agent.name} does not exist`);
+    }
+    names.add(agent.name);
+  }
   return {
     version: 1,
     sessionId: string(list.sessionId, "sessionId"),
     createdAt: string(list.createdAt, "createdAt"),
     revision: integer(list.revision, "revision"),
     tasks,
+    agents,
   };
+}
+
+const AGENT_STATES: readonly AgentState[] = ["starting", "running", "ended"];
+
+function checkAgent(value: unknown, where: string): AgentRecord {
+  const agent = object(value, where);
+  const name = string(agent.name, `${where}.name`);
+  if (!isAgentName(name)) {
+    throw new ShapeError(`${where}.name ${JSON.stringify(name)} is not an agent name`);
+  }
+  const parent = string(agent.parent, `${where}.parent`);
+  if (parent !== LEAD_AGENT && !isAgentName(parent)) {
+    throw new ShapeError(`${where}.parent ${JSON.stringify(parent)} is not an agent name`);
+  }
+  const task = string(agent.task, `${where}.task`);
+  if (!isTaskId(task)) {
+    throw new ShapeError(`${where}.task ${JSON.stringify(task)} is not a task ID`);
+  }
+  const state = string(agent.state, `${where}.state`);
+  if (!(AGENT_STATES as readonly string[]).includes(state)) {
+    throw new ShapeError(`${where}.state ${JSON.stringify(state)} is not an agent state`);
+  }
+  const result: AgentRecord = {
+    name,
+    parent,
+    task,
+    state: state as AgentState,
+    startedAt: string(agent.startedAt, `${where}.startedAt`),
+  };
+  if (agent.pane !== undefined) result.pane = string(agent.pane, `${where}.pane`);
+  if (agent.session !== undefined) result.session = string(agent.session, `${where}.session`);
+  if (agent.endedAt !== undefined) result.endedAt = string(agent.endedAt, `${where}.endedAt`);
+  return result;
 }
 
 /**

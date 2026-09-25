@@ -25,6 +25,8 @@ import {
   nextTaskId,
   openDependencies,
   recordEvent,
+  MAX_AGENTS,
+  type AgentRecord,
   type Task,
   type TaskChanges,
   type TaskList,
@@ -163,8 +165,155 @@ export function updateTask(list: TaskList, ctx: RuleContext, id: string, changes
 
 export function claimTask(list: TaskList, ctx: RuleContext, id: string): Task {
   const task = getTask(list, checkId(id));
+  checkNotEnded(list, ctx);
   checkScope(ctx, task.id);
+  checkClaimable(list, task);
 
+  const active = activeTask(list, ctx.actor.name);
+  if (active !== undefined && !isDescendant(task.id, active.id)) {
+    throw new TauError(
+      "busy",
+      `You work on task ${active.id}. You can claim only a sub-task of ${active.id}. Close ${active.id} first to claim a different task.`,
+    );
+  }
+
+  recordEvent(list, task, { kind: "claimed", at: ctx.now, actor: ctx.actor.name });
+  return task;
+}
+
+/** The number of sub-agents that can run at the same time, for a task list. */
+export const DEFAULT_MAX_SUB_AGENTS = 4;
+
+export interface DelegateInput {
+  /** The task to give to the new sub-agent. */
+  readonly id: string;
+  /** The name of the new sub-agent. See `agentNameFor`. */
+  readonly agent: string;
+  /** The maximum number of sub-agents that run at the same time. */
+  readonly maxAgents?: number;
+}
+
+/**
+ * Gives a task to a new sub-agent: the sub-agent claims the task, and the
+ * list gets an agent record with the state `starting`.
+ *
+ * The delegating agent (`ctx.actor`) does not need to be free: delegation is
+ * not work. But the task must be in its scope, and when the parent task is
+ * in progress, the delegating agent must own it.
+ */
+export function delegateTask(list: TaskList, ctx: RuleContext, input: DelegateInput): Task {
+  const task = getTask(list, checkId(input.id));
+  checkNotEnded(list, ctx);
+  checkScope(ctx, task.id);
+  const parent = ancestorIds(task.id)[0];
+  const parentTask = parent === undefined ? undefined : getTask(list, parent);
+  if (parentTask?.status === "in_progress" && parentTask.owner !== ctx.actor.name) {
+    throw new TauError(
+      "permission_denied",
+      `@${parentTask.owner} owns the parent task ${parentTask.id}. Only the owner can delegate its sub-tasks.`,
+    );
+  }
+  checkClaimable(list, task);
+  if (list.agents.some((agent) => agent.name === input.agent)) {
+    throw new TauError("invalid_state", `The agent name ${input.agent} is already used.`);
+  }
+  const max = input.maxAgents ?? DEFAULT_MAX_SUB_AGENTS;
+  const running = list.agents.filter((agent) => agent.state !== "ended");
+  if (running.length >= max) {
+    throw new TauError(
+      "busy",
+      `${running.length} sub-agents run now (${running.map((agent) => `@${agent.name}`).join(", ")}). The maximum is ${max}. Use tau_wait to wait for one of their tasks.`,
+    );
+  }
+  if (list.agents.length >= MAX_AGENTS) {
+    throw new TauError("invalid_state", `The task list has ${MAX_AGENTS} agent records. This is the maximum.`);
+  }
+  recordEvent(list, task, { kind: "claimed", at: ctx.now, actor: input.agent });
+  list.agents.push({
+    name: input.agent,
+    parent: ctx.actor.name,
+    task: task.id,
+    state: "starting",
+    startedAt: ctx.now,
+  });
+  return task;
+}
+
+export function getAgent(list: TaskList, name: string): AgentRecord {
+  const agent = list.agents.find((item) => item.name === name);
+  if (agent === undefined) {
+    throw new TauError("not_found", `The agent @${name} does not exist in the task list.`);
+  }
+  return agent;
+}
+
+/** Records the pane of a sub-agent. */
+export function setAgentPane(list: TaskList, name: string, pane: string): AgentRecord {
+  const agent = getAgent(list, name);
+  agent.pane = pane;
+  return agent;
+}
+
+/** Records the pi session of a sub-agent. The sub-agent does this when it starts. */
+export function setAgentSession(list: TaskList, name: string, session: string): AgentRecord {
+  const agent = getAgent(list, name);
+  agent.session = session;
+  return agent;
+}
+
+/** Records that a sub-agent started and is ready for input. */
+export function markAgentRunning(list: TaskList, name: string): AgentRecord {
+  const agent = getAgent(list, name);
+  if (agent.state === "starting") agent.state = "running";
+  return agent;
+}
+
+/** Records that a sub-agent does not run anymore. */
+export function endAgent(list: TaskList, name: string, now: string): AgentRecord {
+  const agent = getAgent(list, name);
+  if (agent.state !== "ended") {
+    agent.state = "ended";
+    agent.endedAt = now;
+  }
+  return agent;
+}
+
+/** The sub-agents that `parent` started and that did not end. */
+export function liveChildAgents(list: TaskList, parent: string): AgentRecord[] {
+  return list.agents.filter((agent) => agent.parent === parent && agent.state !== "ended");
+}
+
+/** The sub-agents of `name`, at all depths, that did not end. Deepest first. */
+export function liveDescendantAgents(list: TaskList, name: string): AgentRecord[] {
+  const result: AgentRecord[] = [];
+  const visit = (parent: string) => {
+    for (const child of liveChildAgents(list, parent)) {
+      visit(child.name);
+      result.push(child);
+    }
+  };
+  visit(name);
+  return result;
+}
+
+/**
+ * Checks that the agent did not end. The parent of an ended sub-agent does
+ * not watch it anymore, so it must not claim or delegate work.
+ */
+function checkNotEnded(list: TaskList, ctx: RuleContext): void {
+  if (list.agents.some((agent) => agent.name === ctx.actor.name && agent.state === "ended")) {
+    throw new TauError(
+      "permission_denied",
+      `The sub-agent @${ctx.actor.name} ended. It cannot claim or delegate tasks. Stop now.`,
+    );
+  }
+}
+
+/**
+ * Checks that a task can be claimed: it is waiting or retryable, no
+ * ancestor is closed, and its dependencies are complete.
+ */
+function checkClaimable(list: TaskList, task: Task): void {
   if (task.status === "in_progress") {
     throw new TauError("invalid_state", `Task ${task.id} is already in progress. @${task.owner} owns it.`);
   }
@@ -195,17 +344,6 @@ export function claimTask(list: TaskList, ctx: RuleContext, id: string): Task {
       `Task ${task.id} waits for ${open.join(", ")}. Use tau_wait to wait for ${open.length === 1 ? "it" : "them"}.`,
     );
   }
-
-  const active = activeTask(list, ctx.actor.name);
-  if (active !== undefined && !isDescendant(task.id, active.id)) {
-    throw new TauError(
-      "busy",
-      `You work on task ${active.id}. You can claim only a sub-task of ${active.id}. Close ${active.id} first to claim a different task.`,
-    );
-  }
-
-  recordEvent(list, task, { kind: "claimed", at: ctx.now, actor: ctx.actor.name });
-  return task;
 }
 
 export function completeTask(list: TaskList, ctx: RuleContext, id: string, result: string): Task {

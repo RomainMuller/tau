@@ -8,6 +8,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import tau, { createTau, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
+import { seedTaskList } from "./tasks/model.ts";
+import { delegateTask, setAgentPane } from "./tasks/rules.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -65,7 +67,7 @@ function fakeCtx(hasUI = true, sessionId = "session-1") {
     notices,
     ctx: {
       hasUI,
-      sessionManager: { getSessionId: () => sessionId },
+      sessionManager: { getSessionId: () => sessionId, getSessionFile: () => `/sessions/2026_${sessionId}.jsonl` },
       ui: {
         setWidget(key: string, lines: unknown) {
           widgets.push({ key, lines });
@@ -76,6 +78,11 @@ function fakeCtx(hasUI = true, sessionId = "session-1") {
       },
     },
   };
+}
+
+/** The herdr detection calls (not the other herdr calls, such as metadata). */
+function detections(pi: FakePi): string[][] {
+  return pi.execCalls.filter((call) => call[1] === "pane" && call[2] === "current");
 }
 
 /** The widget calls with text lines (the badge), without the tree factory calls. */
@@ -106,7 +113,7 @@ describe("tau extension", () => {
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "tau-index-"));
-    deps = { agentDir: () => join(root, "agent"), now: () => "2026-01-01T00:00:00.000Z" };
+    deps = { agentDir: () => join(root, "agent"), now: () => "2026-01-01T00:00:00.000Z", env: {} };
     for (const name of ENV_NAMES) {
       saved.set(name, process.env[name]);
       delete process.env[name];
@@ -146,7 +153,7 @@ describe("tau extension", () => {
 
     assert.deepEqual(badges(widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
     assert.equal(typeof widgets.at(-1)?.lines, "function", "the tree widget replaces the badge");
-    assert.deepEqual(pi.execCalls, [[HERDR_BIN, "pane", "current", "--current"]]);
+    assert.deepEqual(detections(pi), [[HERDR_BIN, "pane", "current", "--current"]]);
   });
 
   it("shows the red badge and runs no command when HERDR_BIN_PATH is not set", async () => {
@@ -223,7 +230,7 @@ describe("tau extension", () => {
     await Promise.all([emit(pi, "session_start", first.ctx), emit(pi, "session_start", second.ctx)]);
     await emit(pi, "session_start", second.ctx);
 
-    assert.equal(pi.execCalls.length, 1);
+    assert.equal(detections(pi).length, 1);
     assert.deepEqual(badges(first.widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
     // The badge shows one time; the later start shows the tree again.
     assert.deepEqual(badges(second.widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
@@ -451,5 +458,70 @@ describe("tau extension", () => {
     assert.equal(handle.widget?.running ?? false, false);
     assert.equal(pi.handlers.get("tool_call"), undefined);
     assert.ok(widgets.every((widget) => typeof widget.lines !== "function"));
+  });
+
+  it("starts as a sub-agent with the identity from the environment", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-1.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-1", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p1");
+    });
+    lead.close();
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead" };
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "sub-session");
+    const handle = createTau(pi.api, { ...deps, env });
+
+    await emit(pi, "session_start", ctx);
+
+    assert.deepEqual(notices, []);
+    assert.deepEqual(handle.identity?.actor, { name: "tau-t0", scope: "T0" });
+    assert.ok(pi.tools.has("tau_complete"));
+    const reread = new TaskListStore(file);
+    assert.equal((await reread.read())?.agents[0]?.session, "/sessions/2026_sub-session.jsonl");
+    reread.close();
+    // The sub-agent does not make a task list for its own session.
+    await assert.rejects(readFile(join(root, "tau", "tasklists", "sub-session.db")), { code: "ENOENT" });
+    // tau reports the metadata in the background.
+    for (let i = 0; i < 50 && !pi.execCalls.some((call) => call[2] === "report-metadata"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const metadata = pi.execCalls.find((call) => call[2] === "report-metadata");
+    assert.deepEqual(metadata?.slice(3), [
+      "w1:p1",
+      "--source",
+      "tau:tau-t0",
+      "--title",
+      "tau-t0 · T0 Prepare task list",
+      "--display-agent",
+      "tau sub-agent",
+      "--token",
+      "tau_role=subagent",
+      "--token",
+      "tau_task=T0",
+      "--token",
+      "tau_parent=lead",
+    ]);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("registers nothing when the sub-agent identity does not agree with the task list", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-2.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-2", "2026-01-01T00:00:00.000Z"));
+    lead.close();
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead" };
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "sub-session");
+    createTau(pi.api, { ...deps, env });
+
+    await emit(pi, "session_start", ctx);
+
+    assert.equal(pi.tools.size, 0);
+    assert.match(notices[0]?.message ?? "", /has no sub-agent @tau-t0/);
   });
 });

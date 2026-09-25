@@ -5,12 +5,13 @@
  * from tool arguments. So a model cannot act as a different agent.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 
+import { checkModel, checkThinking, delegate, delegationText, THINKING_LEVELS, type DelegationContext } from "./delegate.ts";
 import { agentSummary, formatChange, formatList, formatSection, formatTask, TASK_SECTIONS, type TaskSection } from "./format.ts";
 import { TauError } from "./tasks/errors.ts";
-import { activeTask, getTask, type TaskList } from "./tasks/model.ts";
+import { activeTask, findTask, getTask, isClosed, isTaskId, type TaskList } from "./tasks/model.ts";
 import {
   addNote,
   cancelTask,
@@ -24,6 +25,7 @@ import {
 } from "./tasks/rules.ts";
 import type { TaskListStore } from "./tasks/store.ts";
 import type { TaskTypeDefinition } from "./tasks/types.ts";
+import { cleanLine } from "./text.ts";
 
 /** The state that the tools use. */
 export interface TaskSession {
@@ -33,6 +35,18 @@ export interface TaskSession {
   readonly taskTypes: Readonly<Record<string, TaskTypeDefinition>>;
   /** Called after each change of the task list by a tool. */
   readonly onChange?: () => void;
+  /** What `tau_delegate` needs. Without it, `tau_delegate` fails. */
+  readonly delegation?: Omit<DelegationContext, "store" | "actor" | "now">;
+  /** The model and thinking level of this agent: the default for sub-agents. */
+  readonly current?: () => { readonly model?: string; readonly thinking: string };
+  /** The time between two reads of `tau_wait`, in milliseconds. */
+  readonly waitPollMs?: number;
+}
+
+/** What a tool call gives to a tool, in addition to its arguments. */
+interface CallContext {
+  readonly signal: AbortSignal | undefined;
+  readonly ctx: ExtensionContext | undefined;
 }
 
 interface ToolSpec {
@@ -42,7 +56,7 @@ interface ToolSpec {
   readonly promptSnippet: string;
   readonly promptGuidelines?: string[];
   readonly parameters: TSchema;
-  readonly run: (session: TaskSession, params: Record<string, unknown>) => Promise<string>;
+  readonly run: (session: TaskSession, params: Record<string, unknown>, call: CallContext) => Promise<string>;
 }
 
 const ID = (description: string) => Type.String({ description, pattern: "^T(0|[1-9][0-9]*)(\\.[1-9][0-9]*)*$" });
@@ -253,8 +267,116 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
   ];
 }
 
+function delegationSpecs(): ToolSpec[] {
+  return [
+    {
+      name: "tau_delegate",
+      label: "tau delegate",
+      description: [
+        "Start a pi sub-agent in a new herdr pane, and give it a task. The sub-agent owns the task from the start, and closes it when the work is done. Delegation is the normal way to do work: give each task that can run alone to a sub-agent.",
+        "Before you call this tool, select the model and the thinking level for the task type. Use the model routing rules from AGENTS.md or from skills. If no rule applies, omit model and thinking: the sub-agent then uses your model and thinking level.",
+        "The task must be ready (dependencies complete) and nobody must own it. At most a small number of sub-agents run at the same time; when the limit is reached, use tau_wait.",
+      ].join("\n"),
+      promptSnippet: "Start a sub-agent for a task",
+      promptGuidelines: [
+        "Delegate each task that can run alone to a sub-agent with tau_delegate. Then wait for the sub-agents with tau_wait. Do not poll.",
+      ],
+      parameters: Type.Object({
+        id: ID("The task to give to the sub-agent."),
+        model: Type.Optional(Type.String({ description: "The pi model ID, as provider/model-id. The default is your model." })),
+        thinking: Type.Optional(
+          Type.String({ description: `The thinking level: ${THINKING_LEVELS.join(", ")}. The default is your thinking level.` }),
+        ),
+      }),
+      run: async (session, params) => {
+        if (session.delegation === undefined) {
+          throw new TauError("invalid_state", "tau cannot start sub-agents in this session.");
+        }
+        const current = session.current?.() ?? { thinking: "medium" };
+        const model = typeof params.model === "string" ? params.model : current.model;
+        if (model === undefined) {
+          throw new TauError("invalid_argument", "Give a model: tau does not know your model.");
+        }
+        const thinking = typeof params.thinking === "string" ? params.thinking : current.thinking;
+        const result = await delegate(
+          { ...session.delegation, store: session.store, actor: session.actor, now: session.now },
+          { id: String(params.id), model: checkModel(model), thinking: checkThinking(thinking) },
+        );
+        session.onChange?.();
+        const list = await session.store.read();
+        return delegationText(result, list === undefined ? undefined : findTask(list, result.task));
+      },
+    },
+    {
+      name: "tau_wait",
+      label: "tau wait",
+      description:
+        "Wait until each task in the list is closed. The call uses no tokens while it waits. It returns at once when one task fails, so that you can react. Use it to wait for sub-agents, or for tasks of other agents that your work depends on.",
+      promptSnippet: "Wait for tasks to close",
+      parameters: Type.Object({
+        ids: Type.Array(ID("A task ID."), { description: "The tasks to wait for.", minItems: 1 }),
+        timeout_seconds: Type.Optional(
+          Type.Integer({ minimum: 1, description: "Return after this time, also when tasks are still open." }),
+        ),
+      }),
+      run: async (session, params, call) => {
+        const ids = [...new Set((params.ids as unknown[]).map(String))];
+        for (const id of ids) {
+          if (!isTaskId(id)) throw new TauError("invalid_argument", `${JSON.stringify(id)} is not a task ID.`);
+        }
+        const timeout = typeof params.timeout_seconds === "number" ? params.timeout_seconds * 1_000 : undefined;
+        return waitForTasks(session, ids, { signal: call.signal, ...(timeout === undefined ? {} : { timeoutMs: timeout }) });
+      },
+    },
+  ];
+}
+
+/**
+ * Waits until all tasks are closed, one task fails, the time ends, or the
+ * signal aborts. Returns a summary.
+ */
+export async function waitForTasks(
+  session: TaskSession,
+  ids: readonly string[],
+  options: { signal?: AbortSignal | undefined; timeoutMs?: number } = {},
+): Promise<string> {
+  const started = Date.now();
+  const deadline = options.timeoutMs === undefined ? undefined : started + options.timeoutMs;
+  const poll = session.waitPollMs ?? 1_000;
+  for (;;) {
+    const list = await readList(session);
+    for (const id of ids) getTask(list, id);
+    const tasks = ids.map((id) => getTask(list, id));
+    const failed = tasks.filter((task) => task.status === "failed");
+    const done = tasks.every((task) => isClosed(task));
+    const timedOut = deadline !== undefined && Date.now() >= deadline;
+    const aborted = options.signal?.aborted === true;
+    if (done || failed.length > 0 || timedOut || aborted) {
+      const seconds = Math.round((Date.now() - started) / 1_000);
+      const header = done
+        ? `All ${tasks.length} tasks are closed (after ${seconds} s).`
+        : failed.length > 0
+          ? `${failed.map((task) => task.id).join(", ")} failed (after ${seconds} s). Other tasks can still be open.`
+          : aborted
+            ? "The wait was stopped."
+            : `The time ended (after ${seconds} s). Some tasks are still open.`;
+      const lines = tasks.map((task) => {
+        const extra =
+          task.status === "failed"
+            ? ` (${task.retryable === true ? "retryable" : "not retryable"})`
+            : task.status === "in_progress" && task.owner !== undefined
+              ? ` (@${task.owner})`
+              : "";
+        return `${task.id}  ${task.status}${extra}  ${cleanTitle(task.title)}`;
+      });
+      return [header, ...lines, "Use tau_get to read the results."].join("\n");
+    }
+    await sleep(poll, options.signal);
+  }
+}
+
 /** The names of all task tools. */
-export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set(specs({}).map((spec) => spec.name));
+export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set([...specs({}), ...delegationSpecs()].map((spec) => spec.name));
 
 /**
  * The task tool names that a different extension registered before tau. pi
@@ -270,7 +392,7 @@ export function conflictingTools(pi: ExtensionAPI): string[] {
 
 /** Registers the task tools. */
 export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void {
-  for (const spec of specs(session.taskTypes)) {
+  for (const spec of [...specs(session.taskTypes), ...delegationSpecs()]) {
     pi.registerTool({
       name: spec.name,
       label: spec.label,
@@ -282,10 +404,10 @@ export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void 
       // work gate checks each call after the tau calls before it changed the
       // task list (for example tau_complete, then bash, in one batch).
       executionMode: "sequential",
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         let text: string;
         try {
-          text = await spec.run(session, params as Record<string, unknown>);
+          text = await spec.run(session, params as Record<string, unknown>, { signal, ctx });
         } catch (error) {
           // Throwing makes a failed tool result. Give the model only the
           // message, which tells what to do.
@@ -333,4 +455,21 @@ function targetId(list: TaskList, session: TaskSession, id: unknown): string {
 
 function optionalString<K extends string>(key: K, value: unknown): { [P in K]?: string } {
   return typeof value === "string" ? ({ [key]: value } as { [P in K]: string }) : {};
+}
+
+function cleanTitle(title: string): string {
+  return cleanLine(title);
+}
+
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
