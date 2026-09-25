@@ -12,7 +12,8 @@ import { Supervisor } from "./supervisor.ts";
 import { TauError } from "./tasks/errors.ts";
 import { seedTaskList } from "./tasks/model.ts";
 import { tauDir } from "./tasks/paths.ts";
-import { setAgentSession } from "./tasks/rules.ts";
+import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
+import { setAgentSession, type Actor } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
@@ -147,6 +148,11 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       ...(deps.superviseMs === undefined ? {} : { intervalMs: deps.superviseMs }),
     });
     supervisor = watcher;
+    const guard = new StopGuard({
+      actor: identity.actor,
+      read: () => store.read(),
+      askToolActive: () => pi.getActiveTools().includes(ASK_TOOL),
+    });
     session = {
       store,
       actor: identity.actor,
@@ -165,9 +171,16 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
         ...(ctx.model === undefined ? {} : { model: `${ctx.model.provider}/${ctx.model.id}` }),
         thinking: pi.getThinkingLevel(),
       }),
+      onAskUser: (_question, toolCtx) => {
+        const target = toolCtx ?? ctx;
+        if (target.hasUI) {
+          target.ui.notify("⏸ tau: waiting for your answer. Type it as your next prompt.", "info");
+        }
+      },
     };
     registerTaskTools(pi, session);
     registerWorkGate(pi, session);
+    registerStopRule(pi, guard, identity.actor);
     registerCommands(pi, store, tree, badgeLabel(status, identity));
     await tree.refresh();
     if (shutDown) {
@@ -240,6 +253,55 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
       reason = `tau blocked the tool: it cannot read the task list (${error instanceof Error ? error.message : String(error)}).`;
     }
     return reason === undefined ? undefined : { block: true, reason };
+  });
+}
+
+/**
+ * The "do not stop" rule. See `stop.ts`. Each input from the user starts
+ * the rule again (also a steer or follow-up message in a run). At the end of a run,
+ * tau adds a continuation message when the agent has open work, and asks pi
+ * for one more model request.
+ */
+function registerStopRule(pi: ExtensionAPI, guard: StopGuard, actor: Actor): void {
+  pi.on("before_agent_start", (event) => {
+    const askToolActive = event.systemPromptOptions.selectedTools.includes(ASK_TOOL);
+    event.systemPromptOptions.sections[PROMPT_SECTION] = promptSection(actor, askToolActive);
+    return undefined;
+  });
+  // Input from the user (in the terminal, or from an RPC client) starts the
+  // rule again, also a steer or follow-up message while the agent works.
+  // Messages that extensions send do not: else an extension that sends
+  // messages again and again stops the limit of idle continuations.
+  pi.on("input", (event) => {
+    if (event.source !== "extension") guard.userPrompt();
+    return undefined;
+  });
+  // Decide after the complete tool batch, not from the order of the calls:
+  // the work gate can block a call before other tool_call handlers run.
+  pi.on("turn_end", (event) => {
+    guard.turnEnded(event.toolResults);
+    return undefined;
+  });
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (event.continue) {
+      // A different extension continues the run: the agent does not stop.
+      guard.continued();
+      return undefined;
+    }
+    const decision = await guard.settle(event.outcome);
+    if (decision.kind === "stop") return undefined;
+    if (decision.kind === "give_up" || decision.kind === "warn") {
+      if (ctx.hasUI) {
+        ctx.ui.notify(decision.text, "warning");
+      } else {
+        console.error(decision.text);
+      }
+      return undefined;
+    }
+    return {
+      entries: [...event.entries, { type: "custom_message", customType: CONTINUE_MESSAGE_TYPE, content: decision.text, display: true }],
+      continue: true,
+    };
   });
 }
 

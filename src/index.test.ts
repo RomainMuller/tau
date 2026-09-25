@@ -9,7 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import tau, { createTau, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { seedTaskList } from "./tasks/model.ts";
-import { delegateTask, setAgentPane } from "./tasks/rules.ts";
+import { createTask, delegateTask, setAgentPane } from "./tasks/rules.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -20,6 +20,8 @@ interface FakePi {
   /** The names of all other API members that the extension used. */
   readonly otherCalls: string[];
   readonly tools: Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>;
+  /** The tools that are not active (pi.getActiveTools). All registered tools are active by default. */
+  readonly inactive: Set<string>;
 }
 
 /**
@@ -32,8 +34,10 @@ function fakePi(reply: { code: number; stdout: string }): FakePi {
   const execCalls: string[][] = [];
   const otherCalls: string[] = [];
   const tools = new Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>();
+  const inactive = new Set<string>();
   const known = {
     getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+    getActiveTools: () => [...tools.keys()].filter((name) => !inactive.has(name)),
     registerTool(tool: { name: string; execute: (id: string, params: unknown) => Promise<unknown> }) {
       tools.set(tool.name, tool);
     },
@@ -56,7 +60,7 @@ function fakePi(reply: { code: number; stdout: string }): FakePi {
       };
     },
   }) as unknown as ExtensionAPI;
-  return { api, handlers, execCalls, otherCalls, tools };
+  return { api, handlers, execCalls, otherCalls, tools, inactive };
 }
 
 function fakeCtx(hasUI = true, sessionId = "session-1") {
@@ -364,6 +368,157 @@ describe("tau extension", () => {
     await emit(pi, "session_start", fakeCtx(true, "once").ctx);
 
     assert.equal(pi.handlers.get("tool_call")?.length, 1);
+    assert.equal(pi.handlers.get("turn_end")?.length, 1);
+    assert.equal(pi.handlers.get("agent_before_settle")?.length, 1);
+    assert.equal(pi.handlers.get("input")?.length, 1);
+    assert.equal(pi.handlers.get("before_agent_start")?.length, 1);
+  });
+
+  it("adds a continuation while tasks are open, and not after tau_ask_user", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "stop-1");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const settle = pi.handlers.get("agent_before_settle")![0]!;
+    const userMessage = () => pi.handlers.get("input")![0]!({ type: "input", text: "x", source: "interactive" }, ctx);
+    const turnEnd = (...names: string[]) =>
+      pi.handlers.get("turn_end")![0]!(
+        { type: "turn_end", toolResults: names.map((toolName) => ({ role: "toolResult", toolName, isError: false })) },
+        ctx,
+      );
+    const ask = async (...others: string[]) => {
+      await pi.tools.get("tau_ask_user")!.execute("1", { question: "Which one?" });
+      await turnEnd("tau_ask_user", ...others);
+    };
+    const earlier = { type: "custom", customType: "other-extension", data: 1 };
+    const boundary = (outcome = "completed", more: Record<string, unknown> = {}) =>
+      settle({ type: "agent_before_settle", outcome, entries: [earlier], continue: false, ...more }, ctx) as Promise<
+        { entries: Array<{ type: string; customType: string; content: string; display: boolean }>; continue: boolean } | undefined
+      >;
+
+    // Without an active tau_ask_user, the continuation does not tell to use it.
+    pi.inactive.add("tau_ask_user");
+    assert.doesNotMatch((await boundary())!.entries[1]!.content, /tau_ask_user/);
+    pi.inactive.delete("tau_ask_user");
+    await userMessage();
+
+    const first = await boundary();
+    assert.equal(first?.continue, true);
+    assert.match(first!.entries[1]!.content, /tau_ask_user/);
+    // The entries of earlier handlers stay, before the continuation message.
+    assert.equal(first?.entries.length, 2);
+    assert.equal(first?.entries[0], earlier);
+    assert.equal(first?.entries[1]?.type, "custom_message");
+    assert.equal(first?.entries[1]?.customType, "tau-continue");
+    assert.equal(first?.entries[1]?.display, true);
+    assert.match(first!.entries[1]!.content, /1 task is open \(T0\)\. .*\n  Ready now: T0\./);
+
+    // No continuation after an abort, or when a different extension continues.
+    assert.equal(await boundary("aborted"), undefined);
+    assert.equal(await boundary("completed", { continue: true }), undefined);
+
+    await ask();
+    assert.ok(notices.some((notice) => /waiting for your answer/.test(notice.message)));
+    assert.equal(await boundary(), undefined);
+
+    // The answer: the rule applies again.
+    await userMessage();
+    assert.equal((await boundary())?.continue, true);
+
+    // A different tool in the same batch: the next stop is not for the question.
+    // (Each case starts with a user message: the list does not change, and
+    // the 3-idle limit must not apply.)
+    await userMessage();
+    await ask("bash");
+    assert.equal((await boundary())?.continue, true);
+
+    // A later turn after the question: the same.
+    await userMessage();
+    await ask();
+    await turnEnd();
+    assert.equal((await boundary())?.continue, true);
+
+    // A different extension continues after the question: the same.
+    await userMessage();
+    await ask();
+    assert.equal(await boundary("completed", { continue: true }), undefined);
+    assert.equal((await boundary())?.continue, true);
+
+    // A user message while the agent works (steer or follow-up) clears the question.
+    await ask();
+    await pi.handlers.get("input")![0]!({ type: "input", text: "x", source: "rpc", streamingBehavior: "steer" }, ctx);
+    assert.equal((await boundary())?.continue, true);
+
+    // After T0 closes, the lead can stop.
+    await pi.tools.get("tau_claim")!.execute("2", { id: "T0" });
+    await pi.tools.get("tau_complete")!.execute("3", { result: "done" });
+    assert.equal(await boundary(), undefined);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("adds the tau section to the system prompt", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "prompt-1");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const start = async (selectedTools: string[]) => {
+      const event = { type: "before_agent_start", prompt: "x", systemPromptOptions: { selectedTools, sections: {} as Record<string, string> } };
+      assert.equal(await pi.handlers.get("before_agent_start")![0]!(event, ctx), undefined);
+      return event.systemPromptOptions.sections.tau ?? "";
+    };
+    const withAsk = await start(["read", "tau_list", "tau_ask_user"]);
+    assert.match(withAsk, /^You are the lead agent\. You cannot stop/);
+    assert.match(withAsk, /Do not end your turn to ask a question\./);
+    assert.match(withAsk, /call tau_ask_user alone/);
+    assert.doesNotMatch(await start(["read", "tau_list"]), /tau_ask_user/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("writes the give-up warning to stderr when there is no UI", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(false, "stop-3");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const settle = pi.handlers.get("agent_before_settle")![0]!;
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => void errors.push(args.map(String).join(" "));
+    try {
+      for (let index = 0; index < 4; index += 1) {
+        await settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx);
+      }
+    } finally {
+      console.error = original;
+    }
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!, /rule is off until your next prompt/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("stops the rule and tells the user after 3 continuations with no change", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "stop-2");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const settle = pi.handlers.get("agent_before_settle")![0]!;
+    const boundary = () =>
+      settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx) as Promise<
+        { continue: boolean } | undefined
+      >;
+    const input = pi.handlers.get("input")![0]!;
+    for (let index = 0; index < 3; index += 1) {
+      assert.equal((await boundary())?.continue, true);
+      // A message that an extension sends is not input from the user: it
+      // does not start the rule again.
+      await input({ type: "input", text: "again", source: "extension" }, ctx);
+    }
+    assert.equal(await boundary(), undefined);
+    assert.ok(notices.some((notice) => notice.type === "warning" && /rule is off until your next prompt/.test(notice.message)));
+    await emit(pi, "session_shutdown", ctx);
   });
 
   it("registers no tools and no gate when the task list cannot be opened", async () => {
@@ -468,6 +623,7 @@ describe("tau extension", () => {
     await lead.mutate((list) => {
       delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
       setAgentPane(list, "tau-t0", "w1:p1");
+      createTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { title: "Lead work", type: "code" });
     });
     lead.close();
     const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead" };
@@ -505,6 +661,19 @@ describe("tau extension", () => {
       "--token",
       "tau_parent=lead",
     ]);
+
+    // The stop rule looks only at the task of the sub-agent.
+    const settle = pi.handlers.get("agent_before_settle")![0]!;
+    const boundary = () =>
+      settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx) as Promise<
+        { entries: Array<{ content: string }>; continue: boolean } | undefined
+      >;
+    const open = await boundary();
+    assert.equal(open?.continue, true);
+    assert.match(open!.entries[0]!.content, /^⟳ tau: your task T0 is in progress\./);
+    await pi.tools.get("tau_complete")!.execute("1", { result: "done" });
+    // T1 of the lead is still open, but it is not the work of the sub-agent.
+    assert.equal(await boundary(), undefined);
     await emit(pi, "session_shutdown", ctx);
   });
 

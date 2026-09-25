@@ -25,7 +25,8 @@ import {
 } from "./tasks/rules.ts";
 import type { TaskListStore } from "./tasks/store.ts";
 import type { TaskTypeDefinition } from "./tasks/types.ts";
-import { cleanLine } from "./text.ts";
+import { ASK_TOOL } from "./stop.ts";
+import { cleanLine, cleanText } from "./text.ts";
 
 /** The state that the tools use. */
 export interface TaskSession {
@@ -41,7 +42,13 @@ export interface TaskSession {
   readonly current?: () => { readonly model?: string; readonly thinking: string };
   /** The time between two reads of `tau_wait`, in milliseconds. */
   readonly waitPollMs?: number;
+  /** Called when the agent asks the user a question with `tau_ask_user`. */
+  readonly onAskUser?: (question: string, ctx: ExtensionContext | undefined) => void;
 }
+
+
+/** The maximum number of characters of a `tau_ask_user` question. */
+export const MAX_QUESTION_LENGTH = 4_000;
 
 /** What a tool call gives to a tool, in addition to its arguments. */
 interface CallContext {
@@ -56,6 +63,8 @@ interface ToolSpec {
   readonly promptSnippet: string;
   readonly promptGuidelines?: string[];
   readonly parameters: TSchema;
+  /** Tell pi to stop after the tool batch (when all tools in the batch agree). */
+  readonly terminate?: boolean;
   readonly run: (session: TaskSession, params: Record<string, unknown>, call: CallContext) => Promise<string>;
 }
 
@@ -267,6 +276,42 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
   ];
 }
 
+function askSpec(): ToolSpec {
+  return {
+    name: ASK_TOOL,
+    label: "tau ask user",
+    description: [
+      "Show a question to the user, then end your turn. The next user prompt is the answer.",
+      'Use this tool only when no other "ask question" tool is available. Call it alone, not with other tools in the same batch. After the call, end your turn: do not call more tools.',
+    ].join("\n"),
+    promptSnippet: 'Ask the user a question and end the turn, if no other "ask question" tool is available',
+    promptGuidelines: ['Use tau_ask_user only when no other "ask question" tool is available.'],
+    parameters: Type.Object({
+      question: Type.String({
+        description: "The question, in plain text. Tell the options if there are some.",
+        minLength: 1,
+        maxLength: MAX_QUESTION_LENGTH,
+      }),
+    }),
+    terminate: true,
+    run: async (session, params, call) => {
+      const question = cleanText(String(params.question)).trim();
+      if (question === "") {
+        throw new TauError("invalid_argument", "Give a question.");
+      }
+      if ([...question].length > MAX_QUESTION_LENGTH) {
+        throw new TauError("invalid_argument", `The question has more than ${MAX_QUESTION_LENGTH} characters. Make it shorter.`);
+      }
+      session.onAskUser?.(question, call.ctx);
+      return [
+        "The user sees this question:",
+        ...question.split("\n").map((line) => `| ${line}`),
+        "End your turn now. Do not call more tools. The next user prompt is the answer.",
+      ].join("\n");
+    },
+  };
+}
+
 function delegationSpecs(): ToolSpec[] {
   return [
     {
@@ -376,7 +421,9 @@ export async function waitForTasks(
 }
 
 /** The names of all task tools. */
-export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set([...specs({}), ...delegationSpecs()].map((spec) => spec.name));
+export const TASK_TOOL_NAMES: ReadonlySet<string> = new Set(
+  [...specs({}), ...delegationSpecs(), askSpec()].map((spec) => spec.name),
+);
 
 /**
  * The task tool names that a different extension registered before tau. pi
@@ -392,7 +439,7 @@ export function conflictingTools(pi: ExtensionAPI): string[] {
 
 /** Registers the task tools. */
 export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void {
-  for (const spec of [...specs(session.taskTypes), ...delegationSpecs()]) {
+  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), askSpec()]) {
     pi.registerTool({
       name: spec.name,
       label: spec.label,
@@ -416,7 +463,11 @@ export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void 
           }
           throw error;
         }
-        return { content: [{ type: "text", text }], details: undefined };
+        return {
+          content: [{ type: "text", text }],
+          details: undefined,
+          ...(spec.terminate === true ? { terminate: true } : {}),
+        };
       },
     });
   }

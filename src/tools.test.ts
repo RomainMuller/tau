@@ -66,6 +66,7 @@ describe("task tools", () => {
   it("registers all task tools with the tau_ prefix", () => {
     assert.deepEqual([...tools.keys()].sort(), [...TASK_TOOL_NAMES].sort());
     assert.deepEqual([...TASK_TOOL_NAMES].sort(), [
+      "tau_ask_user",
       "tau_cancel",
       "tau_claim",
       "tau_complete",
@@ -128,6 +129,29 @@ describe("task tools", () => {
     await assert.rejects(call("tau_claim", { id: "T9" }), /Task T9 does not exist/);
     await assert.rejects(call("tau_complete", { result: "x" }), /You have no active task\. Give the task ID\./);
     await assert.rejects(call("tau_create", { title: "x", type: "nope" }), /is not a task type/);
+  });
+
+  it("tau_ask_user shows the question, ends the turn, and tells the session", async () => {
+    const asked: string[] = [];
+    const map = register({ ...makeSession("lead"), onAskUser: (question) => asked.push(question) });
+    // No task is necessary: tau_ask_user is a tau tool.
+    const result = (await map.get("tau_ask_user")!.execute("call-1", {
+      question: "15 minutes\u001b[2J or 1 hour?\nSay one.",
+    })) as unknown as { content: Array<{ text: string }>; terminate?: boolean };
+    assert.equal(result.terminate, true);
+    assert.deepEqual(asked, ["15 minutes or 1 hour?\nSay one."]);
+    assert.match(result.content[0]!.text, /\| 15 minutes or 1 hour\?\n\| Say one\.\nEnd your turn now\./);
+    // The other tools do not end the turn.
+    const other = (await map.get("tau_list")!.execute("call-2", {})) as unknown as { terminate?: boolean };
+    assert.equal(other.terminate, undefined);
+  });
+
+  it("tau_ask_user refuses an empty question and does not tell the session", async () => {
+    const asked: string[] = [];
+    const map = register({ ...makeSession("lead"), onAskUser: (question) => asked.push(question) });
+    await assert.rejects(call("tau_ask_user", { question: " \u001b[2J " }, map), /Give a question/);
+    await assert.rejects(call("tau_ask_user", { question: "x".repeat(4_001) }, map), /more than 4000 characters/);
+    assert.deepEqual(asked, []);
   });
 
   it("uses the agent of the session, not an agent from the arguments", async () => {

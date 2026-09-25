@@ -562,14 +562,26 @@ An agent cannot stop while its task list has open work.
 When the agent tries to stop too early, `tau` sends a continuation message:
 
 ```text
-⟳ tau: 3 tasks are open (T2, T3, T2.2). Continue the work.
-  Ready now: T3. Claim it or delegate it.
-  Not ready: T2.2 (waits for T2.1). Use tau_wait. Do not poll.
+⟳ tau: 5 tasks are open (T1, T2, T3, T2.1, T2.2). Continue the work. Do not stop before the work is done.
+  Your active task: T2. Do its work, then close it with tau_complete or tau_fail.
+  Not ready: T1 (@tau-t1), T2.1 (@tau-t2-1), T3 (waits for T2), T2.2 (waits for T2.1).
+  Use tau_wait with ids ["T1","T2.1"]. Do not poll.
+  If you must have an answer from the user, call an ask question tool (or tau_ask_user if no other one is available). Do not end your turn to ask.
 ```
 
+The message tells the agent to claim or delegate a ready task. The
+message has only task IDs, statuses, and agent names. It does not have task
+titles: the model gets the message as a user message, and text that agents
+wrote must not look like an instruction of the user. If `tau` cannot read the
+task list, the agent stops, and `tau` shows a warning.
+
 After 3 continuations with no change to the task list, `tau` stops the rule and
-notifies you. You can change this limit in the
-[configuration](#configuration).
+notifies you. The rule is off until your next prompt. You can change this
+limit in the [configuration](#configuration).
+
+The rule does not apply when you stop the agent (for example with `Esc`), or
+when the run ends with an error. A failed task is not open work: the lead
+decides if it retries the task.
 
 ### Wait without polling
 
@@ -603,12 +615,13 @@ tool from a different extension (for example
 call, so it does not stop. In a sub-agent, the question shows in the sub-agent
 pane, and herdr shows that pane as `blocked`.
 
-`tau` adds this instruction to the system prompt:
+`tau` adds a `<tau>` section to the system prompt. It tells the rule, and
+this instruction:
 
 > To get an answer from the user, call an available "ask question" tool. Do
 > not end your turn to ask a question.
 
-#### Last resort: `tau_ask_user`
+#### If no "ask question" tool is available: `tau_ask_user`
 
 If no "ask question" tool is available, the agent can call `tau_ask_user`
 with a plain-text question. The tool shows the question and ends the turn. The
@@ -616,7 +629,12 @@ with a plain-text question. The tool shows the question and ends the turn. The
 answer, and the agent continues the work from there.
 
 The tool description tells the agent to use this tool only when no other "ask
-question" tool is available.
+question" tool is available, and to call it alone. If the agent calls more
+tools in the same batch, pi does not end the turn at once. Then the rule
+applies to the next stop. `tau` skips the rule only when the last turn had one
+tool call: a `tau_ask_user` call that did not fail. A new user message (also a message
+that you send while the agent works) starts the rule again. A message that a
+different extension sends does not.
 
 ```text
 ● tau_ask_user
@@ -725,7 +743,7 @@ All tools exist only when herdr is available.
 | `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). |
 | `tau_send`      | Send a message to an agent, with a priority.                  |
 | `tau_note`      | Add a note to a task.                                         |
-| `tau_ask_user`  | Last resort: ask the user a question, then end the turn.      |
+| `tau_ask_user`  | Ask the user a question, then end the turn. Only when no other "ask question" tool is available. |
 
 ### `tau_list`
 

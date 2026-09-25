@@ -5,11 +5,11 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 299
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 335
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. Ask Romain which next step to start (see section 8). The proposal is
-   step 6: the "do not stop" rule and `tau_ask_user`.
+   `tau_abort` (section 8, item 1).
 
 ## 2. What tau is
 
@@ -59,6 +59,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `pwsvvvkl` | `abe6fe5a` | feat: add the task tools and the work gate                |
 | `tltkpzyk` | `bd9b13df` | feat: show the task tree under the herdr badge            |
 | `ykktntvt` | `380c457f` | feat: delegate tasks to pi sub-agents in herdr panes      |
+| `lklwxowt` | `dc93e269` | docs: add a hand-over document for the next session       |
+| `tmrzoyxo` | (see log)  | feat: add the do-not-stop rule and tau_ask_user           |
 
 The working copy after that is empty.
 
@@ -66,14 +68,15 @@ The working copy after that is empty.
 
 | File | Does |
 |------|------|
-| `index.ts` | Extension entry. `session_start`: herdr check → identity → open store → register tools, gate, commands, widget, supervisor → report pane metadata. `session_shutdown`: stop timers, close store, clear metadata. `createTau(pi, deps)` for tests (returns a `TauHandle`). |
+| `index.ts` | Extension entry. `session_start`: herdr check → identity → open store → register tools, gate, stop rule, commands, widget, supervisor → report pane metadata. `session_shutdown`: stop timers, close store, clear metadata. `createTau(pi, deps)` for tests (returns a `TauHandle`). |
 | `herdr.ts` | `detectHerdr`: needs `HERDR_ENV=1`, absolute `HERDR_BIN_PATH` (no PATH search), and `herdr pane current --current` with a pane ID. |
 | `herdr-client.ts` | Wrapper for herdr CLI: split, start pi (retries `agent_pane_busy`), prompt, list agents (with pi session), list/close panes, report/clear metadata. `HerdrError.herdrCode`. |
 | `identity.ts` | Lead vs sub-agent. Sub-agent env: `TAU_TASKLIST`, `TAU_TASK_ID`, `TAU_AGENT_NAME`, `TAU_PARENT_AGENT`. `checkSubAgent` needs record name/task/parent/pane to agree. Cooperative, not a security boundary. |
 | `delegate.ts` | `delegate()`: reserve (claim for the new agent name), split pane with env, record pane, `herdr agent start … -- --model --thinking --extension <tau>`, mark running, first prompt. Cleanup on failure. |
 | `supervisor.ts` | Liveness every 5 s for the children of this agent. Knows a child by its pi session (name+pane only in the 2-min start grace). Dead child → fail tasks of it and its descendants (`owner agent exited`). Finished child (task closed, no live sub-agents, idle or 2 min after the close) → end. Safe pane close rule. Dry run on a copy, so no write without a change. |
 | `names.ts` | Agent names `tau-t2-1`, `-2` suffix for retries, hash names for deep IDs. |
-| `tools.ts` | 11 tools: `tau_list/get/create/update/claim/complete/fail/cancel/note/delegate/wait`. All `executionMode: "sequential"`. Identity from the process, never from args. `conflictingTools` (another extension with a tau name → tau registers nothing). |
+| `tools.ts` | 12 tools: `tau_list/get/create/update/claim/complete/fail/cancel/note/delegate/wait/ask_user`. `tau_ask_user` returns `terminate: true`. All `executionMode: "sequential"`. Identity from the process, never from args. `conflictingTools` (another extension with a tau name → tau registers nothing). |
+| `stop.ts` | "Do not stop" rule. `openWork` (lead: all open tasks; sub-agent: its scope while its task is in progress), `continuationText` (task IDs, statuses, and tau-made agent names only: no agent text, because it is a user-role message; never a `tau_wait` for own tasks), `promptSection` (the `<tau>` system prompt section), `StopGuard` (idle count by list `revision`, give up after 3, ask exemption). |
 | `gate.ts` | Work gate on `tool_call`: no active task → block non-tau tools; read-only type (or unknown type) → block `edit`/`write`. |
 | `format.ts` | Model-facing text. Agent text is quoted with `| ` and labeled as data. `tau_get` previews (2000 chars, last 10 notes/events) and `section`+`offset` paging by code points. |
 | `text.ts` | Removes ANSI/OSC sequences, control chars, bidi and zero-width chars. |
@@ -132,27 +135,18 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 
 ## 8. What is left (from README), in the proposed order
 
-1. **Step 6 — "do not stop" rule + `tau_ask_user`** (next; about 1.5–2 h with
-   review). Lead cannot stop while tasks are waiting/in progress; sub-agent
-   cannot stop while its task is in progress. Continuation message lists
-   ready tasks and says to use `tau_wait`. Stop after 3 continuations with no
-   task change and notify. `tau_ask_user` = last resort: ends the turn, next
-   prompt is the answer, the rule does not apply to that stop. pi hooks:
-   `agent_before_settle` (can request one continuation), see
-   `docs/extensions.md`. System prompt tells agents to use an "ask question"
-   tool instead of ending the turn.
-2. **`tau_abort`**: stop a sub-agent (and all its sub-agents), fail their
+1. **`tau_abort`** (next; about 1.5–2 h with review): stop a sub-agent (and all its sub-agents), fail their
    tasks `aborted by @x: reason`, retryable. Allowed for own sub-agents at
    any depth. Use agent records (parent chain) and the safe pane close.
-3. **Messages and notes**: `tau_send` (tree-scoped: descendants, parent,
+2. **Messages and notes**: `tau_send` (tree-scoped: descendants, parent,
    siblings; priority `steer` via `pi.sendMessage` deliverAs `steer`, `info`
    at the next tau call or turn end), inbox per agent, messages stop
    `tau_wait`, `✉n` in the tree. Notes exist already (`tau_note`).
-4. **Configuration** `~/.pi/tau/config.json`: `toggleCompletedKey`, `idPills`,
+3. **Configuration** `~/.pi/tau/config.json`: `toggleCompletedKey`, `idPills`,
    `maxTreeLines`, `maxParallelSubAgents`, `maxIdleContinuations`,
    `taskTypes` (with `readOnly`). Code already accepts most of these as
    options (`TreeWidgetOptions`, `maxAgents`, `taskTypes`).
-5. **Fork**: on `session_start` with reason `fork`, copy the list rolled back
+4. **Fork**: on `session_start` with reason `fork`, copy the list rolled back
    to the fork point (`rollback` by revision exists; need to map the fork
    entry to a revision, for example with `pi.appendEntry` after each change),
    new session ID, in-progress tasks of other-session owners → failed
@@ -169,3 +163,14 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 - No real pi pipeline test (tests call tool `execute` directly). Live tests
   cover the main paths.
 - Metadata tokens: cleared at shutdown (title, label, `tau_*` tokens).
+- Stop rule hooks (in `index.ts` `registerStopRule`): `input` (source not
+  `extension`) resets the guard; `turn_end` sets the ask exemption only when
+  the turn had one tool result, a successful `tau_ask_user`; `before_agent_start`
+  sets the `<tau>` section; `agent_before_settle` adds a `tau-continue`
+  custom message and `continue: true`, or warns (give up, or list not
+  readable). No rule on `aborted`/`error` outcomes, or when another
+  extension continues.
+- The guard state is in memory: a pi restart starts the idle count again.
+- A mixed batch with `tau_ask_user` is unit-tested only: in live tests the
+  model follows the description and calls it alone.
+- The idle limit (3) is hard-coded until the configuration step.
