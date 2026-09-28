@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -25,6 +27,7 @@ import { cleanLine } from "./text.ts";
 import { TreeWidget } from "./widget.ts";
 import { forkRevision, forkTaskList, REVISION_ENTRY, sessionIdOf } from "./fork.ts";
 import { taskListFile } from "./tasks/paths.ts";
+import { collectOrphanedTaskLists } from "./tasks/gc.ts";
 import { encodeTaskList } from "./tasks/codec.ts";
 
 /** Things that tests can replace. */
@@ -76,6 +79,8 @@ export interface TauHandle {
   readonly supervisor: Supervisor | undefined;
   readonly identity: Identity | undefined;
   readonly inbox: Inbox | undefined;
+  /** The removal of old task lists (see `tasks/gc.ts`). Only a lead starts it. */
+  readonly collection: Promise<unknown> | undefined;
 }
 
 export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
@@ -85,6 +90,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   let widget: TreeWidget | undefined;
   let supervisor: Supervisor | undefined;
   let messageInbox: Inbox | undefined;
+  let collection: Promise<unknown> | undefined;
   /** True after tau blocked all tools (see `failClosed`). */
   let blockedAll = false;
   const env = deps.env ?? process.env;
@@ -277,7 +283,10 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     continuationPending = registerContinuationTracker(pi);
     // After the tracker: the report needs the final decision of the boundary.
     if (identity.role === "subagent") registerErrorReport(pi, session, identity.parent);
-    if (identity.role === "lead") registerRevisionRecord(pi, store);
+    if (identity.role === "lead") {
+      registerRevisionRecord(pi, store);
+      collection = collectGarbage(ctx, deps, env);
+    }
     registerCommands(pi, store, tree, badgeLabel(status, identity), {
       toggleKey: config.toggleCompletedKey,
       pills: config.idPills,
@@ -333,6 +342,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     },
     get inbox() {
       return messageInbox;
+    },
+    get collection() {
+      return collection;
     },
   };
 }
@@ -631,14 +643,22 @@ async function openTaskList(
     const identity = resolveIdentity(deps.env ?? process.env, tauDir(deps.agentDir()), sessionId);
     store = new TaskListStore(identity.file);
     if (identity.role === "lead") {
-      let seed = () => seedTaskList(sessionId, deps.now());
+      // The transcript of this session (see `tasks/gc.ts`).
+      const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+      let seed = (): TaskList => ({ ...seedTaskList(sessionId, deps.now()), sessionFile });
       // A fork: a copy of the task list of the old session, at the fork point.
       const source = forkSource(ctx, event);
       if (source !== undefined && (await store.read()) === undefined) {
         const forked = await forkedList(ctx, deps, sessionId, source);
-        if (forked !== undefined) seed = () => forked;
+        if (forked !== undefined) seed = () => ({ ...forked, sessionFile });
       }
-      await store.ensure(seed);
+      const list = await store.ensure(seed);
+      // A list from before this field, or a session file that moved.
+      if (list.sessionFile !== sessionFile) {
+        await store.mutate((current) => {
+          current.sessionFile = sessionFile;
+        });
+      }
     } else {
       const list = await store.read();
       if (list === undefined) {
@@ -768,6 +788,29 @@ function registerRevisionRecord(pi: ExtensionAPI, store: TaskListStore): void {
   // A compaction entry has no message_end: record before it too (a clone at
   // the compaction entry must have the changes up to it).
   pi.on("session_before_compact", record);
+}
+
+/**
+ * Removes the task lists whose session transcript does not exist any more
+ * (see `tasks/gc.ts`). Only a lead does this, when it starts. It runs in the
+ * background: the start does not wait for it, and an error does not stop
+ * tau.
+ */
+function collectGarbage(ctx: ExtensionContext, deps: TauDependencies, env: NodeJS.ProcessEnv): Promise<unknown> {
+  const agentDir = deps.agentDir();
+  const roots = [join(agentDir, "sessions")];
+  const fromEnv = env.PI_CODING_AGENT_SESSION_DIR;
+  if (fromEnv !== undefined && fromEnv !== "") {
+    roots.push(fromEnv === "~" ? homedir() : fromEnv.startsWith("~/") ? join(homedir(), fromEnv.slice(2)) : fromEnv);
+  }
+  const current = ctx.sessionManager.getSessionDir?.();
+  if (current !== undefined && current !== "") roots.push(current);
+  return collectOrphanedTaskLists({
+    tauDirectory: tauDir(agentDir),
+    sessionRoots: roots,
+    keep: ctx.sessionManager.getSessionId(),
+    now: Date.parse(deps.now()),
+  }).catch(() => undefined);
 }
 
 /**

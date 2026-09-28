@@ -211,6 +211,12 @@ export interface TaskList {
   readonly version: 1;
   /** The pi session ID of the lead agent. */
   readonly sessionId: string;
+  /**
+   * The transcript (the pi session file) of the lead session: a path, or
+   * `null` when the session has no file (`--no-session`). Lists from before
+   * this field do not have it. See `gc.ts`.
+   */
+  sessionFile?: string | null;
   readonly createdAt: string;
   /** The number of events in the task list. See `recordEvent`. */
   revision: number;

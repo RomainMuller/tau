@@ -90,7 +90,7 @@ function checkList(value: unknown): TaskList {
     names.add(agent.name);
   }
   checkAgentTree(agents);
-  return {
+  const result: TaskList = {
     version: 1,
     sessionId: string(list.sessionId, "sessionId"),
     createdAt: string(list.createdAt, "createdAt"),
@@ -98,6 +98,10 @@ function checkList(value: unknown): TaskList {
     tasks,
     agents,
   };
+  // Files from before this field do not have it.
+  if (list.sessionFile === null) result.sessionFile = null;
+  else if (list.sessionFile !== undefined) result.sessionFile = string(list.sessionFile, "sessionFile");
+  return result;
 }
 
 const AGENT_STATES: readonly AgentState[] = ["starting", "running", "ended"];

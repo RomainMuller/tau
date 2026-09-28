@@ -1149,6 +1149,54 @@ of its lead when it starts, but a running lead keeps its old code, and an
 older version removes the fields of the task list that it does not know
 (for example, the error record of a sub-agent).
 
+### Removal of old task lists
+
+When a lead starts, `tau` removes the task lists of sessions that you cannot
+resume any more: the session transcript (the pi session file) does not
+exist. This runs in the background, and it does not stop the start.
+
+The lead records the path of its session file in its task list. A session
+with no file (`--no-session`) records that it has no file. `tau` removes a
+task list only when all these conditions are true:
+
+1. It is not the task list of the current session.
+2. Its files (the database, and the `-wal` and `-shm` files) did not change
+   for 1 day. pi makes the session file only after the first answer of the
+   model, so a new session has no file yet.
+3. `tau` can read the task list, and the list is for the session of its
+   file name.
+4. The session has no file, or `tau` finds no file of the session: the
+   recorded file does not exist, and the search below finds no other file.
+   (A session can have a different copy of its file, for example when you
+   resumed it from an imported copy.)
+
+The search: `tau` looks for `<time>_<session-id>.jsonl` in the default
+session directory (`<pi agent directory>/sessions`), in
+`PI_CODING_AGENT_SESSION_DIR`, in the session directory of the current
+session, and in their direct sub-directories (also through symbolic links).
+When a directory or a symbolic link cannot be read, `tau` keeps the list.
+
+A task list from an older version of `tau` has no recorded path: `tau` uses
+only the search. When the lead of such a list starts again, it records its
+path.
+
+Limits:
+
+- `tau` searches only the directories above. A task list that is older
+  than 1 day is removed when the only file of its session is in a different
+  custom session directory (`--session-dir`, or the `sessionDir` setting of
+  a different project), in these cases:
+  - The list is from an older version of `tau` (it has no recorded path).
+  - The recorded file does not exist any more (for example, an imported
+    copy that you removed), but the original file is still there.
+- A lead that runs, and did not change its task list for 1 day, can lose
+  its task list when a different lead starts, if its session file does not
+  exist (for example, a `--no-session` lead).
+- `tau` does not lock a task list while it checks and removes it.
+
+`tau` does not remove a file that is a symbolic link, or a file that it
+cannot read.
+
 The `tasklists` directory is for the current user only: `tau` makes it with
 mode `0700`, and removes access for other users if it has it. New database
 files (with the SQLite `-wal` and `-shm` files) have mode `0600`: `tau`

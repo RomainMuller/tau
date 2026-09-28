@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -9,6 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
 import tau, { createTau, errorKind, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
+import { taskListFile } from "./tasks/paths.ts";
 import { seedTaskList } from "./tasks/model.ts";
 import { claimTask, completeTask, createTask, delegateTask, setAgentError, setAgentPane, setAgentSession } from "./tasks/rules.ts";
 
@@ -218,6 +219,77 @@ describe("tau extension", () => {
     assert.deepEqual(badges(widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
     assert.equal(typeof widgets.at(-1)?.lines, "function", "the tree widget replaces the badge");
     assert.deepEqual(detections(pi), [[HERDR_BIN, "pane", "current", "--current"]]);
+  });
+
+  describe("removal of old task lists", () => {
+    const later = () => new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const tauDirectory = () => join(root, "tau");
+
+    /** Makes an old task list of a session whose transcript is gone. */
+    async function orphan(id: string): Promise<void> {
+      const store = new TaskListStore(taskListFile(tauDirectory(), id));
+      await store.ensure(() => ({ ...seedTaskList(id, "2026-01-01T00:00:00.000Z"), sessionFile: "/gone.jsonl" }));
+      store.close();
+    }
+
+    const lists = async () => (await readdir(join(tauDirectory(), "tasklists"))).filter((name) => name.endsWith(".db")).sort();
+
+    it("records the transcript of the lead, and removes old task lists without a transcript", async () => {
+      enableHerdr();
+      await orphan("old-session");
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx();
+      const handle = createTau(pi.api, { ...deps, now: later });
+
+      await emit(pi, "session_start", ctx);
+      await handle.collection;
+
+      const store = new TaskListStore(taskListFile(tauDirectory(), "session-1"));
+      assert.equal((await store.read())?.sessionFile, "/sessions/2026_session-1.jsonl");
+      store.close();
+      assert.deepEqual(await lists(), ["session-1.db"]);
+      await emit(pi, "session_shutdown", ctx);
+    });
+
+    it("records null for a session without a file, and the path for a list from an older version", async () => {
+      enableHerdr();
+      const legacy = new TaskListStore(taskListFile(tauDirectory(), "legacy"));
+      await legacy.ensure(() => seedTaskList("legacy", "2026-01-01T00:00:00.000Z"));
+      legacy.close();
+      for (const [id, file] of [["legacy", "/sessions/2026_legacy.jsonl"], ["memory", undefined]] as const) {
+        const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+        const { ctx } = fakeCtx(true, id);
+        const session = { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionFile: () => file } };
+        createTau(pi.api, deps);
+        await emit(pi, "session_start", session);
+        const store = new TaskListStore(taskListFile(tauDirectory(), id));
+        assert.equal((await store.read())?.sessionFile, file ?? null);
+        store.close();
+        await emit(pi, "session_shutdown", session);
+      }
+    });
+
+    it("a sub-agent does not remove task lists", async () => {
+      enableHerdr();
+      await orphan("old-session");
+      const file = taskListFile(tauDirectory(), "lead-gc");
+      const lead = new TaskListStore(file);
+      await lead.ensure(() => seedTaskList("lead-gc", "2026-01-01T00:00:00.000Z"));
+      await lead.mutate((list) => {
+        delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+        setAgentPane(list, "tau-t0", "w1:p1");
+      });
+      lead.close();
+      const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, "sub-gc");
+      const handle = createTau(pi.api, { ...deps, env, now: later });
+      await emit(pi, "session_start", ctx);
+      assert.equal(handle.identity?.role, "subagent");
+      assert.equal(handle.collection, undefined);
+      assert.deepEqual(await lists(), ["lead-gc.db", "old-session.db"]);
+      await emit(pi, "session_shutdown", ctx);
+    });
   });
 
   it("shows the red badge and runs no command when HERDR_BIN_PATH is not set", async () => {

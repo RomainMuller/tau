@@ -63,6 +63,12 @@ describe("forkTaskList", () => {
     assert.deepEqual(forked.tasks.map((task) => task.id), ["T0"]);
   });
 
+  it("does not copy the transcript path of the old session", () => {
+    const { list, revision } = oldList();
+    list.sessionFile = "/sessions/old.jsonl";
+    assert.equal("sessionFile" in forkTaskList(list, revision, "new", NOW), false);
+  });
+
   it("rolls back to the fork point, and fails the tasks of the sub-agents of the old session", () => {
     const { list, revision } = oldList();
     const forked = forkTaskList(list, revision, "new", NOW);
