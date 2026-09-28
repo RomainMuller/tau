@@ -88,9 +88,10 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   const env = deps.env ?? process.env;
 
   /**
-   * A sub-agent that cannot start tau correctly must not work: its parent
-   * can still send it the task prompt, and without tau it has no work gate
-   * and other rules. So tau shows the error, blocks all tools, and stops pi.
+   * A sub-agent that cannot start tau correctly must not work: its first
+   * prompt comes anyway (a pi argument), and without tau it has no work gate
+   * and other rules. So tau shows the error, blocks all input and all tools,
+   * and stops pi.
    * Then the pane is empty: the parent fails the task when the start grace
    * time ends, and closes the pane that it made.
    */
@@ -99,6 +100,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     if (!blockedAll) {
       blockedAll = true;
       pi.on("tool_call", () => ({ block: true, reason: `tau blocked the tool: ${reason} Stop now.` }));
+      // pi sends the first prompt of a sub-agent (a pi argument) after
+      // session_start: do not give it to the model.
+      pi.on("input", () => ({ action: "handled" as const }));
     }
     ctx.shutdown();
   };

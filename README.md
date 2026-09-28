@@ -425,6 +425,9 @@ If an agent calls a tool that is not a `tau_*` tool (or the
 ```
 
 If `tau` cannot read the task list, it blocks the call too, and tells why.
+When the record of a sub-agent ended (for example, an agent aborted it),
+`tau` blocks all its tools except the `tau_*` tools (and the `askTool`),
+also when its task stays `in_progress` because of open sub-tasks.
 If the lead cannot open the task list when the session starts, `tau` shows
 an error and registers no tools and no gate: pi runs in its standard mode.
 (A sub-agent stops: see [The identity of a sub-agent](#the-identity-of-a-sub-agent).)
@@ -492,17 +495,19 @@ sub-agents do the work.
    If the name is used (for example for a retry), `tau` adds a number:
    `tau-t2-1-2`.
 3. `tau` splits the pane of the agent that delegates (to the right for a wide
-   pane, down for a narrow pane), and starts pi in the new pane:
-   `herdr agent start tau-t2-1 --kind pi --pane <new-pane> -- --model … --thinking … --extension <tau>`
-4. The sub-agent receives a first prompt: its task ID and title, and what to
-   do when the work is done. Then `tau` waits until herdr shows that the
-   sub-agent works (at most 10 seconds). pi can lose the Enter key of the
-   prompt while it starts. When herdr shows that the sub-agent is idle, `tau`
-   sends one more Enter key, and waits again (at most 10 more seconds). In
-   other states, `tau` sends no key: for example, an Enter key can select an
-   answer when the sub-agent asks you a question. A limit: a short time
-   stays between the state check and the key. If the sub-agent shows a
-   question in that time, the Enter key can select its first answer.
+   pane, down for a narrow pane), and starts pi in the new pane, with the
+   first prompt as a pi argument:
+   `herdr agent start tau-t2-1 --kind pi --pane <new-pane> -- --model … --thinking … --extension <tau> -- "<first prompt>"`
+4. The first prompt tells the sub-agent its task ID, and what to do when
+   the work is done. It has no text that agents wrote (for example the
+   title): the sub-agent reads its task with `tau_get`. pi sends the prompt
+   to the model after all extensions loaded (also `tau`, which checks the
+   identity of the sub-agent first). `tau` does not type the prompt into the
+   pane, so no key press can be lost. If `tau` does not start correctly in
+   the sub-agent, the prompt does not go to the model. Then `tau` waits (at
+   most 10 seconds) until herdr shows that the sub-agent works on the prompt.
+   Else the start fails: for example, pi could not send the prompt to the
+   model (no login), and it stays idle.
 5. The sub-agent can see the full task list. It can change only its task and
    the sub-tasks of its task.
 6. The sub-agent can delegate its own sub-tasks to more sub-agents.
@@ -510,7 +515,7 @@ sub-agents do the work.
    task `result` keeps the output.
 
 If a step after step 2 fails (for example, pi does not start, or the
-sub-agent does not start to work on its first prompt), the task
+sub-agent does not start to work), the task
 becomes `failed` with `retryable: true`, and `tau` closes the new pane when
 this is safe (see [Liveness](#liveness)). Exceptions: a task that the
 sub-agent completed already stays completed (the start is correct), and a
@@ -1120,7 +1125,9 @@ change the file before you start the work.
 
 `tau` gives the configuration to a sub-agent in the arguments of a `herdr`
 command. Other users of the computer can see process arguments. So do not
-put secrets in the configuration (for example, in task type descriptions). When a field is not valid, `tau` uses the
+put secrets in the configuration (for example, in task type descriptions).
+Also do not put secrets in task titles: each sub-agent gives the title of
+its task to herdr (`herdr pane report-metadata --title`), and herdr shows it. When a field is not valid, `tau` uses the
 default value of that field, and shows a warning with the reason. When the
 file is not valid JSON, `tau` uses the default configuration.
 

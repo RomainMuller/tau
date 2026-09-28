@@ -55,72 +55,16 @@ describe("HerdrClient", () => {
     await assert.rejects(new HerdrClient(exec, BIN).splitPane("w1:p1", { direction: "right", cwd: "/", env: {} }), /no pane ID/);
   });
 
-  it("sends a prompt, and waits until the agent works on it", async () => {
+  it("waits until the new agent works, with no key", async () => {
     const { exec, calls, options } = fakeExec([ok({})]);
-    await new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1");
-    assert.ok((options[0]?.timeout ?? 0) > 10_000);
-    assert.deepEqual(calls.map((call) => call.slice(1)), [
-      ["agent", "prompt", "tau-t1", "Do T1", "--wait", "--until", "working", "--until", "blocked", "--timeout", "10000"],
+    await new HerdrClient(exec, BIN).waitForWork("tau-t1");
+    assert.deepEqual(calls[0]?.slice(1), [
+      "agent", "wait", "tau-t1", "--until", "working", "--until", "blocked", "--until", "done", "--timeout", "10000",
     ]);
-  });
-
-  /** A reply of `agent list` with one agent. */
-  const listed = (name: string, status: string): Reply => ok({ agents: [{ name, pane_id: "w1:p9", agent_status: status }] });
-
-  it("sends one Enter key when the prompt stalled and the agent is idle, then waits again", async () => {
-    for (const code of ["agent_prompt_stalled", "timeout"]) {
-      const { exec, calls, options } = fakeExec([fail(code, "no working state"), listed("tau-t1", "idle"), ok({}), ok({})]);
-      await new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1");
-      assert.deepEqual(calls.slice(1).map((call) => call.slice(1)), [
-        ["agent", "list"],
-        ["agent", "send-keys", "tau-t1", "Enter"],
-        ["agent", "wait", "tau-t1", "--until", "working", "--until", "blocked", "--until", "done", "--timeout", "10000"],
-      ], code);
-      // The process time limit of the waits is longer than the herdr wait.
-      for (const index of [0, 3]) assert.ok((options[index]?.timeout ?? 0) > 10_000, JSON.stringify(options));
-    }
-  });
-
-  it("sends no Enter key when the stalled agent works, waits for the user, or is done", async () => {
-    for (const status of ["working", "blocked", "done"]) {
-      const { exec, calls } = fakeExec([fail("agent_prompt_stalled", "stalled"), listed("tau-t1", status)]);
-      await new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1");
-      assert.equal(calls.length, 2, status);
-    }
-  });
-
-  it("fails with no Enter key when the stalled agent is not known, or its state is unknown", async () => {
-    for (const reply of [listed("tau-t1", "unknown"), listed("other", "idle"), ok({ agents: [] })]) {
-      const { exec, calls } = fakeExec([fail("agent_prompt_stalled", "stalled"), reply]);
-      await assert.rejects(new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1"), (error: unknown) => {
-        assert.ok(error instanceof HerdrError);
-        assert.match(error.message, /tau-t1 did not start to work on its first prompt, and its state is/);
-        return true;
-      });
-      assert.equal(calls.length, 2);
-    }
-  });
-
-  it("fails when the agent does not work on the prompt also after the Enter key", async () => {
-    const { exec, calls } = fakeExec([fail("agent_prompt_stalled", "stalled"), listed("tau-t1", "idle"), ok({}), fail("timeout", "timed out")]);
-    await assert.rejects(new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1"), (error: unknown) => {
-      assert.ok(error instanceof HerdrError);
-      assert.match(error.message, /tau-t1 did not start to work on its first prompt \(also after one more Enter key\)/);
-      assert.equal(error.herdrCode, "timeout");
-      return true;
-    });
-    assert.equal(calls.length, 4);
-  });
-
-  it("does not send an Enter key for other prompt errors", async () => {
-    for (const reply of [fail("agent_blocked", "blocked"), fail("agent_not_found", "gone"), { killed: true }] as Reply[]) {
-      const { exec, calls } = fakeExec([reply]);
-      await assert.rejects(new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1"));
-      assert.equal(calls.length, 1);
-    }
-    // An error of the wait after the Enter key, other than a stall: as it is.
-    const { exec } = fakeExec([fail("agent_prompt_stalled", "stalled"), listed("tau-t1", "idle"), ok({}), fail("agent_not_found", "gone")]);
-    await assert.rejects(new HerdrClient(exec, BIN).prompt("tau-t1", "Do T1"), /herdr agent wait failed: gone/);
+    // The process time limit is longer than the herdr wait.
+    assert.ok((options[0]?.timeout ?? 0) > 10_000);
+    const failed = fakeExec([fail("timeout", "timed out")]);
+    await assert.rejects(new HerdrClient(failed.exec, BIN).waitForWork("tau-t1"), /herdr agent wait failed: timed out/);
   });
 
   it("starts pi, and tries again while the new pane is busy", async () => {

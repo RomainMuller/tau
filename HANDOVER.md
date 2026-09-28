@@ -5,7 +5,7 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 479
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 475
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. All README steps are built (section 8). Ask Romain what comes next (for
@@ -67,7 +67,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `ytlvsqzr` | `59bbee67` | feat: read the tau configuration file                     |
 | `stysslnx` | `adbd6384` | feat: copy the task list at a session fork                |
 | `oowynxku` | `6370cd11` | fix: copy the list for pi --fork, and add askTool         |
-| `pusnsqqy` | (see log)  | fix: resend a lost first prompt, and trust own task text  |
+| `pusnsqqy` | `a2be470d` | fix: resend a lost first prompt, and trust own task text  |
+| `kwumsxzr` | (see log)  | fix: give the first prompt as a pi argument               |
 
 The working copy after that is empty.
 
@@ -77,9 +78,9 @@ The working copy after that is empty.
 |------|------|
 | `index.ts` | Extension entry. `session_start`: herdr check → identity → open store → register tools, gate, stop rule, commands, widget, supervisor → report pane metadata. `session_shutdown`: stop timers, close store, clear metadata. `createTau(pi, deps)` for tests (returns a `TauHandle`). |
 | `herdr.ts` | `detectHerdr`: needs `HERDR_ENV=1`, absolute `HERDR_BIN_PATH` (no PATH search), and `herdr pane current --current` with a pane ID. |
-| `herdr-client.ts` | Wrapper for herdr CLI: split, start pi (retries `agent_pane_busy`), prompt, list agents (with pi session), list/close panes, report/clear metadata. `HerdrError.herdrCode`. |
+| `herdr-client.ts` | Wrapper for herdr CLI: split, start pi (retries `agent_pane_busy`; the first prompt is a pi argument), list agents (with pi session), list/close panes, report/clear metadata. `HerdrError.herdrCode`. |
 | `identity.ts` | Lead vs sub-agent. Sub-agent env: `TAU_TASKLIST`, `TAU_TASK_ID`, `TAU_AGENT_NAME`, `TAU_PARENT_AGENT`. `checkSubAgent` needs record name/task/parent/pane to agree. Cooperative, not a security boundary. |
-| `delegate.ts` | `delegate()`: reserve (claim for the new agent name), split pane with env, record pane, `herdr agent start … -- --model --thinking --extension <tau>`, mark running, first prompt, then a check that the agent did not end (an abort; a fast completion by the same agent is a correct start). Cleanup on failure: keeps an abort result, reports the real task status, and closes the new pane only with proof (`closeNewPane`), else `closeLater` with the session. |
+| `delegate.ts` | `delegate()`: reserve (claim for the new agent name), split pane with env, record pane, `herdr agent start … -- --model --thinking --extension <tau> -- "<first prompt>"`, mark running (unless it completed and ended already), then a check that the agent did not end (an abort; a fast completion by the same agent is a correct start). Cleanup on failure: keeps an abort result, reports the real task status, and closes the new pane only with proof (`closeNewPane`), else `closeLater` with the session. |
 | `supervisor.ts` | Liveness every 5 s for the children of this agent. Knows a child by its pi session (name+pane only in the 2-min start grace). Dead child → fail tasks of it and its descendants (`owner agent exited`). Finished child (task closed, no live sub-agents, idle or 2 min after the close) → end. Safe pane close rule: an occupied pane needs name + session; an empty pane must be one this process made; a moved agent (found by name + session) gets its current pane closed; the request stays when the agent moved between the two herdr lists. `checkAgain()` (a fresh check after the running one), `closeOutcome(pane)` (`closed`/`pending`/`kept`). Dry run on a copy, so no write without a change. |
 | `names.ts` | Agent names `tau-t2-1`, `-2` suffix for retries, hash names for deep IDs. |
 | `tools.ts` | 14 tools: `tau_list/get/create/update/claim/complete/fail/cancel/note/delegate/wait/send/abort/ask_user`. `tau_send` checks the recipient (`messages.ts`) and the quoted size; `tau_wait` returns when the inbox has a message. `tau_ask_user` returns `terminate: true`. `tau_abort` needs `TaskSession.stopAgents` (else it fails and changes nothing), and reports panes that are `pending` or `kept`. All `executionMode: "sequential"`. Identity from the process, never from args. `conflictingTools` (another extension with a tau name → tau registers nothing). |
@@ -156,8 +157,9 @@ says "Status: DRAFT".
   `tau_ask_user` (the rule applies to the next stop), resume of the old
   session closes the pane of a sub-agent that finished after the fork.
   Found and fixed: `pi --fork` made a new list (F3); the gate blocked other
-  ask tools with no active task (F2, new `askTool`). Not live-tested yet:
-  `askTool` and `pi --fork` after the fix (unit tests only).
+  ask tools with no active task (F2, new `askTool`). Both fixes passed a
+  live test after the change (lead and sub-agent with `askTool`; `pi --fork`
+  copied the list).
 - `askTool` (Romain's design): when set, no `tau_ask_user`; the gate never
   blocks it (also with no task, a read-only task, or a list read error);
   prompt and continuation name it; a warning one time per load of tau when
@@ -165,18 +167,31 @@ says "Status: DRAFT".
   (also `tau_ask_user` with `askTool`): the gate and the delivery know tau
   tools by name. README warns that a tool that does more than ask works
   outside the gate.
-- First prompt (F5, live-seen 1 time in 3): pi can lose the Enter key while
-  it starts. `HerdrClient.prompt` uses `herdr agent prompt --wait --until
-  working --until blocked --timeout 10000`; on `agent_prompt_stalled` or
-  `timeout` it reads `agent list`: working/blocked/done -> ok; idle -> one
-  `send-keys Enter`, then `agent wait` (working|blocked|done, 10 s); other
-  state or missing -> fail (retryable). `delegate` accepts a prompt error when
-  the new agent completed its task. Limits: a short race between the state
-  check and the Enter (a question UI can get its first answer); a false
-  stall when herdr shows a finished fast agent as idle (the delegation fails);
-  the tool abort signal is not passed to herdr calls (pre-existing). The
-  stalled path is unit-tested only (FakeHerdr does not model it).
-- Own task text (F4, live-seen: a sub-agent asked if its task was a prompt
+- First prompt (F5, seen 1 time in 3 in a live test: pi lost the Enter key
+  of a typed prompt while it started). Now the first prompt is a pi argument: `herdr
+  agent start … -- --model … --extension <tau> -- "<first prompt>"`. pi sends
+  it after `init()` (all extensions loaded, tau `session_start` awaited), as
+  an `input` event with source `interactive`. No key presses. herdr refuses
+  control characters in agent arguments (`agent arguments cannot be encoded
+  safely`: line feed, tab), so `firstPrompt` is one line. It has no agent
+  text (no title: the sub-agent reads it with tau_get). herdr quotes shell
+  characters (tested live with `$HOME`, backticks, `!!`, quotes, `;` in a
+  title, before the title was removed). The sub-agent can work, complete, and
+  end before herdr replies or before the parent marks it running: `delegate`
+  accepts that (also when `agent start` then fails). `completedBy` uses the
+  last `completed` event (notes can come after it). The work gate blocks all
+  non-tau tools of an ended agent (an abort can leave its task in progress).
+  After `agent start`, `delegate` runs `herdr agent wait --until working
+  --until blocked --until done --timeout 10000` (`waitForWork`, no key): pi
+  that cannot send the prompt (no login) stays idle, and the start fails
+  (retryable). A very fast agent that herdr shows as idle before its task is
+  complete makes a false failure (not seen live).
+  Open: an error later in a run (for example gateway timeouts, seen live)
+  leaves pi idle with the task in progress; the supervisor sees a live
+  agent, so nothing fails the task, and `tau_wait` of the parent waits. A sub-agent
+  that fails closed also returns `{ action: "handled" }` for `input`, so the
+  first prompt does not reach the model. `HerdrClient.prompt` is removed.
+- Own task text (F4, seen in a live test: a sub-agent asked if its task was a prompt
   injection): `descriptionIsWork` in `format.ts`. The description is "the
   work of your task" only for the owner of an in-progress task, when the
   last writer (created/updated event) is the owner, an agent above it in the
@@ -267,8 +282,8 @@ says "Status: DRAFT".
   trigger a record (README limit). A lead-owned task under a sub-agent task
   keeps that task (and waiting tasks between) open until the lead closes or
   cancels them (rule 11). The size fallback has no test (needs a ~16 MiB
-  list). Not live-tested: fork with a running sub-agent, fork of a fork,
-  `/clone`.
+  list). Fork with a running sub-agent, fork of a fork, and `/clone` passed
+  live tests (see the first item of this section).
 - Shutdown stops the tree, the supervisor, and the inbox (after `stop()`,
   they start no new work: `check`, `checkAgain`, `refresh` do nothing), waits
   for the inbox poll and the supervisor check, then for the tree refresh, and

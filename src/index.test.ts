@@ -1616,5 +1616,9 @@ async function assertFailedClosed(pi: FakePi, ctx: unknown, shutdowns: number[],
   assert.equal(blocked.block, true);
   assert.match(blocked.reason, reason);
   assert.match(blocked.reason, /Stop now\.$/);
+  // The first prompt (a pi argument) does not reach the model.
+  const inputs = pi.handlers.get("input") ?? [];
+  assert.equal(inputs.length, 1);
+  assert.deepEqual(await inputs[0]!({ type: "input", text: "You are @tau-t0", source: "interactive" }, ctx), { action: "handled" });
   assert.ok(shutdowns.length >= 1, "pi stops");
 }

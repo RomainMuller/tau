@@ -9,7 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { checkGate } from "./gate.ts";
 import { descriptionIsWork, formatSection, formatTask } from "./format.ts";
 import { findTask, seedTaskList, type TaskList } from "./tasks/model.ts";
-import { claimTask, completeTask, createTask, delegateTask, failTask, updateTask } from "./tasks/rules.ts";
+import { abortTask, claimTask, completeTask, createTask, delegateTask, failTask, updateTask } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 import { cleanLine, cleanText } from "./text.ts";
@@ -411,6 +411,32 @@ describe("work gate", () => {
     assert.match((await gate("edit", "ask_user_question")) ?? "", /read-only/);
   });
 
+  it("blocks all tools except the tau tools for an ended agent, also with a task in progress", async () => {
+    const at = (name: string, scope?: string) => ({ actor: scope === undefined ? { name } : { name, scope }, now: "2026-01-01T00:00:00.000Z" });
+    await store.mutate((current) => {
+      createTask(current, at("lead"), { title: "Work", type: "code" });
+      createTask(current, at("lead"), { title: "Sub", type: "code", parent: "T1" });
+      delegateTask(current, at("lead"), { id: "T1", agent: "tau-t1" });
+      // The lead claims the sub-task, and aborts tau-t1: T1 stays in progress.
+      claimTask(current, at("lead"), "T1.1");
+      abortTask(current, at("lead"), "T1", "stop");
+    });
+    const current = await list();
+    assert.equal(findTask(current, "T1")?.status, "in_progress");
+    for (const toolName of ["bash", "edit", "read", "ask_user_question"]) {
+      const reason = checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: current, agent: "tau-t1", taskTypes: types });
+      assert.match(reason ?? "", /your agent record ended/, toolName);
+    }
+    // tau tools (for example tau_note), and the configured ask tool, stay.
+    assert.equal(checkGate({ toolName: "tau_note", tauTools: TASK_TOOL_NAMES, list: current, agent: "tau-t1", taskTypes: types }), undefined);
+    assert.equal(
+      checkGate({ toolName: "ask_user_question", tauTools: TASK_TOOL_NAMES, list: current, agent: "tau-t1", taskTypes: types, askTool: "ask_user_question" }),
+      undefined,
+    );
+    // The lead still works.
+    assert.equal(checkGate({ toolName: "bash", tauTools: TASK_TOOL_NAMES, list: current, agent: "lead", taskTypes: types }), undefined);
+  });
+
   it("never blocks the tau tools", async () => {
     for (const toolName of TASK_TOOL_NAMES) {
       assert.equal(checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types }), undefined);
@@ -484,7 +510,7 @@ describe("tau_delegate and tau_wait tools", () => {
       startPiAgent: async (_name: string, _pane: string, args: string[]) => {
         seen.push(args);
       },
-      prompt: async () => undefined,
+      waitForWork: async () => undefined,
       closePane: async () => undefined,
     };
     const withDelegation: TaskSession = {

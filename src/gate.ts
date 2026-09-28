@@ -34,6 +34,11 @@ export function checkGate(input: GateInput): string | undefined {
   if (input.tauTools.has(input.toolName) || input.toolName === input.askTool) {
     return undefined;
   }
+  // An ended agent (for example, an agent aborted it) must not work, also
+  // when its task stays in progress because of open sub-tasks.
+  if (input.list.agents.some((agent) => agent.name === input.agent && agent.state === "ended")) {
+    return `tau blocked ${input.toolName}: your agent record ended (an agent stopped you, or your work ended). Do no more work. Stop now.`;
+  }
   const active = activeTask(input.list, input.agent);
   if (active === undefined) {
     return [
