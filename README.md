@@ -522,8 +522,8 @@ sub-agents do the work.
    `T2.1`. The new agent is the task owner, and the status is `in_progress`.
    If the name is used (for example for a retry), `tau` adds a number:
    `tau-t2-1-2`.
-3. `tau` splits the pane of the agent that delegates (to the right for a wide
-   pane, down for a narrow pane), and starts pi in the new pane, with the
+3. `tau` makes a new pane in the column of sub-agents (see
+   [Pane layout](#pane-layout)), and starts pi in the new pane, with the
    first prompt as a pi argument:
    `herdr agent start tau-t2-1 --kind pi --pane <new-pane> --timeout 60000 -- --model … --thinking … --extension <tau> -- "<first prompt>"`
 4. The first prompt tells the sub-agent its task ID, and what to do when
@@ -563,14 +563,59 @@ this is safe (see [Liveness](#liveness)). Exceptions: a task that the
 sub-agent completed already stays completed (the start is correct), and a
 task with open sub-tasks stays `in_progress` until they close (rule 7).
 
-Sub-agents are always pi agents. The new pane is a sibling of the pane of the
-agent that delegates, in the same tab. `tau` does not move the focus to the new
-pane. The sub-agent loads the pi extensions of your pi settings, and tau.
+Sub-agents are always pi agents. The new pane is in the tab of the lead (see
+[Pane layout](#pane-layout)).
+`tau` does not move the focus to the new pane. The sub-agent loads the pi extensions of your pi settings, and tau.
 Extensions that you gave to the lead with `-e` only are not loaded.
 
 An agent can delegate a task while it works on a different task: delegation
 is not work. When the parent task is `in_progress`, only its owner can
 delegate its sub-tasks.
+
+### Pane layout
+
+The lead pane stays on the left, at full height. All sub-agents (also the
+sub-agents of sub-agents) go in one column on the right of the lead, and
+each pane of the column gets the same height:
+
+```text
+1 sub-agent        3 sub-agents
++------+------+    +------+------+
+|      |      |    |      | t1   |
+|      |      |    |      +------+
+| lead |  t1  |    | lead | t2   |
+|      |      |    |      +------+
+|      |      |    |      | t3   |
++------+------+    +------+------+
+```
+
+1. The first sub-agent splits the lead pane to the right. The lead and the
+   column get one half of the width each.
+2. Each next sub-agent splits the lowest pane of the column down.
+3. After a pane of a sub-agent opens or closes (also when you close it),
+   `tau` gives the same height to each pane of the column again
+   (`herdr pane resize`).
+
+The column is the stack of panes that touch the right edge of the lead
+pane. A pane of the column is a `tau` pane when it is the pane of a
+sub-agent that did not end, and herdr shows no agent in it, or shows that
+sub-agent. `tau` changes the heights only when all panes of the column are
+`tau` panes: a pane that you added or use there stays as it is. `tau` does
+not split a pane of the column that you split to the right. When the
+column has no `tau` pane, the next sub-agent starts a new column at the
+right edge of the lead.
+
+`tau` uses the layout only when herdr shows the lead in the lead pane (the
+pi session of the task list), and the agent that delegates is in the same
+tab. So a wrong `TAU_LEAD_PANE` cannot make `tau` change a different pane.
+
+When `tau` cannot find the lead pane (for example, you moved it to a
+different tab), or when the lead does not give its pane (an older version
+of `tau`), `tau` splits the pane of the agent that delegates: to the right
+for a wide pane, down for a narrow pane. When you move panes by hand,
+`tau` does not move them back (it only changes the heights of the
+column). The layout is only for display: an
+error in it does not stop a delegation.
 
 ### The identity of a sub-agent
 
@@ -583,6 +628,7 @@ The new pane gets these environment variables:
 | `TAU_AGENT_NAME`   | The herdr name of the sub-agent: `tau-t2-1`.        |
 | `TAU_PARENT_AGENT` | The agent that started it: `lead` or `tau-…`.       |
 | `TAU_CONFIG`       | The configuration of the lead, as JSON. See [Configuration](#configuration). |
+| `TAU_LEAD_PANE`    | The herdr pane of the lead, for the [pane layout](#pane-layout). Only for display. |
 
 `tau` does not trust these values alone. The database must be in the tau
 directory, and the task list must have a record of this sub-agent, with the

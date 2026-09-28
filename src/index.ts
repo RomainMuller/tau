@@ -12,7 +12,8 @@ import { configFor } from "./config.ts";
 import { checkGate } from "./gate.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { detectHerdr, type Exec, type HerdrStatus } from "./herdr.ts";
-import { checkSubAgent, ENV_TASKLIST, resolveIdentity, type Identity } from "./identity.ts";
+import { checkSubAgent, ENV_LEAD_PANE, ENV_TASKLIST, resolveIdentity, type Identity } from "./identity.ts";
+import { isPaneId } from "./layout.ts";
 import { Supervisor } from "./supervisor.ts";
 import { TauError } from "./tasks/errors.ts";
 import { seedTaskList, type TaskList } from "./tasks/model.ts";
@@ -203,6 +204,11 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     herdrClient = herdr;
     paneOfThisAgent = status.pane.paneId;
     const createdPanes = new Set<string>();
+    // The pane of the lead: the column of sub-agents goes on its right (see
+    // `layout.ts`). A sub-agent gets it from its parent.
+    const fromEnv = env[ENV_LEAD_PANE];
+    const leadPane =
+      identity.role === "lead" ? status.pane.paneId : fromEnv !== undefined && isPaneId(fromEnv) ? fromEnv : undefined;
     const tree = new TreeWidget(store, {
       badge: badgeLabel(status, identity),
       maxLines: config.maxTreeLines,
@@ -216,6 +222,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       now: deps.now,
       onChange: () => void tree.refresh(),
       createdPanes,
+      leadPane,
       ...(deps.superviseMs === undefined ? {} : { intervalMs: deps.superviseMs }),
     });
     supervisor = watcher;
@@ -251,6 +258,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
         closeLater: (pane, agent, session) => watcher.scheduleClose(pane, agent, session),
         maxAgents: config.maxParallelSubAgents,
         config: JSON.stringify(config),
+        leadPane,
       },
       current: () => ({
         ...(ctx.model === undefined ? {} : { model: `${ctx.model.provider}/${ctx.model.id}` }),

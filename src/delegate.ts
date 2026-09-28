@@ -24,7 +24,8 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { HerdrClient } from "./herdr-client.ts";
-import { ENV_AGENT_NAME, ENV_CONFIG, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
+import { ENV_AGENT_NAME, ENV_CONFIG, ENV_LEAD_PANE, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
+import { layoutOwnership, placeNewPane, rebalance, serialized, type Placement } from "./layout.ts";
 import { agentNameFor } from "./names.ts";
 import { TauError } from "./tasks/errors.ts";
 import { findTask, type Task, type TaskList } from "./tasks/model.ts";
@@ -56,7 +57,13 @@ export interface DelegationContext {
   readonly closeLater?: (pane: string, agent: string, session?: string) => void;
   /** The effective configuration as JSON, for the new sub-agent (`TAU_CONFIG`). */
   readonly config?: string;
+  /**
+   * The herdr pane of the lead (see `layout.ts`). Without it, tau splits
+   * the pane of the delegating agent.
+   */
+  readonly leadPane?: string | undefined;
 }
+
 
 export interface DelegateRequest {
   readonly id: string;
@@ -110,26 +117,37 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
 
   let pane: string | undefined;
   try {
-    const direction = await ctx.herdr.splitDirection(ctx.paneId);
-    pane = await ctx.herdr.splitPane(ctx.paneId, {
-      direction,
-      cwd: ctx.cwd,
-      env: {
-        [ENV_TASKLIST]: ctx.store.file,
-        [ENV_TASK_ID]: reserved.task,
-        [ENV_AGENT_NAME]: reserved.agent,
-        [ENV_PARENT_AGENT]: ctx.actor.name,
-        ...(ctx.config === undefined ? {} : { [ENV_CONFIG]: ctx.config }),
-      },
+    const env = {
+      [ENV_TASKLIST]: ctx.store.file,
+      [ENV_TASK_ID]: reserved.task,
+      [ENV_AGENT_NAME]: reserved.agent,
+      [ENV_PARENT_AGENT]: ctx.actor.name,
+      ...(ctx.config === undefined ? {} : { [ENV_CONFIG]: ctx.config }),
+      ...(ctx.leadPane === undefined ? {} : { [ENV_LEAD_PANE]: ctx.leadPane }),
+    };
+    const lead = ctx.leadPane;
+    // Split and record the pane in one layout change: a different
+    // delegation must see the new pane in the column before it splits.
+    const paneId = await serialized(ctx.herdr, async () => {
+      const placement = lead === undefined ? undefined : await placementFor(ctx, lead).catch(() => undefined);
+      const made = await ctx.herdr.splitPane(placement?.pane ?? ctx.paneId, {
+        direction: placement?.direction ?? (await ctx.herdr.splitDirection(ctx.paneId)),
+        cwd: ctx.cwd,
+        env,
+        ...(placement === undefined ? {} : { ratio: placement.ratio }),
+      });
+      pane = made;
+      ctx.createdPanes?.add(made);
+      // A different agent can abort the new sub-agent while it starts. Then
+      // stop here: the catch block closes the new pane.
+      await ctx.store.mutate((list) => {
+        checkAgentNotEnded(list, reserved.agent);
+        setAgentPane(list, reserved.agent, made);
+      });
+      return made;
     });
-    const paneId = pane;
-    ctx.createdPanes?.add(paneId);
-    // A different agent can abort the new sub-agent while it starts. Then
-    // stop here: the catch block closes the new pane.
-    await ctx.store.mutate((list) => {
-      checkAgentNotEnded(list, reserved.agent);
-      setAgentPane(list, reserved.agent, paneId);
-    });
+    pane = paneId;
+    await rebalance(ctx.herdr, ctx.store, lead);
     // The first prompt is a pi argument (after "--"), not typed into the
     // editor: pi sends it after all extensions loaded (also tau, which then
     // checks the identity of the sub-agent). So no key press can be lost.
@@ -233,6 +251,12 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
   return { agent: reserved.agent, task: reserved.task, pane };
 }
 
+/** Where the pane of a new sub-agent goes, when tau can use the layout of the lead (see `layout.ts`). */
+async function placementFor(ctx: DelegationContext, lead: string): Promise<Placement | undefined> {
+  const isTauPane = await layoutOwnership(ctx.herdr, ctx.store, lead);
+  return isTauPane === undefined ? undefined : placeNewPane(ctx.herdr, lead, ctx.paneId, isTauPane);
+}
+
 /**
  * Closes the new pane of a start that failed, when this is safe: herdr
  * shows the pane, and no agent is in it, or the new sub-agent is (see
@@ -255,10 +279,12 @@ async function closeNewPane(ctx: DelegationContext, pane: string, agent: string,
   // This process made the pane.
   const safe = occupant === undefined || isSubAgentIn(occupant, agent, session, true);
   if (!safe) return false;
-  return ctx.herdr.closePane(pane).then(
+  const closed = await ctx.herdr.closePane(pane).then(
     () => true,
     () => false,
   );
+  if (closed) await rebalance(ctx.herdr, ctx.store, ctx.leadPane);
+  return closed;
 }
 
 /**

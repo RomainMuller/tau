@@ -8,6 +8,7 @@ import { checkModel, checkThinking, delegate, firstPrompt, ranFirstPrompt, type 
 import type { HerdrAgent, HerdrClient, PaneMetadata, SplitDirection } from "./herdr-client.ts";
 import { checkSubAgent, resolveIdentity } from "./identity.ts";
 import { agentNameFor, isAgentName, titleSlug } from "./names.ts";
+import { FakeTab } from "./testing/fake-tab.ts";
 import { TauError } from "./tasks/errors.ts";
 import { findTask, rollback, seedTaskList, type TaskList } from "./tasks/model.ts";
 import { taskListFile } from "./tasks/paths.ts";
@@ -36,7 +37,9 @@ class FakeHerdr {
   async splitDirection(): Promise<SplitDirection> {
     return "right";
   }
-  async splitPane(from: string, options: { env: Record<string, string> }): Promise<string> {
+  splits: Array<{ from: string; direction: string; ratio: number | undefined }> = [];
+  async splitPane(from: string, options: { env: Record<string, string>; direction: string; ratio?: number }): Promise<string> {
+    this.splits.push({ from, direction: options.direction, ratio: options.ratio });
     this.calls.push(`split ${from} ${JSON.stringify(options.env)}`);
     if (this.failSplit) throw this.failSplit;
     const pane = `w1:p${this.nextPane++}`;
@@ -117,6 +120,106 @@ beforeEach(async () => {
 afterEach(async () => {
   store.close();
   await rm(dir, { recursive: true, force: true });
+});
+
+describe("delegate, layout", () => {
+  /** herdr with a tree layout (see `FakeTab`), and the lead in w1:p1. */
+  function withTab(): FakeTab {
+    const tab = new FakeTab({ root: "w1:p1", height: 99 });
+    herdr.agents.push({ name: undefined, paneId: "w1:p1", status: "working", session: "/s/2026_s1.jsonl" });
+    const fake = herdr as unknown as {
+      layout: (pane: string) => Promise<unknown>;
+      resizePane: (pane: string, direction: "up" | "down", amount: number) => Promise<void>;
+    };
+    fake.layout = () => tab.layout();
+    fake.resizePane = (pane, direction, amount) => tab.resizePane(pane, direction, amount);
+    const split = herdr.splitPane.bind(herdr);
+    herdr.splitPane = async (from, options) => {
+      const id = await split(from, options);
+      tab.split(from, options.direction as "right" | "down", options.ratio ?? 0.5, id);
+      return id;
+    };
+    const close = herdr.closePane.bind(herdr);
+    herdr.closePane = async (pane) => {
+      await close(pane);
+      tab.close(pane);
+    };
+    return tab;
+  }
+
+  it("keeps the lead on the left, stacks the sub-agents on the right with the same height, and gives the lead pane to them", async () => {
+    const tab = withTab();
+    const withLead = { ...context(), leadPane: "w1:p1" };
+    await store.mutate((list) => {
+      for (const title of ["B", "C"]) rules.createTask(list, LEAD, { title, type: "code" });
+    });
+    for (const id of ["T0", "T1", "T2"]) await delegate(withLead, { id, model: "p/m", thinking: "low" });
+    assert.deepEqual(herdr.splits, [
+      { from: "w1:p1", direction: "right", ratio: 0.5 },
+      { from: "w1:p10", direction: "down", ratio: 0.5 },
+      { from: "w1:p11", direction: "down", ratio: 0.5 },
+    ]);
+    const layout = await tab.layout();
+    assert.deepEqual(layout.panes.get("w1:p1"), { x: 0, y: 0, width: 150, height: 99 });
+    assert.deepEqual(await tab.heights(["w1:p10", "w1:p11", "w1:p12"]), [33, 33, 33]);
+    assert.match(herdr.calls.find((call) => call.startsWith("split"))!, /"TAU_LEAD_PANE":"w1:p1"/);
+  });
+
+  it("balances the column after the supervisor closes a pane, also when you closed it", async () => {
+    const tab = withTab();
+    const withLead = { ...context(), leadPane: "w1:p1" };
+    await store.mutate((list) => {
+      for (const title of ["B", "C"]) rules.createTask(list, LEAD, { title, type: "code" });
+    });
+    for (const id of ["T0", "T1", "T2"]) await delegate(withLead, { id, model: "p/m", thinking: "low" });
+    const watcher = new Supervisor({ store, herdr: herdr as unknown as HerdrClient, actor: { name: "lead" }, now: () => NOW, createdPanes, leadPane: "w1:p1" });
+    // The middle sub-agent is done: the supervisor closes its pane.
+    await store.mutate((list) => rules.completeTask(list, { actor: { name: "tau-t1" }, now: NOW }, "T1", "done"));
+    await watcher.check();
+    assert.deepEqual(herdr.closed, ["w1:p11"]);
+    assert.deepEqual(await tab.heights(["w1:p10", "w1:p12"]), [50, 49]);
+  });
+
+  it("balances the column when you close the pane of a sub-agent", async () => {
+    const tab = withTab();
+    const withLead = { ...context(), leadPane: "w1:p1" };
+    await store.mutate((list) => {
+      for (const title of ["B", "C", "D"]) rules.createTask(list, LEAD, { title, type: "code" });
+    });
+    for (const id of ["T0", "T1", "T2", "T3"]) await delegate(withLead, { id, model: "p/m", thinking: "low" });
+    const watcher = new Supervisor({ store, herdr: herdr as unknown as HerdrClient, actor: { name: "lead" }, now: () => NOW, createdPanes, leadPane: "w1:p1" });
+    // You close the second pane: herdr gives its rows to one neighbour.
+    tab.close("w1:p11");
+    herdr.panes.delete("w1:p11");
+    herdr.agents = herdr.agents.filter((agent) => agent.paneId !== "w1:p11");
+    const before = await tab.heights(["w1:p10", "w1:p12", "w1:p13"]);
+    assert.notDeepEqual(before, [33, 33, 33]);
+    tab.calls = [];
+    // The first check fails the task and schedules the close; the pane is
+    // gone already, so the check balances the column.
+    await watcher.check();
+    assert.ok(tab.calls.length > 0, "tau resized the column");
+    assert.deepEqual(await tab.heights(["w1:p10", "w1:p12", "w1:p13"]), [33, 33, 33]);
+  });
+
+  it("does not use a lead pane that does not have the lead in it", async () => {
+    withTab();
+    herdr.agents = herdr.agents.map((agent) => (agent.paneId === "w1:p1" ? { ...agent, session: "/s/2026_other.jsonl" } : agent));
+    await delegate({ ...context(), leadPane: "w1:p1" }, { id: "T0", model: "p/m", thinking: "low" });
+    assert.deepEqual(herdr.splits, [{ from: "w1:p1", direction: "right", ratio: undefined }], "the old rule: split its own pane");
+  });
+
+  it("splits its own pane when it does not know the lead pane, or cannot read the layout", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    // No layout command in this fake herdr: the placement fails.
+    await store.mutate((list) => rules.createTask(list, LEAD, { title: "B", type: "code" }));
+    await delegate({ ...context(), leadPane: "w1:p1" }, { id: "T1", model: "p/m", thinking: "low" });
+    assert.deepEqual(herdr.splits, [
+      { from: "w1:p1", direction: "right", ratio: undefined },
+      { from: "w1:p1", direction: "right", ratio: undefined },
+    ]);
+    assert.doesNotMatch(herdr.calls.find((call) => call.startsWith("split"))!, /TAU_LEAD_PANE/);
+  });
 });
 
 describe("titleSlug", () => {

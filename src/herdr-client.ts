@@ -44,6 +44,19 @@ export interface HerdrAgent {
   readonly session?: string | undefined;
 }
 
+export interface Rect {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** The layout of the tab of a pane: the rectangle of each pane, and the splits. */
+export interface PaneLayout {
+  readonly panes: ReadonlyMap<string, Rect>;
+  readonly splits: ReadonlyArray<{ readonly direction: string; readonly ratio: number; readonly rect: Rect }>;
+}
+
 export interface PaneMetadata {
   readonly source: string;
   readonly title?: string;
@@ -91,9 +104,11 @@ export class HerdrClient {
    */
   async splitPane(
     paneId: string,
-    options: { direction: SplitDirection; cwd: string; env: Readonly<Record<string, string>> },
+    options: { direction: SplitDirection; cwd: string; env: Readonly<Record<string, string>>; ratio?: number },
   ): Promise<string> {
     const args = ["pane", "split", "--pane", paneId, "--direction", options.direction, "--cwd", options.cwd, "--no-focus"];
+    // The share of the old pane.
+    if (options.ratio !== undefined) args.push("--ratio", String(options.ratio));
     for (const [key, value] of Object.entries(options.env)) {
       args.push("--env", `${key}=${value}`);
     }
@@ -136,6 +151,43 @@ export class HerdrClient {
     await this.#run([
       "agent", "wait", name, "--until", "working", "--until", "blocked", "--until", "done", "--timeout", String(WORK_START_TIMEOUT_MS),
     ]);
+  }
+
+  /** The layout of the tab of a pane. */
+  async layout(paneId: string): Promise<PaneLayout> {
+    const reply = await this.#run(["pane", "layout", "--pane", paneId]);
+    const layout = field(field(reply, "result"), "layout");
+    const panes = field(layout, "panes");
+    const splits = field(layout, "splits");
+    if (!Array.isArray(panes) || !Array.isArray(splits)) {
+      throw new TauError("storage", "herdr replied to `pane layout` without panes and splits.");
+    }
+    const result = new Map<string, Rect>();
+    for (const pane of panes) {
+      const id = field(pane, "pane_id");
+      const rect = toRect(field(pane, "rect"));
+      if (typeof id === "string" && rect !== undefined) result.set(id, rect);
+    }
+    return {
+      panes: result,
+      splits: splits.flatMap((split) => {
+        const direction = field(split, "direction");
+        const ratio = field(split, "ratio");
+        const rect = toRect(field(split, "rect"));
+        return typeof direction === "string" && typeof ratio === "number" && Number.isFinite(ratio) && rect !== undefined
+          ? [{ direction, ratio, rect }]
+          : [];
+      }),
+    };
+  }
+
+  /**
+   * Moves an edge of a pane: `down` moves its bottom edge down, `up` moves
+   * its top edge up (or its bottom edge, for the top pane). `amount` is a
+   * share of the split that has the edge.
+   */
+  async resizePane(paneId: string, direction: "up" | "down" | "left" | "right", amount: number): Promise<void> {
+    await this.#run(["pane", "resize", "--pane", paneId, "--direction", direction, "--amount", amount.toFixed(4)]);
   }
 
   /** The live agents that herdr knows. */
@@ -223,6 +275,13 @@ export class HerdrClient {
     }
     return parseJson(result.stdout);
   }
+}
+
+function toRect(value: unknown): Rect | undefined {
+  const [x, y, width, height] = ["x", "y", "width", "height"].map((name) => field(value, name));
+  const numbers = [x, y, width, height];
+  if (!numbers.every((item) => typeof item === "number" && Number.isFinite(item))) return undefined;
+  return { x: x as number, y: y as number, width: width as number, height: height as number };
 }
 
 function parseJson(text: string): unknown {

@@ -49,6 +49,12 @@ export const ENV_PARENT_AGENT = "TAU_PARENT_AGENT";
  * sub-agents.
  */
 export const ENV_CONFIG = "TAU_CONFIG";
+/**
+ * The herdr pane of the lead. A sub-agent puts the panes of its own
+ * sub-agents in the column on the right of this pane (see `layout.ts`).
+ * It is only for display: tau does not trust it for other things.
+ */
+export const ENV_LEAD_PANE = "TAU_LEAD_PANE";
 
 /**
  * Finds the identity of this process. Without `TAU_TASKLIST`, the process is

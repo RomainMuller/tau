@@ -28,6 +28,9 @@
  */
 
 import type { HerdrAgent, HerdrClient } from "./herdr-client.ts";
+import { rebalance } from "./layout.ts";
+import { isAgentSession, isSubAgentIn } from "./sessions.ts";
+export { isAgentSession, isSubAgentIn, sameSession } from "./sessions.ts";
 import { findTask, type AgentRecord, type TaskList } from "./tasks/model.ts";
 import {
   endAgent,
@@ -66,6 +69,8 @@ export interface SupervisorOptions {
   /** Called after the task list changed. */
   readonly onChange?: () => void;
   readonly intervalMs?: number;
+  /** The herdr pane of the lead. After a close, tau balances the column of sub-agents (see `layout.ts`). */
+  readonly leadPane?: string | undefined;
 }
 
 /** A pane that tau must close when it is safe. */
@@ -275,6 +280,7 @@ export class Supervisor {
     if (this.#toClose.size === 0) return;
     const panes = await this.#options.herdr.listPanes().catch(() => undefined);
     if (panes === undefined) return;
+    let closed = false;
     for (const scheduled of [...this.#toClose.values()]) {
       // herdr knows the agent by its name and pi session. When it is in a
       // different pane (the pane moved after the last record), close its
@@ -290,7 +296,11 @@ export class Supervisor {
         // The pane does not exist. When the agent list showed the agent, it
         // moved between the two lists: keep the request, and find its pane
         // again at the next check.
-        if (found === undefined) this.#toClose.delete(scheduled.pane);
+        if (found === undefined) {
+          this.#toClose.delete(scheduled.pane);
+          // The pane closed (for example, you closed it): balance the column.
+          closed = true;
+        }
         continue;
       }
       const occupant = agents.find((agent) => agent.paneId === item.pane);
@@ -310,10 +320,12 @@ export class Supervisor {
         await this.#options.herdr.closePane(item.pane);
         this.#toClose.delete(scheduled.pane);
         this.#createdPanes.delete(item.pane);
+        closed = true;
       } catch {
         // Try again at the next check.
       }
     }
+    if (closed) await rebalance(this.#options.herdr, this.#options.store, this.#options.leadPane);
   }
 }
 
@@ -343,31 +355,7 @@ function findLive(agents: readonly HerdrAgent[], record: AgentRecord, nowMs: num
   return agents.find((agent) => agent.name === record.name && agent.paneId === record.pane);
 }
 
-/** True when the herdr agent runs the pi session `session` (a recorded session of a sub-agent). */
-export function isAgentSession(agent: HerdrAgent, session: string | undefined): boolean {
-  return session !== undefined && agent.session !== undefined && sameSession(agent.session, session);
-}
 
-/**
- * True when the herdr agent in a pane is the sub-agent `name`, with the
- * recorded pi session `session`. The session must be the same (the name
- * alone is not proof: herdr names can be used again), and:
- *
- * - herdr shows the agent with the name of the sub-agent, or
- * - herdr shows the agent with no name (herdr can drop the name when a start
- *   times out), and this process made the pane (`ownPane`). A pi that a
- *   user started (for example a lead) has no herdr name too: so a nameless
- *   agent in a different pane is not proof.
- */
-export function isSubAgentIn(agent: HerdrAgent, name: string, session: string | undefined, ownPane: boolean): boolean {
-  if (!isAgentSession(agent, session)) return false;
-  return agent.name === name || (agent.name === undefined && ownPane);
-}
-
-/** herdr reports a session file path or a session ID. A file name contains the ID. */
-export function sameSession(a: string, b: string): boolean {
-  return a === b || a.endsWith(`_${b}.jsonl`) || b.endsWith(`_${a}.jsonl`);
-}
 
 /**
  * The names of ended agents (started by `parent`, or by their ended
