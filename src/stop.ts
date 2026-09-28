@@ -76,14 +76,16 @@ export interface OpenWork {
 /**
  * The open work of `actor`. For the lead (no scope), all `waiting` and
  * `in_progress` tasks. For a sub-agent, the open tasks in its scope, but only
- * while its scope task is `in_progress`. Returns `undefined` when the agent
+ * while its scope task is `in_progress` and the sub-agent owns it. Returns `undefined` when the agent
  * can stop.
  */
 export function openWork(list: TaskList, actor: Actor): OpenWork | undefined {
   const scope = actor.scope;
   if (scope !== undefined) {
     const own = list.tasks.find((task) => task.id === scope);
-    if (own === undefined || own.status !== "in_progress") return undefined;
+    // A different agent can own the task now (for example a retry, after
+    // the start of this sub-agent failed): then this sub-agent has no work.
+    if (own === undefined || own.status !== "in_progress" || own.owner !== actor.name) return undefined;
   }
   const open = list.tasks.filter(
     (task) => !isClosed(task) && (scope === undefined || isInSubtree(task.id, scope)),

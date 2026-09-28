@@ -170,6 +170,11 @@ export class HerdrClient {
     return new Set(panes.map((pane) => field(pane, "pane_id")).filter((id): id is string => typeof id === "string"));
   }
 
+  /** Gives a new herdr name to the agent in a pane (or with a name). */
+  async renameAgent(target: string, name: string): Promise<void> {
+    await this.#run(["agent", "rename", target, name]);
+  }
+
   async closePane(paneId: string): Promise<void> {
     await this.#run(["pane", "close", paneId]);
   }

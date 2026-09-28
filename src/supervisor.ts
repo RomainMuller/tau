@@ -12,14 +12,13 @@
  *   and the child is idle (or `FINISH_GRACE_MS` went by), the child ends.
  *
  * tau closes the pane of an ended child only when this is safe: herdr shows
- * the child in the pane (the same name and pi session), or this process made
- * the pane and herdr shows no agent in it. When herdr shows the child (by
- * its name and pi session) in a different pane, tau closes that pane.
+ * the child in the pane (the same pi session), or this process made the pane
+ * and herdr shows no agent in it. When herdr shows the child (by its pi
+ * session) in a different pane, tau closes that pane.
  *
  * This protects against old records and errors. It is not a security
- * boundary: a program of the same user can write a false name and session
- * in the task list. Then tau can close the pane of the agent with that name
- * and session. So a wrong agent record cannot close a different pane (for
+ * boundary: a program of the same user can write a false session in the
+ * task list. Then tau can close the pane of the agent with that session. So a wrong agent record cannot close a different pane (for
  * example the pane of the lead). When a close fails, tau tries again at the
  * next check.
  *
@@ -254,15 +253,7 @@ export class Supervisor {
       // herdr knows the agent by its name and pi session. When it is in a
       // different pane (the pane moved after the last record), close its
       // current pane.
-      const found =
-        scheduled.session === undefined
-          ? undefined
-          : agents.find(
-              (agent) =>
-                agent.name === scheduled.agent &&
-                agent.session !== undefined &&
-                sameSession(agent.session, scheduled.session!),
-            );
+      const found = scheduled.session === undefined ? undefined : agents.find((agent) => isAgentSession(agent, scheduled.session));
       const item = found === undefined ? scheduled : { ...scheduled, pane: found.paneId };
       if (!panes.has(item.pane)) {
         // The pane does not exist. When the agent list showed the agent, it
@@ -272,17 +263,11 @@ export class Supervisor {
         continue;
       }
       const occupant = agents.find((agent) => agent.paneId === item.pane);
-      // An agent in the pane must be the same agent: the same name and the
-      // same pi session. The name alone is not proof (herdr names can be used
-      // again), so without a known session tau does not close an occupied
-      // pane.
-      const safe =
-        occupant === undefined
-          ? this.#createdPanes.has(item.pane)
-          : occupant.name === item.agent &&
-            item.session !== undefined &&
-            occupant.session !== undefined &&
-            sameSession(occupant.session, item.session);
+      // An agent in the pane must be the same agent: the same pi session.
+      // The name is not proof (herdr names can be used again, and herdr can
+      // drop the name of an agent whose start failed), so without a known
+      // session tau does not close an occupied pane.
+      const safe = occupant === undefined ? this.#createdPanes.has(item.pane) : isAgentSession(occupant, item.session);
       if (!safe) {
         // A different agent is in the pane, or tau did not make it: keep it.
         this.#toClose.delete(scheduled.pane);
@@ -317,6 +302,15 @@ function findLive(agents: readonly HerdrAgent[], record: AgentRecord, nowMs: num
   // not start tau correctly: it is not a live sub-agent.
   if (nowMs - Date.parse(record.startedAt) >= START_GRACE_MS) return undefined;
   return agents.find((agent) => agent.name === record.name && agent.paneId === record.pane);
+}
+
+/**
+ * True when the herdr agent runs the pi session `session` of a sub-agent
+ * record. The sub-agent records its own session when it starts, so this is
+ * the proof that the agent is that sub-agent (see the module comment).
+ */
+export function isAgentSession(agent: HerdrAgent, session: string | undefined): boolean {
+  return session !== undefined && agent.session !== undefined && sameSession(agent.session, session);
 }
 
 /** herdr reports a session file path or a session ID. A file name contains the ID. */

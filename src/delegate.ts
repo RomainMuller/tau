@@ -30,7 +30,7 @@ import { TauError } from "./tasks/errors.ts";
 import { findTask, type Task, type TaskList } from "./tasks/model.ts";
 import { checkAgentNotEnded, delegateTask, endAgent, failTasksOfAgent, markAgentRunning, setAgentPane, type Actor } from "./tasks/rules.ts";
 import type { TaskListStore } from "./tasks/store.ts";
-import { sameSession, START_GRACE_MS } from "./supervisor.ts";
+import { isAgentSession, sameSession, START_GRACE_MS } from "./supervisor.ts";
 import { cleanLine } from "./text.ts";
 
 /** The thinking levels of pi. */
@@ -151,10 +151,16 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
         // The session must be the file that herdr shows for the new agent
         // (the same absolute path): an old session file of the same agent
         // name proves nothing, and a session ID does not name a file.
-        const live = (await ctx.herdr.listAgents().catch(() => [])).find((agent) => agent.name === reserved.agent);
-        if (session === undefined || live?.session !== session || !(await ranFirstPrompt(session, reserved.agent))) {
+        // herdr can drop the name of the agent when its start times out,
+        // while pi runs: then find the agent by its pane.
+        const live = (await ctx.herdr.listAgents().catch(() => [])).find(
+          (agent) => agent.session === session && (agent.name === reserved.agent || agent.paneId === paneId),
+        );
+        if (session === undefined || live === undefined || !(await ranFirstPrompt(session, reserved.agent))) {
           throw error;
         }
+        // Give the name back to herdr, so that herdr knows the agent by it.
+        if (live.name !== reserved.agent) await ctx.herdr.renameAgent(live.paneId, reserved.agent).catch(() => undefined);
       }
     }
     await ctx.store.mutate((list) => {
@@ -222,7 +228,7 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
 /**
  * Closes the new pane of a start that failed, when this is safe: herdr
  * shows the pane, and no agent is in it, or the new sub-agent is (the same
- * name and pi session). Returns true when the pane is closed or does not
+ * pi session; herdr can drop the name of an agent whose start failed). Returns true when the pane is closed or does not
  * exist. Returns false when tau cannot close it safely now (for example,
  * herdr does not reply): then the supervisor must try later.
  */
@@ -234,15 +240,11 @@ async function closeNewPane(ctx: DelegationContext, pane: string, agent: string,
     // An abort can have closed the pane already. But when herdr shows the
     // new sub-agent (same name and session) in a different pane, it moved:
     // the supervisor must close its current pane.
-    const moved =
-      session !== undefined &&
-      agents.some((item) => item.name === agent && item.session !== undefined && sameSession(item.session, session));
+    const moved = session !== undefined && agents.some((item) => item.session !== undefined && sameSession(item.session, session));
     return !moved;
   }
   const occupant = agents.find((item) => item.paneId === pane);
-  const safe =
-    occupant === undefined ||
-    (occupant.name === agent && session !== undefined && occupant.session !== undefined && sameSession(occupant.session, session));
+  const safe = occupant === undefined || isAgentSession(occupant, session);
   if (!safe) return false;
   return ctx.herdr.closePane(pane).then(
     () => true,

@@ -413,8 +413,9 @@ is idle. If it is not idle 2 minutes after its task closed, it ends too. An
 ended sub-agent cannot change tasks (it can still add notes).
 
 `tau` closes the pane of an ended sub-agent only when herdr shows that
-sub-agent in the pane (the same name and pi session), or when this pi made
-the pane and no agent is in it. When the sub-agent moved, `tau` closes its
+sub-agent in the pane (the same pi session: the sub-agent records its
+session when it starts, and herdr can drop the name of an agent whose start
+failed), or when this pi made the pane and no agent is in it. When the sub-agent moved, `tau` closes its
 current pane. So an old record cannot close a different pane, for example
 yours. (This is not a security boundary: a program of your user that writes
 false records in the task list can make `tau` close a pane.) When a close fails, `tau` tries again at the next check.
@@ -525,12 +526,15 @@ sub-agents do the work.
      the model.
    - Then `tau` waits (at most 10 seconds) until herdr shows that the
      sub-agent works on the prompt.
-   - If herdr does not show this, `tau` reads the pi session file of the
-     sub-agent (at most 4 MiB). The start is correct when herdr shows the
-     new sub-agent with this session file (the same path; a session ID alone
-     is not enough), and the file has the first prompt of this sub-agent,
-     and after it an answer or an error of the model. (Then the turn was too
-     short for herdr to see it.)
+   - If `herdr agent start` fails, or herdr does not show this, `tau` reads
+     the pi session file of the sub-agent (at most 4 MiB). The start is
+     correct when herdr shows the new sub-agent with this session file (the
+     same path; a session ID alone is not enough), with its name or in its
+     new pane, and the file has the first prompt of this sub-agent, and
+     after it an answer or an error of the model. (Then the turn was too
+     short for herdr to see it, or herdr timed out while pi worked.) When
+     herdr dropped the name of the agent, `tau` gives it back
+     (`herdr agent rename`).
    - Else the start fails. For example, pi could not send the prompt to the
      model (no login), and it stays idle.
 5. The sub-agent can see the full task list. It can change only its task and
@@ -650,7 +654,9 @@ stop it, or its run ends with an error. See below.)
 
 - **Lead:** it cannot stop while a task in the list is `waiting` or
   `in_progress`.
-- **Sub-agent:** it cannot stop while its task is `in_progress`.
+- **Sub-agent:** it cannot stop while its task is `in_progress` and it owns
+  the task. (After a failed start, a retry can give the task to a different
+  sub-agent.)
 
 When the agent tries to stop too early, `tau` sends a continuation message
 (this example is without an `askTool`; with one, the last line names it):

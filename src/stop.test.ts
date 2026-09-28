@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 
-import { seedTaskList, type TaskList } from "./tasks/model.ts";
+import { findTask, seedTaskList, type TaskList } from "./tasks/model.ts";
 import {
   cancelTask,
   claimTask,
@@ -71,6 +71,14 @@ describe("openWork", () => {
     assert.deepEqual(work.ready, []);
     completeTask(list, ctx(SUB), "T1", "built");
     // T2 and T3 are open, but they are not the work of the sub-agent.
+    assert.equal(openWork(list, SUB), undefined);
+  });
+
+  it("is undefined for a sub-agent when a different agent owns its task now (a retry)", () => {
+    planned();
+    failTask(list, ctx(SUB), "T1", "did not start", true);
+    delegateTask(list, ctx(), { id: "T1", agent: "tau-t1-2" });
+    assert.equal(findTask(list, "T1")?.status, "in_progress");
     assert.equal(openWork(list, SUB), undefined);
   });
 
