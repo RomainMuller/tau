@@ -9,7 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type, type TSchema } from "typebox";
 
 import { checkModel, checkThinking, delegate, delegationText, THINKING_LEVELS, type DelegationContext } from "./delegate.ts";
-import { agentSummary, formatChange, formatList, formatSection, formatTask, TASK_SECTIONS, type TaskSection } from "./format.ts";
+import { agentSummary, descriptionIsWork, formatChange, formatList, formatSection, formatTask, TASK_SECTIONS, type TaskSection } from "./format.ts";
 import { TauError } from "./tasks/errors.ts";
 import { activeTask, findTask, getTask, isClosed, isTaskId, type AgentRecord, type TaskList } from "./tasks/model.ts";
 import {
@@ -164,9 +164,9 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
             );
           }
           const offset = typeof params.offset === "number" ? params.offset : 0;
-          return formatSection(task, params.section as TaskSection, offset);
+          return formatSection(task, params.section as TaskSection, offset, descriptionIsWork(list, task, session.actor.name));
         }
-        return formatTask(list, task);
+        return formatTask(list, task, { viewer: session.actor.name });
       },
     },
     {
@@ -230,7 +230,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       run: async (session, params) =>
         change(session, (list, ctx) => {
           const task = claimTask(list, ctx, String(params.id));
-          return `Claimed ${task.id}. It is your active task now.\n\n${formatTask(list, task)}`;
+          return `Claimed ${task.id}. It is your active task now.\n\n${formatTask(list, task, { viewer: ctx.actor.name })}`;
         }),
     },
     {

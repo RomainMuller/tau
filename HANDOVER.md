@@ -5,7 +5,7 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 469
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 479
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. All README steps are built (section 8). Ask Romain what comes next (for
@@ -66,7 +66,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `tvkpmnvr` | `4ed71080` | feat: add agent messages with tau_send                    |
 | `ytlvsqzr` | `59bbee67` | feat: read the tau configuration file                     |
 | `stysslnx` | `adbd6384` | feat: copy the task list at a session fork                |
-| `oowynxku` | (see log)  | fix: copy the list for pi --fork, and add askTool         |
+| `oowynxku` | `6370cd11` | fix: copy the list for pi --fork, and add askTool         |
+| `pusnsqqy` | (see log)  | fix: resend a lost first prompt, and trust own task text  |
 
 The working copy after that is empty.
 
@@ -164,6 +165,24 @@ says "Status: DRAFT".
   (also `tau_ask_user` with `askTool`): the gate and the delivery know tau
   tools by name. README warns that a tool that does more than ask works
   outside the gate.
+- First prompt (F5, live-seen 1 time in 3): pi can lose the Enter key while
+  it starts. `HerdrClient.prompt` uses `herdr agent prompt --wait --until
+  working --until blocked --timeout 10000`; on `agent_prompt_stalled` or
+  `timeout` it reads `agent list`: working/blocked/done -> ok; idle -> one
+  `send-keys Enter`, then `agent wait` (working|blocked|done, 10 s); other
+  state or missing -> fail (retryable). `delegate` accepts a prompt error when
+  the new agent completed its task. Limits: a short race between the state
+  check and the Enter (a question UI can get its first answer); a false
+  stall when herdr shows a finished fast agent as idle (the delegation fails);
+  the tool abort signal is not passed to herdr calls (pre-existing). The
+  stalled path is unit-tested only (FakeHerdr does not model it).
+- Own task text (F4, live-seen: a sub-agent asked if its task was a prompt
+  injection): `descriptionIsWork` in `format.ts`. The description is "the
+  work of your task" only for the owner of an in-progress task, when the
+  last writer (created/updated event) is the owner, an agent above it in the
+  agent tree, or `tau` (T0). Else data (retry after an earlier owner changed
+  it; the lead claims a task that a sub-agent wrote). `/tau show` is always
+  data. The first prompt says to follow the description only with that label.
 - `before_agent_start` order: tau reads `selectedTools` in its handler. A
   later extension handler can change the tools: then the prompt and the
   one-time missing-tool warning can be wrong for that run.

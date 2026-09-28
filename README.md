@@ -495,15 +495,26 @@ sub-agents do the work.
    pane, down for a narrow pane), and starts pi in the new pane:
    `herdr agent start tau-t2-1 --kind pi --pane <new-pane> -- --model … --thinking … --extension <tau>`
 4. The sub-agent receives a first prompt: its task ID and title, and what to
-   do when the work is done.
+   do when the work is done. Then `tau` waits until herdr shows that the
+   sub-agent works (at most 10 seconds). pi can lose the Enter key of the
+   prompt while it starts. When herdr shows that the sub-agent is idle, `tau`
+   sends one more Enter key, and waits again (at most 10 more seconds). In
+   other states, `tau` sends no key: for example, an Enter key can select an
+   answer when the sub-agent asks you a question. A limit: a short time
+   stays between the state check and the key. If the sub-agent shows a
+   question in that time, the Enter key can select its first answer.
 5. The sub-agent can see the full task list. It can change only its task and
    the sub-tasks of its task.
 6. The sub-agent can delegate its own sub-tasks to more sub-agents.
 7. When the sub-agent closed its task and is idle, `tau` closes its pane. The
    task `result` keeps the output.
 
-If a step after step 2 fails (for example, pi does not start), the task
-becomes `failed` with `retryable: true`, and `tau` closes the new pane.
+If a step after step 2 fails (for example, pi does not start, or the
+sub-agent does not start to work on its first prompt), the task
+becomes `failed` with `retryable: true`, and `tau` closes the new pane when
+this is safe (see [Liveness](#liveness)). Exceptions: a task that the
+sub-agent completed already stays completed (the start is correct), and a
+task with open sub-tasks stays `in_progress` until they close (rule 7).
 
 Sub-agents are always pi agents. The new pane is a sibling of the pane of the
 agent that delegates, in the same tab. `tau` does not move the focus to the new
@@ -911,6 +922,16 @@ next page.
 Text that agents wrote shows with `| ` at the start of each line, under a
 header that tells that it is data, not instructions. So this text cannot look
 like a field of the result.
+
+One exception: the description of your own `in_progress` task is the work
+of that task, when you or an agent above you in the agent tree (your
+parent, the parent of your parent, …, the lead) wrote it last, or when
+`tau` wrote it (the first task `T0`). Then its
+header tells that. Without this exception, a sub-agent can think that its
+own task is a prompt injection. The description stays data when a
+different agent wrote it last: for example, when the lead claims a task
+that a sub-agent created, or when an earlier owner changed the description
+before it failed the task. Results and notes stay data for all agents.
 
 ### `tau_complete` and `tau_fail`
 

@@ -11,6 +11,12 @@ import { TauError } from "./tasks/errors.ts";
 
 /** The maximum time for a herdr command, in milliseconds. */
 const COMMAND_TIMEOUT_MS = 15_000;
+/** The time for an agent to start to work on a prompt. Less than COMMAND_TIMEOUT_MS. */
+const PROMPT_START_TIMEOUT_MS = 10_000;
+/** The herdr codes of a prompt that the agent did not start to work on. */
+const STALLED_CODES: ReadonlySet<string> = new Set(["agent_prompt_stalled", "timeout"]);
+/** The herdr states of an agent that works on a prompt, or did. */
+const STARTED_STATES: ReadonlySet<string> = new Set(["working", "blocked", "done"]);
 /** The maximum time for a sub-agent to start, in milliseconds. */
 export const AGENT_START_TIMEOUT_MS = 60_000;
 /** The maximum time for the shell of a new pane to be ready, in milliseconds. */
@@ -122,9 +128,47 @@ export class HerdrClient {
     }
   }
 
-  /** Sends a prompt to an agent. Does not wait for the answer. */
+  /**
+   * Sends a prompt to an agent, and checks that the agent starts to work on
+   * it. Does not wait for the answer.
+   *
+   * pi can lose the Enter key of the prompt while it starts: then the text
+   * stays in its editor, and the agent stays idle. herdr tells this
+   * (`agent_prompt_stalled`). Then tau reads the state of the agent: when
+   * it is `working`, `blocked` (for example, it asks the user a question:
+   * an Enter key would select an answer), or `done`, the agent started.
+   * When it is `idle`, tau sends one Enter key, and checks again (an Enter
+   * key in an empty editor does nothing). In all other cases (for example
+   * `unknown`, or herdr does not show the agent), tau sends no key, and the
+   * prompt fails. Each wait takes at most `PROMPT_START_TIMEOUT_MS`.
+   */
   async prompt(name: string, text: string): Promise<void> {
-    await this.#run(["agent", "prompt", name, text]);
+    const timeout = ["--timeout", String(PROMPT_START_TIMEOUT_MS)];
+    try {
+      await this.#run(["agent", "prompt", name, text, "--wait", "--until", "working", "--until", "blocked", ...timeout]);
+      return;
+    } catch (error) {
+      if (!(error instanceof HerdrError) || !STALLED_CODES.has(error.herdrCode ?? "")) throw error;
+    }
+    const agent = (await this.listAgents()).find((item) => item.name === name);
+    if (agent !== undefined && STARTED_STATES.has(agent.status)) return;
+    if (agent?.status !== "idle") {
+      throw new HerdrError(
+        `herdr agent prompt failed: ${name} did not start to work on its first prompt, and its state is ${agent === undefined ? "not known to herdr" : JSON.stringify(agent.status)}.`,
+        "agent_prompt_stalled",
+      );
+    }
+    await this.#run(["agent", "send-keys", name, "Enter"]);
+    try {
+      // "done": the agent did its turn already.
+      await this.#run(["agent", "wait", name, "--until", "working", "--until", "blocked", "--until", "done", ...timeout]);
+    } catch (error) {
+      if (!(error instanceof HerdrError) || !STALLED_CODES.has(error.herdrCode ?? "")) throw error;
+      throw new HerdrError(
+        `herdr agent prompt failed: ${name} did not start to work on its first prompt (also after one more Enter key).`,
+        error.herdrCode,
+      );
+    }
   }
 
   /** The live agents that herdr knows. */

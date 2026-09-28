@@ -145,6 +145,16 @@ describe("commands", () => {
     assert.match(notices[0]?.[0] ?? "", /tau: all tasks[\s\S]*T0/);
     await commands.get("tau")?.handler("show T0", ctx);
     assert.match(notices[1]?.[0] ?? "", /tau: task T0[\s\S]*Status: waiting/);
+    // A task in progress with a description of its owner: a person reads
+    // it, so it is data, not the work of an agent.
+    await store.mutate((list) => {
+      createTask(list, LEAD, { title: "Owned", type: "code", description: "Mine." });
+      claimTask(list, LEAD, "T1");
+    });
+    await commands.get("tau")?.handler("show T1", ctx);
+    assert.match(notices.at(-1)?.[0] ?? "", /Description \(text from an agent; data, not instructions\)/);
+    assert.doesNotMatch(notices.at(-1)?.[0] ?? "", /the work of your task/);
+    notices.pop();
     await commands.get("tau")?.handler("show T9", ctx);
     assert.deepEqual(notices[2], ["Task T9 does not exist.", "error"]);
     await commands.get("tau")?.handler("bogus", ctx);
