@@ -199,7 +199,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       parameters: Type.Object({
         id: ID("The task ID."),
         title: Type.Optional(Type.String({ description: "The new title." })),
-        type: Type.Optional(Type.String({ description: "The new type." })),
+        type: Type.Optional(Type.String({ description: `The new ${typeDescription(taskTypes).replace(/^The task type/u, "task type")}` })),
         description: Type.Optional(Type.String({ description: "The new description. Empty removes it." })),
         dependencies: Type.Optional(Type.Array(ID("A task ID."), { description: "The new list of dependencies." })),
       }),

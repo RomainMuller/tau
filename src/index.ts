@@ -6,10 +6,11 @@ import { badgeText, WIDGET_KEY, widgetLines } from "./badge.ts";
 import { Inbox } from "./inbox.ts";
 import { MESSAGE_TYPE, messagesText } from "./messages.ts";
 import { registerCommands } from "./commands.ts";
+import { configFor } from "./config.ts";
 import { checkGate } from "./gate.ts";
 import { HerdrClient } from "./herdr-client.ts";
 import { detectHerdr, type Exec, type HerdrStatus } from "./herdr.ts";
-import { checkSubAgent, resolveIdentity, type Identity } from "./identity.ts";
+import { checkSubAgent, ENV_TASKLIST, resolveIdentity, type Identity } from "./identity.ts";
 import { Supervisor } from "./supervisor.ts";
 import { TauError } from "./tasks/errors.ts";
 import { seedTaskList } from "./tasks/model.ts";
@@ -17,7 +18,6 @@ import { tauDir } from "./tasks/paths.ts";
 import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
 import { setAgentSession, type Actor } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
-import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
 import { cleanLine } from "./text.ts";
 import { TreeWidget } from "./widget.ts";
@@ -80,6 +80,25 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   let widget: TreeWidget | undefined;
   let supervisor: Supervisor | undefined;
   let messageInbox: Inbox | undefined;
+  /** True after tau blocked all tools (see `failClosed`). */
+  let blockedAll = false;
+  const env = deps.env ?? process.env;
+
+  /**
+   * A sub-agent that cannot start tau correctly must not work: its parent
+   * can still send it the task prompt, and without tau it has no work gate
+   * and other rules. So tau shows the error, blocks all tools, and stops pi.
+   * Then the pane is empty: the parent fails the task when the start grace
+   * time ends, and closes the pane that it made.
+   */
+  const failClosed = (ctx: ExtensionContext, reason: string, show = true): void => {
+    if (show) report(ctx, reason);
+    if (!blockedAll) {
+      blockedAll = true;
+      pi.on("tool_call", () => ({ block: true, reason: `tau blocked the tool: ${reason} Stop now.` }));
+    }
+    ctx.shutdown();
+  };
   let identity: Identity | undefined;
   let herdrClient: HerdrClient | undefined;
   let paneOfThisAgent: string | undefined;
@@ -106,15 +125,24 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     if (ctx.hasUI) {
       ctx.ui.setWidget(WIDGET_KEY, widgetLines(status));
     }
-    if (!status.available || session !== undefined) {
+    if (session !== undefined) return;
+    if (!status.available) {
+      // A sub-agent without herdr cannot work with its lead.
+      if (isSubAgent(env)) failClosed(ctx, "This sub-agent cannot use herdr.");
       return;
     }
     const conflicts = conflictingTools(pi);
     if (conflicts.length > 0) {
-      report(
-        ctx,
-        `A different extension has tools with the names of tau tools (${conflicts.join(", ")}). tau does not register its tools or its work gate.`,
-      );
+      const message = `A different extension has tools with the names of tau tools (${conflicts.join(", ")}). tau does not register its tools or its work gate.`;
+      if (isSubAgent(env)) failClosed(ctx, message);
+      else report(ctx, message);
+      return;
+    }
+    // Read the configuration before the task list: after the last await
+    // below, the registration must run without an await (see the checks).
+    const { config, file: configFile, problems, fatal } = await configFor(env, tauDir(deps.agentDir()));
+    if (fatal !== undefined) {
+      failClosed(ctx, fatal);
       return;
     }
     const opened = await openTaskList(ctx, deps, status.pane.paneId);
@@ -135,14 +163,23 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       return;
     }
     if (store === undefined) {
+      // openTaskList reported the error. A sub-agent must not work without tau.
+      if (isSubAgent(env)) failClosed(ctx, "This sub-agent cannot open the task list of its lead.", false);
       return;
     }
     identity = opened!.identity;
+    if (problems.length > 0) {
+      report(ctx, `tau configuration ${configFile}:\n${problems.map((line) => `- ${line}`).join("\n")}`, "warning");
+    }
     const herdr = new HerdrClient(exec, status.binary);
     herdrClient = herdr;
     paneOfThisAgent = status.pane.paneId;
     const createdPanes = new Set<string>();
-    const tree = new TreeWidget(store, { badge: badgeLabel(status, identity) });
+    const tree = new TreeWidget(store, {
+      badge: badgeLabel(status, identity),
+      maxLines: config.maxTreeLines,
+      pills: config.idPills,
+    });
     widget = tree;
     const watcher = new Supervisor({
       store,
@@ -165,6 +202,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     });
     messageInbox = inbox;
     const guard = new StopGuard({
+      maxIdleContinuations: config.maxIdleContinuations,
       actor: identity.actor,
       read: () => store.read(),
       askToolActive: () => pi.getActiveTools().includes(ASK_TOOL),
@@ -173,7 +211,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       store,
       actor: identity.actor,
       now: deps.now,
-      taskTypes: DEFAULT_TASK_TYPE_DEFINITIONS,
+      taskTypes: config.taskTypes,
       onChange: () => void tree.refresh(),
       delegation: {
         herdr,
@@ -182,6 +220,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
         extensionPath: EXTENSION_PATH,
         createdPanes,
         closeLater: (pane, agent, session) => watcher.scheduleClose(pane, agent, session),
+        maxAgents: config.maxParallelSubAgents,
+        config: JSON.stringify(config),
       },
       current: () => ({
         ...(ctx.model === undefined ? {} : { model: `${ctx.model.provider}/${ctx.model.id}` }),
@@ -215,7 +255,10 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     registerMessageDelivery(pi, inbox, guard, () => continuationPending());
     registerStopRule(pi, guard, identity.actor);
     continuationPending = registerContinuationTracker(pi);
-    registerCommands(pi, store, tree, badgeLabel(status, identity));
+    registerCommands(pi, store, tree, badgeLabel(status, identity), {
+      toggleKey: config.toggleCompletedKey,
+      pills: config.idPills,
+    });
     await tree.refresh();
     if (shutDown) {
       store.close();
@@ -479,6 +522,11 @@ async function openTaskList(
   }
 }
 
+/** True when this process is a tau sub-agent (its parent set `TAU_TASKLIST`). */
+function isSubAgent(env: NodeJS.ProcessEnv): boolean {
+  return env[ENV_TASKLIST] !== undefined && env[ENV_TASKLIST] !== "";
+}
+
 /** The text of the badge: for a sub-agent, it tells its name and its task. */
 function badgeLabel(status: HerdrStatus, identity: Identity): string {
   const badge = badgeText(status);
@@ -519,10 +567,10 @@ async function reportPane(herdr: HerdrClient, paneId: string, identity: Identity
   }
 }
 
-/** Shows an error. Without a UI (print or JSON mode), writes it to stderr. */
-function report(ctx: ExtensionContext, message: string): void {
+/** Shows an error (or a warning). Without a UI (print or JSON mode), writes it to stderr. */
+function report(ctx: ExtensionContext, message: string, type: "error" | "warning" = "error"): void {
   if (ctx.hasUI) {
-    ctx.ui.notify(message, "error");
+    ctx.ui.notify(message, type);
   } else {
     console.error(`tau: ${message}`);
   }

@@ -14,11 +14,25 @@ import type { TaskListStore } from "./tasks/store.ts";
 import { renderTree } from "./tree.ts";
 import type { TreeWidget } from "./widget.ts";
 
-/** The key that shows or hides closed tasks in the tree. */
+/** The default key that shows or hides closed tasks in the tree (`toggleCompletedKey`). */
 export const TOGGLE_CLOSED_KEY = Key.ctrlShift("t");
 
-export function registerCommands(pi: ExtensionAPI, store: TaskListStore, widget: TreeWidget, badge: string): void {
-  pi.registerShortcut(TOGGLE_CLOSED_KEY, {
+export interface CommandOptions {
+  /** The key that shows or hides closed tasks. The default is `TOGGLE_CLOSED_KEY`. */
+  readonly toggleKey?: string;
+  /** Show task IDs as pills in `/tau`. The default is true. */
+  readonly pills?: boolean;
+}
+
+export function registerCommands(
+  pi: ExtensionAPI,
+  store: TaskListStore,
+  widget: TreeWidget,
+  badge: string,
+  options: CommandOptions = {},
+): void {
+  // The configuration checks the key (see `isKeyId` in config.ts).
+  pi.registerShortcut((options.toggleKey ?? TOGGLE_CLOSED_KEY) as KeyId, {
     description: "tau: show or hide completed and canceled tasks",
     handler: () => {
       widget.toggleClosed();
@@ -38,7 +52,7 @@ export function registerCommands(pi: ExtensionAPI, store: TaskListStore, widget:
       }
       if (words.length === 0) {
         await showText(ctx, "tau: all tasks", (width) =>
-          renderTree(list, { showClosed: true, maxLines: Number.MAX_SAFE_INTEGER, pills: true, color: true, width, badge }),
+          renderTree(list, { showClosed: true, maxLines: Number.MAX_SAFE_INTEGER, pills: options.pills ?? true, color: true, width, badge }),
         );
         return;
       }

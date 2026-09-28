@@ -189,6 +189,12 @@ describe("delegate", () => {
     });
   });
 
+  it("gives the configuration of the delegating agent to the new sub-agent", async () => {
+    await delegate({ ...context(), config: '{"maxTreeLines":2}' }, { id: "T0", model: "p/m", thinking: "low" });
+    const split = herdr.calls.find((call) => call.startsWith("split "))!;
+    assert.equal(JSON.parse(split.slice(split.indexOf("{"))).TAU_CONFIG, '{"maxTreeLines":2}');
+  });
+
   it("does not use a name that herdr already uses", async () => {
     herdr.agents.push({ name: "tau-t0", paneId: "w9:p9", status: "idle" });
     const result = await delegate(context(), { id: "T0", model: "prov/m", thinking: "low" });

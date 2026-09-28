@@ -42,6 +42,13 @@ export const ENV_TASKLIST = "TAU_TASKLIST";
 export const ENV_TASK_ID = "TAU_TASK_ID";
 export const ENV_AGENT_NAME = "TAU_AGENT_NAME";
 export const ENV_PARENT_AGENT = "TAU_PARENT_AGENT";
+/**
+ * The effective configuration of the lead, as JSON (see `config.ts`). A
+ * sub-agent uses it, not the file, so that all agents of one task list use
+ * the same rules (task types, limits). Each sub-agent gives it to its own
+ * sub-agents.
+ */
+export const ENV_CONFIG = "TAU_CONFIG";
 
 /**
  * Finds the identity of this process. Without `TAU_TASKLIST`, the process is

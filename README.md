@@ -84,7 +84,8 @@ When herdr is not available, `tau` does nothing else. It registers no tools, no
 commands, and no keys. Its only hooks are the `session_start` handler, which
 does the check and shows the badge, and the `session_shutdown` handler, which
 removes the badge. Pi runs in its standard mode. The badge is the only
-difference.
+difference. (A tau sub-agent without herdr does not work: see
+[The identity of a sub-agent](#the-identity-of-a-sub-agent).)
 
 `tau` does the check one time, in the first `session_start` event. The result
 stays the same until pi reloads the extension (`/reload`).
@@ -187,7 +188,8 @@ complete.
 ╰──────────────────────────────────────────────────────────────╯
 ```
 
-**All tasks view** (after `ctrl+shift+t`). `⧗` shows all dependencies. A
+**All tasks view** (after `ctrl+shift+t`, the default
+[key](#configuration)). `⧗` shows all dependencies. A
 dependency that is complete has a `✔` (with pills, the green pill shows it).
 The line limit of [Tall trees](#tall-trees) applies to this view too: this
 preview shows 8 lines, as with `maxTreeLines: 8`.
@@ -421,8 +423,9 @@ If an agent calls a tool that is not a `tau_*` tool, and it owns no
 ```
 
 If `tau` cannot read the task list, it blocks the call too, and tells why.
-If `tau` cannot open the task list when the session starts, it shows an
-error and registers no tools and no gate: pi runs in its standard mode.
+If the lead cannot open the task list when the session starts, `tau` shows
+an error and registers no tools and no gate: pi runs in its standard mode.
+(A sub-agent stops: see [The identity of a sub-agent](#the-identity-of-a-sub-agent).)
 
 When the type of the active task has `readOnly: true`, the work gate also
 blocks `edit` and `write`. `bash` stays available, because `tau` cannot check
@@ -513,12 +516,21 @@ The new pane gets these environment variables:
 | `TAU_TASK_ID`      | The task of the sub-agent, for example `T2.1`.      |
 | `TAU_AGENT_NAME`   | The herdr name of the sub-agent: `tau-t2-1`.        |
 | `TAU_PARENT_AGENT` | The agent that started it: `lead` or `tau-…`.       |
+| `TAU_CONFIG`       | The configuration of the lead, as JSON. See [Configuration](#configuration). |
 
 `tau` does not trust these values alone. The database must be in the tau
 directory, and the task list must have a record of this sub-agent, with the
 same task, parent, and herdr pane. The task must be `in_progress`, with the
-sub-agent as owner. If not, `tau` shows an error and registers nothing in
-that pi.
+sub-agent as owner.
+
+A sub-agent that cannot start `tau` correctly must not work: for example,
+these checks fail, it has no valid configuration from its lead, it cannot
+use herdr, or a different extension has a `tau_*` tool name. Then `tau`
+shows an error, blocks all tools, and stops that pi. If pi stops before the
+start completes, the delegation fails at once (the task fails, retryable,
+and `tau` closes the pane). Else the pane is empty: the parent fails the
+task (`owner agent exited`) when the start grace time ends, and closes the
+pane.
 
 These checks keep the agents of one user in order. They are not a security
 boundary between agents: a program of the same user (for example a `bash`
@@ -886,7 +898,7 @@ cannot contain control characters.
 
 | Input             | Does                                                 |
 |-------------------|------------------------------------------------------|
-| `ctrl+shift+t`    | Show or hide `completed` and `canceled` tasks.       |
+| `ctrl+shift+t`    | Show or hide `completed` and `canceled` tasks. This is the default key: see `toggleCompletedKey` in the [configuration](#configuration). |
 | `/tau`            | Show the full task list in a dialog.                 |
 | `/tau show <id>`  | Show one task with all fields, complete.             |
 
@@ -976,8 +988,39 @@ become `failed`, with the result `owner is in a different session` and
 
 ## Configuration
 
-Edit `~/.pi/tau/config.json`. All fields are optional. There is no
-configuration for each project.
+Edit `~/.pi/tau/config.json` (in the [tau directory](#storage)). All fields
+are optional. There is no configuration for each project. The file is JSON,
+and it can have `//` and `/* */` comments. It can be a symbolic link. The
+file is trusted input: it sets the work gate and the text that models get
+(task type descriptions). Do not link it to a file that other users can
+change.
+
+The lead reads the file when the session starts, and again after
+`/reload`. Sub-agents do not read the file: they get the configuration of
+the lead (in `TAU_CONFIG`), so that all agents of one task list use the same
+rules, also when the file changes (until `/reload`, see below). A sub-agent
+that does not get a valid configuration from its lead does not work (see
+[The identity of a sub-agent](#the-identity-of-a-sub-agent)).
+
+After `/reload`, the new configuration of the lead applies to the lead and
+to the sub-agents that start after it. Sub-agents that run already keep the
+configuration that they got. To use one configuration for all agents,
+change the file before you start the work.
+
+`tau` gives the configuration to a sub-agent in the arguments of a `herdr`
+command. Other users of the computer can see process arguments. So do not
+put secrets in the configuration (for example, in task type descriptions). When a field is not valid, `tau` uses the
+default value of that field, and shows a warning with the reason. When the
+file is not valid JSON, `tau` uses the default configuration.
+
+| Field                  | Valid values                                              |
+|------------------------|-----------------------------------------------------------|
+| `toggleCompletedKey`   | A key: modifiers (`ctrl`, `shift`, `alt`, `super`), then a letter, a digit, a symbol, or a special key (`tab`, `pageUp`, …). It must have `ctrl`, `alt`, or `super`, so that it does not catch normal input. A function key (`f1` … `f12`) has no modifier. Not Escape, not `+`, and not `[`, `]`, `\` (with `ctrl`, the terminal sends the same bytes as Escape). |
+| `idPills`              | `true` or `false`.                                        |
+| `maxTreeLines`         | An integer from 1 to 100.                                 |
+| `maxParallelSubAgents` | An integer from 1 to 32.                                  |
+| `maxIdleContinuations` | An integer from 0 to 100. With 0, the "do not stop" rule gives up at the first early stop. |
+| `taskTypes`            | 1 to 50 types. A name starts with `a-z`, then has `a-z`, `0-9`, and `-` (at most 32 characters). Each type has a `description` (1 to 300 characters) and an optional `readOnly`. The list must have `plan`, the type of the first task `T0`. If one type is not valid, `tau` uses the default list. |
 
 ```jsonc
 {

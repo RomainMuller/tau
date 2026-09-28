@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { DEFAULT_CONFIG } from "./config.ts";
 import tau, { createTau, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { seedTaskList } from "./tasks/model.ts";
@@ -24,6 +25,8 @@ interface FakePi {
   readonly inactive: Set<string>;
   /** The calls of pi.sendMessage: the message and the options. */
   readonly sent: Array<[unknown, unknown]>;
+  /** The keys of pi.registerShortcut. */
+  readonly shortcuts: string[];
 }
 
 /**
@@ -40,7 +43,9 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
   const tools = new Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>();
   const inactive = new Set<string>();
   const sent: Array<[unknown, unknown]> = [];
+  const shortcuts: string[] = [];
   const known = {
+    registerShortcut: (key: string) => void shortcuts.push(key),
     sendMessage: (message: unknown, options: unknown) => void sent.push([message, options]),
     getAllTools: () => [...tools.keys()].map((name) => ({ name })),
     getActiveTools: () => [...tools.keys()].filter((name) => !inactive.has(name)),
@@ -67,17 +72,20 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
       };
     },
   }) as unknown as ExtensionAPI;
-  return { api, handlers, execCalls, otherCalls, tools, inactive, sent };
+  return { api, handlers, execCalls, otherCalls, tools, inactive, sent, shortcuts };
 }
 
 function fakeCtx(hasUI = true, sessionId = "session-1") {
   const widgets: Array<{ key: string; lines: unknown }> = [];
   const notices: Array<{ message: string; type: unknown }> = [];
+  const shutdowns: number[] = [];
   return {
     widgets,
     notices,
+    shutdowns,
     ctx: {
       hasUI,
+      shutdown: () => void shutdowns.push(1),
       sessionManager: { getSessionId: () => sessionId, getSessionFile: () => `/sessions/2026_${sessionId}.jsonl` },
       ui: {
         setWidget(key: string, lines: unknown) {
@@ -150,6 +158,9 @@ function enableHerdr(): void {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_BIN_PATH = HERDR_BIN;
 }
+
+/** The configuration that a lead gives to its sub-agents (the defaults). */
+const LEAD_CONFIG = JSON.stringify(DEFAULT_CONFIG);
 
 describe("tau extension", () => {
   const saved = new Map<string, string | undefined>();
@@ -750,6 +761,109 @@ describe("tau extension", () => {
     });
   });
 
+  it("uses the configuration file, and warns about the fields that are not valid", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(
+      join(root, "tau", "config.json"),
+      `{
+        // Comments are permitted.
+        "toggleCompletedKey": "ctrl+shift+y",
+        "maxIdleContinuations": 1,
+        "maxTreeLines": 2,
+        "taskTypes": { "plan": { "description": "Plan." }, "spike": { "description": "Try an idea.", "readOnly": true } },
+        "colour": "blue"
+      }`,
+    );
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "config-1");
+    const handle = createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+
+    assert.deepEqual(pi.shortcuts, ["ctrl+shift+y"]);
+    assert.ok(notices.some((notice) => notice.type === "warning" && /"colour" is not a configuration field/.test(notice.message)));
+    // The task types of the configuration.
+    await assert.rejects(pi.tools.get("tau_create")!.execute("1", { title: "x", type: "code" }), /is not a task type/);
+    await pi.tools.get("tau_create")!.execute("2", { title: "Try it", type: "spike" });
+    await pi.tools.get("tau_claim")!.execute("3", { id: "T1" });
+    // spike is read-only: the work gate blocks edit.
+    const gate = pi.handlers.get("tool_call")![0]!;
+    const blocked = (await gate({ type: "tool_call", toolName: "edit", toolCallId: "4", input: {} }, ctx)) as { reason: string };
+    assert.match(blocked.reason, /"spike", which is read-only/);
+    // No configured type permits changes except plan: the message tells it.
+    assert.match(blocked.reason, /No configured task type other than "plan" permits file changes/);
+    // maxIdleContinuations: 1 continuation, then the rule stops.
+    const settle = chain(pi, "agent_before_settle");
+    const boundary = () => settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx);
+    assert.notEqual(await boundary(), undefined);
+    assert.equal(await boundary(), undefined);
+    // maxTreeLines: 2 lines for 4 open tasks (the last line tells the rest).
+    await pi.tools.get("tau_create")!.execute("5", { title: "More", type: "plan" });
+    await pi.tools.get("tau_create")!.execute("6", { title: "Even more", type: "plan" });
+    // A refresh can run already (a tool started it): wait for it, then refresh.
+    await handle.widget!.refresh();
+    await handle.widget!.refresh();
+    const lines = handle.widget!.lines(100);
+    // The header, 2 task lines, and the line that tells the rest.
+    assert.equal(lines.length, 1 + 2 + 1, lines.join("\n"));
+    assert.match(lines[0]!, /3 waiting/);
+    assert.match(lines.at(-1)!, /… 2 more/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("uses idPills and maxParallelSubAgents, and gives the configuration to sub-agents", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "idPills": false, "maxParallelSubAgents": 1 }');
+    // The list of the lead: T0 was delegated to tau-t0 already (1 live sub-agent).
+    const file = join(root, "tau", "tasklists", "config-2.db");
+    const store = new TaskListStore(file);
+    await store.ensure(() => seedTaskList("config-2", "2026-01-01T00:00:00.000Z"));
+    await store.mutate((list) => {
+      createTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { title: "Next", type: "code" });
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p2");
+      setAgentSession(list, "tau-t0", "/s/2026_t0.jsonl");
+    });
+    store.close();
+    // herdr shows tau-t0 alive, so that the liveness check keeps it.
+    const live = [{ name: "tau-t0", pane_id: "w1:p2", agent_status: "working", agent_session: { value: "/s/2026_t0.jsonl" } }];
+    const pi = fakePi((args) =>
+      args[0] === "agent" && args[1] === "list"
+        ? { code: 0, stdout: JSON.stringify({ result: { agents: live } }) }
+        : { code: 0, stdout: PANE_REPLY },
+    );
+    const { ctx } = fakeCtx(true, "config-2");
+    const handle = createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    // idPills false: the tree shows status marks, not pills.
+    await handle.widget!.refresh();
+    // eslint-disable-next-line no-control-regex
+    assert.match(handle.widget!.lines(100).join("\n").replace(/\u001b\[[0-9;]*m/gu, ""), /○ T1  Next/);
+    // maxParallelSubAgents 1: a second sub-agent is refused.
+    await assert.rejects(pi.tools.get("tau_delegate")!.execute("1", { id: "T1", model: "p/m", thinking: "low" }), /The maximum is 1/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("writes the configuration warnings to stderr when there is no UI", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "colour": "blue" }');
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(false, "config-3");
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => void errors.push(args.map(String).join(" "));
+    try {
+      createTau(pi.api, deps);
+      await emit(pi, "session_start", ctx);
+    } finally {
+      console.error = original;
+    }
+    assert.ok(errors.some((line) => /"colour" is not a configuration field/.test(line)), errors.join("\n"));
+    await emit(pi, "session_shutdown", ctx);
+  });
+
   it("adds the tau section to the system prompt", async () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
@@ -919,7 +1033,7 @@ describe("tau extension", () => {
       createTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { title: "Lead work", type: "code" });
     });
     lead.close();
-    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead" };
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx, notices } = fakeCtx(true, "sub-session");
     const handle = createTau(pi.api, { ...deps, env });
@@ -970,20 +1084,129 @@ describe("tau extension", () => {
     await emit(pi, "session_shutdown", ctx);
   });
 
+  it("registers nothing in a sub-agent without a valid configuration from its lead", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-3.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-3", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p1");
+    });
+    lead.close();
+    for (const config of [undefined, "", "{ bad", JSON.stringify({ taskTypes: { code: { description: "x" } } })]) {
+      const env = {
+        TAU_TASKLIST: file,
+        TAU_TASK_ID: "T0",
+        TAU_AGENT_NAME: "tau-t0",
+        TAU_PARENT_AGENT: "lead",
+        ...(config === undefined ? {} : { TAU_CONFIG: config }),
+      };
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx, notices, shutdowns } = fakeCtx(true, "sub-bad");
+      createTau(pi.api, { ...deps, env });
+      await emit(pi, "session_start", ctx);
+      assert.equal(pi.tools.size, 0, String(config));
+      assert.match(notices[0]?.message ?? "", /did not get a valid configuration from its lead/, String(config));
+      // Fail closed: one handler blocks all tools.
+      const gates = pi.handlers.get("tool_call") ?? [];
+      assert.equal(gates.length, 1, String(config));
+      const blocked = (await gates[0]!({ type: "tool_call", toolName: "edit", toolCallId: "1", input: {} }, ctx)) as {
+        block: boolean;
+        reason: string;
+      };
+      assert.equal(blocked.block, true);
+      assert.match(blocked.reason, /did not get a valid configuration from its lead.* Stop now\./);
+      await emit(pi, "session_start", ctx);
+      assert.equal(pi.handlers.get("tool_call")?.length, 1, "one handler, also after a later session_start");
+      assert.ok(shutdowns.length >= 1, "pi stops");
+    }
+  });
+
+  it("a lead reads its file, not a TAU_CONFIG of its environment", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "toggleCompletedKey": "ctrl+shift+y" }');
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "lead-env");
+    createTau(pi.api, { ...deps, env: { TAU_CONFIG: JSON.stringify({ ...DEFAULT_CONFIG, toggleCompletedKey: "ctrl+shift+u" }) } });
+    await emit(pi, "session_start", ctx);
+    assert.deepEqual(pi.shortcuts, ["ctrl+shift+y"]);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("gives its configuration to a new sub-agent (TAU_CONFIG in the new pane)", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "maxTreeLines": 3 }');
+    const pi = fakePi((args) =>
+      args[0] === "agent" && args[1] === "list"
+        ? { code: 0, stdout: JSON.stringify({ result: { agents: [] } }) }
+        : args[0] === "pane" && args[1] === "split"
+          ? { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p9" } } }) }
+          : { code: 0, stdout: PANE_REPLY },
+    );
+    const { ctx } = fakeCtx(true, "handoff-1");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    await pi.tools.get("tau_delegate")!.execute("1", { id: "T0", model: "p/m", thinking: "low" });
+    const split = pi.execCalls.find((call) => call[1] === "pane" && call[2] === "split")!;
+    const value = split.find((arg) => typeof arg === "string" && arg.startsWith("TAU_CONFIG="))!.slice("TAU_CONFIG=".length);
+    assert.equal(JSON.parse(value).maxTreeLines, 3);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
   it("registers nothing when the sub-agent identity does not agree with the task list", async () => {
     enableHerdr();
     const file = join(root, "tau", "tasklists", "lead-2.db");
     const lead = new TaskListStore(file);
     await lead.ensure(() => seedTaskList("lead-2", "2026-01-01T00:00:00.000Z"));
     lead.close();
-    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead" };
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
-    const { ctx, notices } = fakeCtx(true, "sub-session");
+    const { ctx, notices, shutdowns } = fakeCtx(true, "sub-session");
     createTau(pi.api, { ...deps, env });
 
     await emit(pi, "session_start", ctx);
 
     assert.equal(pi.tools.size, 0);
     assert.match(notices[0]?.message ?? "", /has no sub-agent @tau-t0/);
+    await assertFailedClosed(pi, ctx, shutdowns, /cannot open the task list of its lead/);
+  });
+
+  it("fails closed in a sub-agent without herdr, or with a tool name conflict", async () => {
+    const env = { TAU_TASKLIST: join(root, "x.db"), TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+    // No herdr: HERDR_ENV is not set.
+    {
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx, shutdowns } = fakeCtx(true, "sub-no-herdr");
+      createTau(pi.api, { ...deps, env });
+      await emit(pi, "session_start", ctx);
+      await assertFailedClosed(pi, ctx, shutdowns, /cannot use herdr/);
+    }
+    // A different extension has a tau tool name.
+    enableHerdr();
+    {
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      pi.tools.set("tau_list", { execute: async () => undefined });
+      const { ctx, shutdowns } = fakeCtx(true, "sub-conflict");
+      createTau(pi.api, { ...deps, env });
+      await emit(pi, "session_start", ctx);
+      await assertFailedClosed(pi, ctx, shutdowns, /A different extension has tools with the names of tau tools/);
+    }
   });
 });
+
+/** Checks that tau blocks all tools with the reason, and stopped pi, one time. */
+async function assertFailedClosed(pi: FakePi, ctx: unknown, shutdowns: number[], reason: RegExp): Promise<void> {
+  const gates = pi.handlers.get("tool_call") ?? [];
+  assert.equal(gates.length, 1);
+  const blocked = (await gates[0]!({ type: "tool_call", toolName: "bash", toolCallId: "1", input: {} }, ctx)) as {
+    block: boolean;
+    reason: string;
+  };
+  assert.equal(blocked.block, true);
+  assert.match(blocked.reason, reason);
+  assert.match(blocked.reason, /Stop now\.$/);
+  assert.ok(shutdowns.length >= 1, "pi stops");
+}

@@ -40,9 +40,13 @@ export function checkGate(input: GateInput): string | undefined {
   // A type that the configuration does not define is read-only: this is the
   // safe choice.
   if (FILE_CHANGE_TOOLS.has(input.toolName) && input.taskTypes[active.type]?.readOnly !== false) {
+    // Name a type that permits changes, from the configured types.
+    const writable = Object.entries(input.taskTypes).find(([name, type]) => !type.readOnly && name !== "plan")?.[0];
     return [
       `tau blocked ${input.toolName}: your active task ${active.id} has the type "${cleanLine(active.type)}", which is read-only.`,
-      'Record what you found in the task result. Create a "code" task for changes.',
+      writable === undefined
+        ? 'Record what you found in the task result. No configured task type other than "plan" permits file changes: tell the user.'
+        : `Record what you found in the task result. Create a "${writable}" task for changes.`,
     ].join("\n");
   }
   return undefined;

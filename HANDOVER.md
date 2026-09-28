@@ -5,11 +5,11 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 408
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 438
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. Ask Romain which next step to start (see section 8). The proposal is
-   the configuration file (section 8, item 1).
+   fork (section 8, item 1), the last planned step.
 
 ## 2. What tau is
 
@@ -62,7 +62,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `lklwxowt` | `dc93e269` | docs: add a hand-over document for the next session       |
 | `tmrzoyxo` | `2676a1d7` | feat: add the do-not-stop rule and tau_ask_user           |
 | `xnnzlppn` | `95d5be63` | feat: add tau_abort to stop sub-agents                    |
-| `tvkpmnvr` | (see log)  | feat: add agent messages with tau_send                    |
+| `tvkpmnvr` | `4ed71080` | feat: add agent messages with tau_send                    |
+| `ytlvsqzr` | (see log)  | feat: read the tau configuration file                     |
 
 The working copy after that is empty.
 
@@ -81,6 +82,7 @@ The working copy after that is empty.
 | `stop.ts` | "Do not stop" rule. `openWork` (lead: all open tasks; sub-agent: its scope while its task is in progress), `continuationText` (task IDs, statuses, and tau-made agent names only: no agent text, because it is a user-role message; never a `tau_wait` for own tasks), `promptSection` (the `<tau>` system prompt section), `StopGuard` (idle count by list `revision`, give up after 3, ask exemption). |
 | `messages.ts` | Messages: `checkRecipient` (sub-agents at any depth, parent, siblings; ended agents refused), `checkMessageText`, `messagesText` (header + `\| ` quote, `cleanText`). |
 | `inbox.ts` | `Inbox`: delivers only while the agent is idle (`pi.sendMessage` with `triggerTurn`), at most one turn per 5 s, `pause`/`resume`, gives messages back (`untakeMessages`) when the state changed or the delivery threw, `stop`/`drain`. |
+| `config.ts` | `~/.pi/tau/config.json` (JSON with comments): `loadConfig` (never throws; O_NONBLOCK open + fstat + bounded read; symlink allowed), `parseConfig` (per-field defaults + problem lines, max 20; `Object.hasOwn`), `isKeyId` (needs ctrl/alt/super; no Escape, `+`, `[ ] \\`, ctrl+h/i/j/m), `configFor` (lead: the file; sub-agent: `TAU_CONFIG` or `fatal`). |
 | `gate.ts` | Work gate on `tool_call`: no active task → block non-tau tools; read-only type (or unknown type) → block `edit`/`write`. |
 | `format.ts` | Model-facing text. Agent text is quoted with `| ` and labeled as data. `tau_get` previews (2000 chars, last 10 notes/events) and `section`+`offset` paging by code points. |
 | `text.ts` | Removes ANSI/OSC sequences, control chars, bidi and zero-width chars. |
@@ -139,11 +141,7 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 
 ## 8. What is left (from README), in the proposed order
 
-1. **Configuration** (next; about 1.5 h with review) `~/.pi/tau/config.json`: `toggleCompletedKey`, `idPills`,
-   `maxTreeLines`, `maxParallelSubAgents`, `maxIdleContinuations`,
-   `taskTypes` (with `readOnly`). Code already accepts most of these as
-   options (`TreeWidgetOptions`, `maxAgents`, `taskTypes`).
-2. **Fork**: on `session_start` with reason `fork`, copy the list rolled back
+1. **Fork** (next; about 2 h with review): on `session_start` with reason `fork`, copy the list rolled back
    to the fork point (`rollback` by revision exists; need to map the fork
    entry to a revision, for example with `pi.appendEntry` after each change),
    new session ID, in-progress tasks of other-session owners → failed
@@ -170,7 +168,6 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 - The guard state is in memory: a pi restart starts the idle count again.
 - A mixed batch with `tau_ask_user` is unit-tested only: in live tests the
   model follows the description and calls it alone.
-- The idle limit (3) is hard-coded until the configuration step.
 - `tau_abort` limits (accepted, documented in README):
   - An empty pane of a grandchild that exited before the abort stays open:
     only the process that made a pane can close it empty, and that process
@@ -205,6 +202,16 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
     added messages; an async failure of `pi.sendMessage(triggerTurn)` is not
     reported to tau; mixed tau versions (restart sub-agents after an
     upgrade).
+- Configuration: the lead reads the file at session start (and `/reload`);
+  it gives `JSON.stringify(config)` to each sub-agent in `TAU_CONFIG` (herdr
+  `--env`, visible in process arguments: no secrets). A sub-agent with no
+  valid `TAU_CONFIG` fails closed (`failClosed` in `index.ts`: error, a
+  handler that blocks all tools, `ctx.shutdown()`); the same for a sub-agent
+  without herdr, with a tool-name conflict, or with a failed identity check.
+  Its parent fails the task after the start grace and closes the empty pane. After `/reload`, running sub-agents keep their
+  old configuration (README limit). `/tau` with `idPills: false` has no
+  command test. A sub-agent with a different `PI_CODING_AGENT_DIR` than its
+  lead is refused by the identity check (pre-existing).
 - Not tested: `index.ts` passes the session to `closeLater` (one line, no
   end-to-end test); the `checkAgain` concurrency test uses the test copy of
   the stop hook, not the `index.ts` one.

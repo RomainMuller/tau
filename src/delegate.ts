@@ -19,7 +19,7 @@
  */
 
 import type { HerdrClient } from "./herdr-client.ts";
-import { ENV_AGENT_NAME, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
+import { ENV_AGENT_NAME, ENV_CONFIG, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
 import { agentNameFor } from "./names.ts";
 import { TauError } from "./tasks/errors.ts";
 import { findTask, type Task, type TaskList } from "./tasks/model.ts";
@@ -49,6 +49,8 @@ export interface DelegationContext {
   readonly createdPanes?: Set<string>;
   /** Asks the supervisor to close a pane later, when a close now fails. */
   readonly closeLater?: (pane: string, agent: string, session?: string) => void;
+  /** The effective configuration as JSON, for the new sub-agent (`TAU_CONFIG`). */
+  readonly config?: string;
 }
 
 export interface DelegateRequest {
@@ -112,6 +114,7 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
         [ENV_TASK_ID]: reserved.task,
         [ENV_AGENT_NAME]: reserved.agent,
         [ENV_PARENT_AGENT]: ctx.actor.name,
+        ...(ctx.config === undefined ? {} : { [ENV_CONFIG]: ctx.config }),
       },
     });
     const paneId = pane;
