@@ -413,12 +413,22 @@ is idle. If it is not idle 2 minutes after its task closed, it ends too. An
 ended sub-agent cannot change tasks (it can still add notes).
 
 `tau` closes the pane of an ended sub-agent only when herdr shows that
-sub-agent in the pane (the same pi session: the sub-agent records its
-session when it starts, and herdr can drop the name of an agent whose start
-failed), or when this pi made the pane and no agent is in it. When the sub-agent moved, `tau` closes its
-current pane. So an old record cannot close a different pane, for example
+sub-agent in the pane, or when this pi made the pane and no agent is in
+it. herdr shows the sub-agent when it shows an agent with the pi session
+that the sub-agent recorded when it started, and one of these is true:
+
+- The agent has the name of the sub-agent.
+- The agent has no name, and this pi made the pane. (herdr can drop the
+  name of an agent when its start times out. A pi that you started has no
+  herdr name too: so a nameless agent in a different pane is not proof.)
+
+When the sub-agent moved (herdr shows it with its name and pi session in a
+different pane), `tau` closes its current pane. So an old record cannot close a different pane, for example
 yours. (This is not a security boundary: a program of your user that writes
 false records in the task list can make `tau` close a pane.) When a close fails, `tau` tries again at the next check.
+A limit: `tau` keeps these close requests in the memory of the pi process.
+When the lead stops before a close succeeds, the pane stays open after
+the lead starts again: close it yourself.
 
 The lead can also stop existing (for example, you close its pane). When you
 resume the lead session, its liveness check compares its sub-agents with
@@ -529,12 +539,15 @@ sub-agents do the work.
    - If `herdr agent start` fails, or herdr does not show this, `tau` reads
      the pi session file of the sub-agent (at most 4 MiB). The start is
      correct when herdr shows the new sub-agent with this session file (the
-     same path; a session ID alone is not enough), with its name or in its
-     new pane, and the file has the first prompt of this sub-agent, and
+     same path; a session ID alone is not enough), with its name, or with
+     no name in its new pane, and the file has the first prompt of this sub-agent, and
      after it an answer or an error of the model. (Then the turn was too
      short for herdr to see it, or herdr timed out while pi worked.) When
-     herdr dropped the name of the agent, `tau` gives it back
-     (`herdr agent rename`).
+     herdr dropped the name of the agent, `tau` tries to give it back
+     (`herdr agent rename`). When this fails, the sub-agent still works:
+     `tau` knows it by its pi session and its pane, and the liveness check
+     tries the rename again. Until then, `tau` cannot follow the sub-agent
+     when its pane moves.
    - Else the start fails. For example, pi could not send the prompt to the
      model (no login), and it stays idle.
 5. The sub-agent can see the full task list. It can change only its task and
@@ -604,12 +617,13 @@ Each tau pi tells herdr what its pane is (`herdr pane report-metadata`):
 - The title label is a short form of the task title, for the side bar:
   lower-case words with `-` between them, at most 28 characters. For
   example, "Review: tests and validation" gives
-  `review-tests-and-validation`. When the title has no letter or digit,
-  the label is `tau sub-agent`.
+  `review-tests-and-validation`. `tau` keeps only the letters `a` to `z`
+  (also without their accents) and the digits. When the title has none of
+  them, the label is `tau sub-agent`.
 - `<model>` is the name of the model of the agent (for example
   `GPT-6 Sol`), else its ID. When you select a different model, `tau`
-  reports it again. When pi does not know the model, there is no `model`
-  token.
+  reports it again. When pi does not know the model, `tau` removes the
+  `model` token.
 
 The herdr side bar shows the agent label as `agent`. To also show the
 model, add the `$model` token to the rows of the side bar, in the herdr

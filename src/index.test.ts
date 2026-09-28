@@ -292,6 +292,30 @@ describe("tau extension", () => {
     });
   });
 
+  it("reports the model of the lead, and nothing after shutdown", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx();
+    const withModel = { ...ctx, model: { provider: "p", id: "p/m-1", name: "Model One" } };
+    const handle = createTau(pi.api, deps);
+    await emit(pi, "session_start", withModel);
+    await handle.reporting;
+    const reports = () => pi.execCalls.filter((call) => call[2] === "report-metadata" && call.includes("--token"));
+    assert.deepEqual(reports().at(-1)?.slice(3), [
+      "w1:p1", "--source", "tau:lead", "--title", "tau lead", "--display-agent", "tau lead",
+      "--token", "tau_role=lead", "--token", "model=Model One",
+    ]);
+    await emit(pi, "session_shutdown", withModel);
+    const clear = pi.execCalls.filter((call) => call[2] === "report-metadata").at(-1);
+    assert.ok(clear?.includes("--clear-token") && clear.includes("model"), "shutdown removes the model token");
+    const count = reports().length;
+    for (const handler of pi.handlers.get("model_select") ?? []) {
+      await handler({ type: "model_select", model: { id: "p/m-2", name: "Model Two" }, source: "set" }, withModel);
+    }
+    await handle.reporting;
+    assert.equal(reports().length, count, "no report after shutdown");
+  });
+
   it("shows the red badge and runs no command when HERDR_BIN_PATH is not set", async () => {
     process.env.HERDR_ENV = "1";
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
@@ -1734,6 +1758,9 @@ describe("tau extension", () => {
       "tau_task=T0",
       "--token",
       "tau_parent=lead",
+      // pi does not know the model: remove a model token of an earlier report.
+      "--clear-token",
+      "model",
     ]);
     // A new model: tau reports the metadata again, with the model token.
     const before = pi.execCalls.filter((call) => call[2] === "report-metadata").length;

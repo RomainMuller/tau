@@ -12,13 +12,14 @@
  *   and the child is idle (or `FINISH_GRACE_MS` went by), the child ends.
  *
  * tau closes the pane of an ended child only when this is safe: herdr shows
- * the child in the pane (the same pi session), or this process made the pane
- * and herdr shows no agent in it. When herdr shows the child (by its pi
- * session) in a different pane, tau closes that pane.
+ * the child in the pane (see `isSubAgentIn`), or this process made the pane
+ * and herdr shows no agent in it. When herdr shows the child (by its name
+ * and pi session) in a different pane, tau closes that pane.
  *
  * This protects against old records and errors. It is not a security
- * boundary: a program of the same user can write a false session in the
- * task list. Then tau can close the pane of the agent with that session. So a wrong agent record cannot close a different pane (for
+ * boundary: a program of the same user can write a false name and session
+ * in the task list. Then tau can close the pane of the agent with that name
+ * and session. So a wrong agent record cannot close a different pane (for
  * example the pane of the lead). When a close fails, tau tries again at the
  * next check.
  *
@@ -175,6 +176,31 @@ export class Supervisor {
       this.#options.onChange?.();
     }
     await this.#closePanes(agents);
+    await this.#restoreNames(agents, nowMs);
+  }
+
+  /**
+   * Gives the name back to a live child that herdr shows with no name (the
+   * rename after a start that timed out can fail, see `delegate.ts`).
+   * Without its name, tau cannot follow the child when its pane moves.
+   *
+   * One rename for each check, so that a slow herdr does not delay the
+   * checks. Before the rename, tau reads the agents again, and checks that
+   * the child is still in the pane with no name: the list of the check can
+   * be old. (herdr has no conditional rename, so a very short race stays.)
+   */
+  async #restoreNames(agents: readonly HerdrAgent[], nowMs: number): Promise<void> {
+    const list = await this.#options.store.read().catch(() => undefined);
+    if (list === undefined) return;
+    const child = liveChildAgents(list, this.#options.actor.name).find((record) => {
+      const live = findLive(agents, record, nowMs);
+      return live !== undefined && live.name === undefined;
+    });
+    if (child === undefined) return;
+    const now = await this.#options.herdr.listAgents().catch(() => undefined);
+    const live = now === undefined ? undefined : findLive(now, child, nowMs);
+    if (live === undefined || live.name !== undefined) return;
+    await this.#options.herdr.renameAgent(live.paneId, child.name).catch(() => undefined);
   }
 
   /** Applies the liveness rules to `current`. Returns true when it changed. */
@@ -253,7 +279,12 @@ export class Supervisor {
       // herdr knows the agent by its name and pi session. When it is in a
       // different pane (the pane moved after the last record), close its
       // current pane.
-      const found = scheduled.session === undefined ? undefined : agents.find((agent) => isAgentSession(agent, scheduled.session));
+      // A nameless agent in a different pane is not proof: tau does not
+      // follow it.
+      const found =
+        scheduled.session === undefined
+          ? undefined
+          : agents.find((agent) => agent.name === scheduled.agent && isAgentSession(agent, scheduled.session));
       const item = found === undefined ? scheduled : { ...scheduled, pane: found.paneId };
       if (!panes.has(item.pane)) {
         // The pane does not exist. When the agent list showed the agent, it
@@ -263,11 +294,11 @@ export class Supervisor {
         continue;
       }
       const occupant = agents.find((agent) => agent.paneId === item.pane);
-      // An agent in the pane must be the same agent: the same pi session.
-      // The name is not proof (herdr names can be used again, and herdr can
-      // drop the name of an agent whose start failed), so without a known
-      // session tau does not close an occupied pane.
-      const safe = occupant === undefined ? this.#createdPanes.has(item.pane) : isAgentSession(occupant, item.session);
+      // An agent in the pane must be the same agent. See `isSubAgentIn`.
+      const safe =
+        occupant === undefined
+          ? this.#createdPanes.has(item.pane)
+          : isSubAgentIn(occupant, item.agent, item.session, this.#createdPanes.has(item.pane));
       if (!safe) {
         // A different agent is in the pane, or tau did not make it: keep it.
         this.#toClose.delete(scheduled.pane);
@@ -291,12 +322,20 @@ const CLOSE_EVENTS = new Set(["completed", "failed", "canceled"]);
 /**
  * The live herdr agent of a record. When the sub-agent recorded its pi
  * session, only an agent with that session matches: a different agent with
- * the same name (after the child stopped) does not. Before that, the name
+ * the same name (after the child stopped) does not. The agent must also
+ * have the name of the record, or no name and the recorded pane. Before that, the name
  * and the pane must match, and only in the start grace time.
  */
 function findLive(agents: readonly HerdrAgent[], record: AgentRecord, nowMs: number): HerdrAgent | undefined {
   if (record.session !== undefined) {
-    return agents.find((agent) => agent.session !== undefined && sameSession(agent.session, record.session!));
+    // herdr can drop the name of an agent when its start times out: then
+    // the agent must be in the recorded pane. A nameless agent in a
+    // different pane can be a pi that a user started with the same session.
+    return agents.find(
+      (agent) =>
+        isAgentSession(agent, record.session) &&
+        (agent.name === record.name || (agent.name === undefined && agent.paneId === record.pane)),
+    );
   }
   // A sub-agent that did not record its session in the start grace time did
   // not start tau correctly: it is not a live sub-agent.
@@ -304,13 +343,25 @@ function findLive(agents: readonly HerdrAgent[], record: AgentRecord, nowMs: num
   return agents.find((agent) => agent.name === record.name && agent.paneId === record.pane);
 }
 
-/**
- * True when the herdr agent runs the pi session `session` of a sub-agent
- * record. The sub-agent records its own session when it starts, so this is
- * the proof that the agent is that sub-agent (see the module comment).
- */
+/** True when the herdr agent runs the pi session `session` (a recorded session of a sub-agent). */
 export function isAgentSession(agent: HerdrAgent, session: string | undefined): boolean {
   return session !== undefined && agent.session !== undefined && sameSession(agent.session, session);
+}
+
+/**
+ * True when the herdr agent in a pane is the sub-agent `name`, with the
+ * recorded pi session `session`. The session must be the same (the name
+ * alone is not proof: herdr names can be used again), and:
+ *
+ * - herdr shows the agent with the name of the sub-agent, or
+ * - herdr shows the agent with no name (herdr can drop the name when a start
+ *   times out), and this process made the pane (`ownPane`). A pi that a
+ *   user started (for example a lead) has no herdr name too: so a nameless
+ *   agent in a different pane is not proof.
+ */
+export function isSubAgentIn(agent: HerdrAgent, name: string, session: string | undefined, ownPane: boolean): boolean {
+  if (!isAgentSession(agent, session)) return false;
+  return agent.name === name || (agent.name === undefined && ownPane);
 }
 
 /** herdr reports a session file path or a session ID. A file name contains the ID. */

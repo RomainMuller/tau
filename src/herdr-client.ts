@@ -49,6 +49,8 @@ export interface PaneMetadata {
   readonly title?: string;
   readonly displayAgent?: string;
   readonly tokens?: Readonly<Record<string, string>>;
+  /** Tokens to remove (for example a token of an earlier report). */
+  readonly clearTokens?: readonly string[];
 }
 
 export class HerdrClient {
@@ -186,6 +188,9 @@ export class HerdrClient {
     if (metadata.displayAgent !== undefined) args.push("--display-agent", metadata.displayAgent);
     for (const [name, value] of Object.entries(metadata.tokens ?? {})) {
       args.push("--token", `${name}=${value}`);
+    }
+    for (const name of metadata.clearTokens ?? []) {
+      args.push("--clear-token", name);
     }
     await this.#run(args);
   }

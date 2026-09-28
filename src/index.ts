@@ -882,6 +882,9 @@ async function reportPane(
   model: string | undefined,
 ): Promise<void> {
   const modelToken: Record<string, string> = model === undefined ? {} : { [MODEL_TOKEN]: model };
+  // An earlier report (for example of a pi that did not stop normally) can
+  // have a model token: remove it when the model is not known.
+  const clearTokens = model === undefined ? [MODEL_TOKEN] : [];
   try {
     if (identity.role === "lead") {
       await herdr.reportMetadata(paneId, {
@@ -889,6 +892,7 @@ async function reportPane(
         title: "tau lead",
         displayAgent: "tau lead",
         tokens: { tau_role: "lead", ...modelToken },
+        clearTokens,
       });
       return;
     }
@@ -900,6 +904,7 @@ async function reportPane(
       title: [...title].slice(0, 80).join(""),
       displayAgent: (task === undefined ? undefined : titleSlug(task.title)) ?? "tau sub-agent",
       tokens: { tau_role: "subagent", tau_task: identity.actor.scope, tau_parent: identity.parent, ...modelToken },
+      clearTokens,
     });
   } catch {
     // The metadata is only for display.

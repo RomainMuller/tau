@@ -694,6 +694,79 @@ describe("delegation, more cases", () => {
     assert.deepEqual(herdr.closed, ["w1:p10"]);
   });
 
+  it("closes the pane of a nameless failed start later, when the first close fails", async () => {
+    const original = herdr.startPiAgent.bind(herdr);
+    herdr.startPiAgent = async (name, pane, args) => {
+      await original(name, pane, args);
+      herdr.agents = herdr.agents.map((agent) => (agent.name === name ? { ...agent, name: undefined } : agent));
+      throw new TauError("storage", "herdr agent start failed: timed out waiting for agent startup");
+    };
+    const close = herdr.closePane.bind(herdr);
+    let failures = 1;
+    herdr.closePane = async (pane) => {
+      if (failures-- > 0) throw new Error("herdr is busy");
+      await close(pane);
+    };
+    const watcher = supervisor();
+    await assert.rejects(
+      delegate({ ...context(), closeLater: (pane, agent, session) => watcher.scheduleClose(pane, agent, session) }, { id: "T0", model: "p/m", thinking: "low" }),
+      /still open/,
+    );
+    await watcher.check();
+    assert.deepEqual(herdr.closed, ["w1:p10"]);
+  });
+
+  it("does not follow a nameless agent with the session of the child into a different pane", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const session = (await read()).agents[0]!.session!;
+    // A second pane that this process made, with a pi that a user resumed
+    // from the session of the child (no herdr name). The child is gone.
+    createdPanes.add("w1:p11");
+    herdr.panes.add("w1:p11");
+    herdr.agents = [{ name: undefined, paneId: "w1:p11", status: "idle", session }];
+    await supervisor().check();
+    const list = await read();
+    assert.equal(list.agents[0]?.pane, "w1:p10");
+    assert.equal(findTask(list, "T0")?.status, "failed");
+    assert.ok(!herdr.closed.includes("w1:p11"));
+  });
+
+  it("gives the name back to a live nameless child at the next check", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    herdr.agents = herdr.agents.map((agent) => ({ ...agent, name: undefined }));
+    await supervisor().check();
+    assert.deepEqual(herdr.renamed, [["w1:p10", "tau-t0"]]);
+    assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+  });
+
+  it("reads the agents again before a rename, and renames at most one child in a check", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    const session = (await read()).agents[0]!.session!;
+    herdr.agents = [{ name: undefined, paneId: "w1:p10", status: "working", session }];
+    // At the second list (just before the rename), an unrelated pi is in the pane.
+    const list = herdr.listAgents.bind(herdr);
+    let calls = 0;
+    herdr.listAgents = async () => {
+      calls += 1;
+      return calls === 1 ? list() : [{ name: undefined, paneId: "w1:p10", status: "idle", session: "/s/2026_unrelated.jsonl" }];
+    };
+    await supervisor().check();
+    assert.deepEqual(herdr.renamed, []);
+  });
+
+  it("does not close a pane where a differently named agent runs the recorded session", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    await store.mutate((list) => rules.completeTask(list, { actor: { name: "tau-t0" }, now: NOW }, "T0", "done"));
+    const session = (await read()).agents[0]!.session!;
+    // A different agent (for example a lead) resumed the session of the child.
+    herdr.agents = [
+      { name: "other", paneId: "w1:p10", status: "idle", session },
+      { name: undefined, paneId: "w1:p1", status: "idle", session },
+    ];
+    await supervisor().check();
+    assert.deepEqual(herdr.closed, []);
+  });
+
   it("asks the supervisor to close the pane later when the close fails", async () => {
     herdr.failStart = new TauError("storage", "boom");
     herdr.closePane = async () => {
@@ -1177,6 +1250,72 @@ describe("tau_abort", () => {
     } finally {
       await rm(sessions, { recursive: true, force: true });
     }
+  });
+
+  it("accepts the start when the rename fails: tau knows the agent by its session", async () => {
+    const sessions = await mkdtemp(join(tmpdir(), "tau-sessions-"));
+    try {
+      const file = join(sessions, "2026_new.jsonl");
+      herdr.recordSession = false;
+      const original = herdr.startPiAgent.bind(herdr);
+      herdr.startPiAgent = async (name, pane, args) => {
+        await original(name, pane, args);
+        const lines = [
+          { type: "message", message: { role: "user", content: args.at(-1) } },
+          { type: "message", message: { role: "assistant" } },
+        ];
+        await writeFile(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+        await store.mutate((list) => rules.setAgentSession(list, name, file));
+        herdr.agents = herdr.agents.map((agent) => (agent.name === name ? { ...agent, name: undefined, session: file } : agent));
+        throw new TauError("storage", "herdr agent start failed: timed out waiting for agent startup");
+      };
+      herdr.renameAgent = async () => {
+        throw new TauError("storage", "herdr agent rename failed: name in use");
+      };
+      const result = await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+      assert.equal(result.agent, "tau-t0");
+      assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+    } finally {
+      await rm(sessions, { recursive: true, force: true });
+    }
+  });
+
+  it("does not accept a nameless agent with the session in a different pane", async () => {
+    const sessions = await mkdtemp(join(tmpdir(), "tau-sessions-"));
+    try {
+      const file = join(sessions, "2026_new.jsonl");
+      herdr.recordSession = false;
+      const original = herdr.startPiAgent.bind(herdr);
+      herdr.startPiAgent = async (name, pane, args) => {
+        await original(name, pane, args);
+        const lines = [
+          { type: "message", message: { role: "user", content: args.at(-1) } },
+          { type: "message", message: { role: "assistant" } },
+        ];
+        await writeFile(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+        await store.mutate((list) => rules.setAgentSession(list, name, file));
+        // A pi that the user started (no herdr name) runs this session in a different pane.
+        herdr.agents = [{ name: undefined, paneId: "w1:p1", status: "working", session: file }];
+        throw new TauError("storage", "herdr agent start failed: timed out waiting for agent startup");
+      };
+      await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /timed out/);
+      assert.deepEqual(herdr.renamed, []);
+      assert.ok(!herdr.closed.includes("w1:p1"));
+    } finally {
+      await rm(sessions, { recursive: true, force: true });
+    }
+  });
+
+  it("gives the name back when a fast sub-agent completed its task before herdr replied", async () => {
+    const original = herdr.startPiAgent.bind(herdr);
+    herdr.startPiAgent = async (name, pane, args) => {
+      await original(name, pane, args);
+      await store.mutate((list) => rules.completeTask(list, { actor: { name, scope: "T0" }, now: NOW }, "T0", "fast"));
+      herdr.agents = herdr.agents.map((agent) => (agent.name === name ? { ...agent, name: undefined } : agent));
+      throw new TauError("storage", "herdr agent start failed: timed out waiting for agent startup");
+    };
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    assert.deepEqual(herdr.renamed, [["w1:p10", "tau-t0"]]);
   });
 
   it("closes the pane of a failed start when herdr shows the new sub-agent without a name", async () => {

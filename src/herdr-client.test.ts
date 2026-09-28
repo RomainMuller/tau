@@ -125,4 +125,13 @@ describe("HerdrClient", () => {
     ]);
     assert.deepEqual(calls[1]?.slice(1), ["pane", "report-metadata", "w1:p2", "--source", "tau:x", "--clear-title", "--clear-display-agent"]);
   });
+
+  it("removes tokens in a report, and renames an agent", async () => {
+    const { exec, calls } = fakeExec([{}, {}]);
+    const client = new HerdrClient(exec, BIN);
+    await client.reportMetadata("w1:p2", { source: "tau:x", tokens: { a: "1" }, clearTokens: ["model"] });
+    await client.renameAgent("w1:p2", "tau-t1");
+    assert.deepEqual(calls[0]?.slice(1), ["pane", "report-metadata", "w1:p2", "--source", "tau:x", "--token", "a=1", "--clear-token", "model"]);
+    assert.deepEqual(calls[1]?.slice(1), ["agent", "rename", "w1:p2", "tau-t1"]);
+  });
 });
