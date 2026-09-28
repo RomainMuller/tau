@@ -11,6 +11,7 @@ import { isAgentName } from "../names.ts";
 import {
   isTaskId,
   LEAD_AGENT,
+  MAX_AGENT_ERROR_CHARS,
   MAX_AGENTS,
   type AgentRecord,
   type AgentState,
@@ -129,6 +130,13 @@ function checkAgent(value: unknown, where: string): AgentRecord {
   if (agent.pane !== undefined) result.pane = string(agent.pane, `${where}.pane`);
   if (agent.session !== undefined) result.session = string(agent.session, `${where}.session`);
   if (agent.endedAt !== undefined) result.endedAt = string(agent.endedAt, `${where}.endedAt`);
+  if (agent.error !== undefined) {
+    const error = string(agent.error, `${where}.error`);
+    if ([...error].length > MAX_AGENT_ERROR_CHARS) {
+      throw new ShapeError(`${where}.error has more than ${MAX_AGENT_ERROR_CHARS} characters`);
+    }
+    result.error = error;
+  }
   return result;
 }
 

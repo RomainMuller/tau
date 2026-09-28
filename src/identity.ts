@@ -110,11 +110,18 @@ function checkTaskListPath(file: string, tauDirectory: string): string {
 /**
  * Checks that the task list gave this task to this sub-agent. Throws when
  * the agent record or the task does not agree with the identity.
+ *
+ * The pane must be the pane of the record, except when the pane moved
+ * after the parent made it and before pi started (a moved pane gets a new
+ * ID): the sub-agent did not record its pi session yet, and herdr does not
+ * show the pane of the record any more (`recordPaneGone`). Then the caller
+ * records the new pane. This check is cooperative, not a security boundary.
  */
 export function checkSubAgent(
   list: TaskList,
   identity: Extract<Identity, { role: "subagent" }>,
   paneId: string,
+  recordPaneGone = false,
 ): void {
   const record = list.agents.find((agent) => agent.name === identity.actor.name);
   if (record === undefined || record.task !== identity.actor.scope || record.parent !== identity.parent) {
@@ -123,7 +130,7 @@ export function checkSubAgent(
       `The task list has no sub-agent @${identity.actor.name} for task ${identity.actor.scope} with parent @${identity.parent}.`,
     );
   }
-  if (record.pane !== paneId) {
+  if (record.pane !== paneId && (record.session !== undefined || !recordPaneGone)) {
     throw new TauError(
       "permission_denied",
       `The sub-agent @${identity.actor.name} must run in pane ${record.pane ?? "(none)"}, not in pane ${paneId}.`,

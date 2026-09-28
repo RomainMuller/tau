@@ -8,7 +8,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import { activeTask, childrenOf, findTask, parentId, type Task, type TaskList, type TaskStatus } from "./tasks/model.ts";
+import { activeTask, childrenOf, findTask, ownerError, parentId, type Task, type TaskList, type TaskStatus } from "./tasks/model.ts";
 import { cleanLine } from "./text.ts";
 
 export interface TreeOptions {
@@ -158,7 +158,8 @@ function extrasText(list: TaskList, task: Task, options: TreeOptions): string {
   if (task.owner !== undefined && task.status !== "waiting" && task.status !== "canceled") {
     const unread = options.unread?.get(task.owner) ?? 0;
     const mail = unread > 0 && activeTask(list, task.owner)?.id === task.id ? ` ✉${unread}` : "";
-    parts.push(style(`@${cleanLine(task.owner)}${mail}`, "accent", options));
+    const error = ownerError(list, task) === undefined ? "" : " ⚠ error";
+    parts.push(style(`@${cleanLine(task.owner)}${mail}${error}`, "accent", options));
   }
   const shownDependencies = options.showClosed
     ? task.dependencies

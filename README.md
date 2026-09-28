@@ -220,6 +220,7 @@ Legend:
 | `@x` | Agent `x` owns the task.                         |
 | `⧗`  | The task depends on these tasks.                 |
 | `✉n` | The owner has `n` messages that it did not read. (For an agent with no active task, `@agent ✉n` shows in the header.) |
+| `⚠ error` | The owner (a sub-agent) stopped after an error, and waits for a message. See [Errors of a sub-agent](#errors-of-a-sub-agent). |
 
 Example with messages that are not read yet:
 
@@ -392,7 +393,9 @@ uses its name and its pane.) When a sub-agent is not in the list, `tau` fails
 its task (rule 11), and closes its pane. It does the same for the sub-agents of that sub-agent, at all depths,
 because nobody watches them now. A sub-agent that is still starting has 2
 minutes before `tau` checks it. When you move the pane of a sub-agent, `tau`
-records its new pane.
+records its new pane (herdr gives a moved pane a new ID). This is also
+correct when the pane moves before the pi of the sub-agent starts: then the
+sub-agent records its new pane when it starts.
 
 A sub-agent that stopped after an error is alive while its pi runs (herdr
 shows it): the liveness check does not fail its task (see
@@ -510,8 +513,12 @@ sub-agents do the work.
    pane, so no key press can be lost. If `tau` does not start correctly in
    the sub-agent, the prompt does not go to the model. Then `tau` waits (at
    most 10 seconds) until herdr shows that the sub-agent works on the prompt.
-   Else the start fails: for example, pi could not send the prompt to the
-   model (no login), and it stays idle.
+   Else `tau` reads the pi session file of the sub-agent (at most 4 MiB):
+   when herdr shows the new sub-agent with this session file (the same
+   path; a session ID alone is not enough), and the file has the first
+   prompt of this sub-agent and after it an answer or an error of the
+   model, the start is correct (herdr did not see a short turn). Else the start fails: for example, pi could not send the prompt to
+   the model (no login), and it stays idle.
 5. The sub-agent can see the full task list. It can change only its task and
    the sub-tasks of its task.
 6. The sub-agent can delegate its own sub-tasks to more sub-agents.
@@ -549,7 +556,10 @@ The new pane gets these environment variables:
 `tau` does not trust these values alone. The database must be in the tau
 directory, and the task list must have a record of this sub-agent, with the
 same task, parent, and herdr pane. The task must be `in_progress`, with the
-sub-agent as owner.
+sub-agent as owner. One exception for the pane: when the pane moved before
+pi started (herdr gives a moved pane a new ID), the sub-agent can start in
+its new pane, if herdr does not show the old pane any more and no pi of this
+sub-agent registered yet. Then the sub-agent records its new pane.
 
 A sub-agent that cannot start `tau` correctly must not work: for example,
 these checks fail, it has no valid configuration from its lead, it cannot
@@ -675,12 +685,31 @@ The parent decides: it sends a message to continue (a message starts a new
 turn of the idle sub-agent), or it aborts the sub-agent. You can also type
 in the pane of the sub-agent.
 
+The sub-agent also records the kind of error in the task list, until its
+next turn starts, or until a new pi session of the sub-agent starts (a
+`/reload` keeps the record). The record has only one of the
+fixed kinds of error: `tau` shows any other text as `other error`. While
+the record is there:
+
+- The tree shows `⚠ error` after the owner, and `tau_list` shows
+  `@tau-t2-1 (stopped after an error)`.
+- `tau_wait` returns at once when the owner of a task in its list stopped
+  after an error (as for a failed task).
+- The continuation message of the parent names the task, and it does not
+  tell the parent to wait for it:
+
+  ```text
+    Stopped after an error: T2.1 (@tau-t2-1, timeout). Send a message to continue (tau_send), or stop it (tau_abort).
+  ```
+
 Limits:
 
 - When the report cannot be sent (for example, the parent has 100
   messages that it did not read, or the task list cannot be changed),
   `tau` shows a warning in the pane of the sub-agent, and does not try
-  again. Then the parent does not know about the error.
+  again. Then the parent gets no message, but the record of the error (see
+  below) still shows in its tree, its `tau_wait`, and its continuation
+  messages, when `tau` could write the record.
 - pi does not tell `tau` when you press `Esc` while `tau` sends the report.
   Then the report goes to the parent, and messages can start turns of the
   sub-agent.
@@ -692,8 +721,9 @@ Limits:
 
 Sometimes no task is ready: each open task waits for a different agent. Then
 the agent calls `tau_wait` with a list of tasks. The tool call blocks, and the
-agent uses no tokens, until each task in the list is closed, or until a
-[message](#messages-and-notes) arrives for the agent.
+agent uses no tokens, until each task in the list is closed, until a
+[message](#messages-and-notes) arrives for the agent, or until the owner of a
+task stops after an error.
 
 ```text
 ● tau_wait T2.1, T4
@@ -702,7 +732,9 @@ agent uses no tokens, until each task in the list is closed, or until a
 ```
 
 When one task in the list fails, `tau_wait` returns at once, so that the agent
-can retry the task or abort the other tasks. The result shows the tasks that
+can retry the task or abort the other tasks. It also returns at once when
+the owner of a task stopped after an error (see
+[Errors of a sub-agent](#errors-of-a-sub-agent)). The result shows the tasks that
 are still open:
 
 ```text
@@ -925,7 +957,7 @@ All tools exist only when herdr is available.
 | `tau_cancel`    | Cancel a `waiting` task, with a reason.                       |
 | `tau_delegate`  | Start a sub-agent for a task, with a model and thinking.      |
 | `tau_abort`     | Stop a sub-agent and its sub-agents, and fail their tasks, with a reason. |
-| `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). |
+| `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). It returns at once when a task fails, when the owner of a task stopped after an error, or when a message arrives. |
 | `tau_send`      | Send a message to an agent, with a priority.                  |
 | `tau_note`      | Add a note to a task.                                         |
 | `tau_ask_user`  | Ask the user a question, then end the turn. Only when no other "ask question" tool is available. It does not exist when `askTool` is set. |
@@ -1066,6 +1098,12 @@ transaction.
   automatically when its process stops. While a different process has the
   lock, `tau` waits for at most 5 seconds, and it does not block pi while it
   waits.
+
+After you change or upgrade the files of `tau`, restart the lead (and its
+sub-agents) before you continue the work. A sub-agent loads the `tau` files
+of its lead when it starts, but a running lead keeps its old code, and an
+older version removes the fields of the task list that it does not know
+(for example, the error record of a sub-agent).
 
 The `tasklists` directory is for the current user only: `tau` makes it with
 mode `0700`, and removes access for other users if it has it. The database

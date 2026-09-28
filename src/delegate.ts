@@ -20,6 +20,9 @@
  *   start stops too, and the task keeps the result of the abort.
  */
 
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type { HerdrClient } from "./herdr-client.ts";
 import { ENV_AGENT_NAME, ENV_CONFIG, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
 import { agentNameFor } from "./names.ts";
@@ -139,10 +142,20 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
       await ctx.herdr.waitForWork(reserved.agent);
     } catch (error) {
       // The sub-agent works while herdr waits for it: a fast one can
-      // complete its task before herdr replies (also with an error). That is
-      // a correct start.
+      // complete its task before herdr replies (also with an error), or do
+      // its first turn before herdr sees it work. That is a correct start.
       const now = await ctx.store.read().catch(() => undefined);
-      if (now === undefined || !completedBy(now, reserved.task, reserved.agent)) throw error;
+      if (now === undefined) throw error;
+      if (!completedBy(now, reserved.task, reserved.agent)) {
+        const session = now.agents.find((agent) => agent.name === reserved.agent)?.session;
+        // The session must be the file that herdr shows for the new agent
+        // (the same absolute path): an old session file of the same agent
+        // name proves nothing, and a session ID does not name a file.
+        const live = (await ctx.herdr.listAgents().catch(() => [])).find((agent) => agent.name === reserved.agent);
+        if (session === undefined || live?.session !== session || !(await ranFirstPrompt(session, reserved.agent))) {
+          throw error;
+        }
+      }
     }
     await ctx.store.mutate((list) => {
       // The sub-agent works while pi starts: a fast one can complete its task
@@ -246,6 +259,56 @@ function completedBy(list: TaskList, id: string, agent: string): boolean {
   // The last close: notes can come after it.
   const close = task?.history.findLast((event) => event.kind === "completed");
   return task?.status === "completed" && close?.actor === agent;
+}
+
+/** The maximum number of bytes that `ranFirstPrompt` reads. */
+const MAX_SESSION_READ_BYTES = 4 * 1024 * 1024;
+
+/**
+ * True when the pi session file `file` has the first prompt of `agent` (a
+ * user message that starts as `firstPrompt` does), and after it an
+ * assistant message (an answer or an error of the model): then pi sent the
+ * first prompt of this agent to the model. `false` when the file cannot be
+ * read, is not a regular file, or is not an absolute path (a session ID).
+ * Reads at most `MAX_SESSION_READ_BYTES`.
+ */
+export async function ranFirstPrompt(file: string, agent: string): Promise<boolean> {
+  if (!isAbsolute(file)) return false;
+  const start = `You are @${agent}, a tau sub-agent.`;
+  let handle;
+  try {
+    // O_NONBLOCK: a named pipe (FIFO) must not stop the delegation.
+    handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!(await handle.stat()).isFile()) return false;
+    const buffer = Buffer.alloc(MAX_SESSION_READ_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    let prompted = false;
+    for (const line of buffer.subarray(0, bytesRead).toString("utf8").split("\n")) {
+      let entry: { type?: unknown; message?: { role?: unknown; content?: unknown } };
+      try {
+        entry = JSON.parse(line) as typeof entry;
+      } catch {
+        continue;
+      }
+      if (entry.type !== "message") continue;
+      if (entry.message?.role === "user" && messageText(entry.message.content).startsWith(start)) prompted = true;
+      else if (prompted && entry.message?.role === "assistant") return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    await handle?.close();
+  }
+}
+
+/** The text of the content of a pi message: a string, or text parts. */
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => (typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" ? String((part as { text?: unknown }).text ?? "") : ""))
+    .join("");
 }
 
 /**

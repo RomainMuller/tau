@@ -134,6 +134,73 @@ export interface AgentRecord {
   state: AgentState;
   readonly startedAt: string;
   endedAt?: string;
+  /**
+   * The kind of error when the last run of the sub-agent ended with an
+   * error (for example `timeout`): the sub-agent waits for a message. tau
+   * makes this text (see `errorKind` in `index.ts`). The sub-agent removes it
+   * at its next turn.
+   */
+  error?: string;
+}
+
+/** The maximum number of characters of `AgentRecord.error`. */
+export const MAX_AGENT_ERROR_CHARS = 200;
+
+/**
+ * The kinds of model provider errors (see `errorKind`). tau puts only these
+ * in model-facing text: the raw error text comes from outside.
+ */
+const ERROR_KINDS = [
+  "rate limit",
+  "authentication or permission error",
+  "not found (for example, the model does not exist: delegate with a different model)",
+  "timeout",
+  "connection error",
+  "provider error",
+  "other error",
+] as const;
+
+/**
+ * The kind of a model provider error, for the parent. The raw error text
+ * comes from outside (the provider): it can have instructions, request IDs,
+ * or tokens, so the parent gets only one of `ERROR_KINDS`, with the HTTP
+ * status when the text has one (the pane of the sub-agent shows the raw
+ * error).
+ */
+export function errorKind(error: string): string {
+  const status = /\b([45]\d\d)\b/u.exec(error)?.[1];
+  const withStatus = (kind: (typeof ERROR_KINDS)[number]) => (status === undefined ? kind : `${kind} (HTTP ${status})`);
+  if (status === "429" || /rate.?limit/iu.test(error)) return withStatus("rate limit");
+  if (status === "401" || status === "403" || /unauthori[sz]ed|forbidden|api key|credential/iu.test(error)) {
+    return withStatus("authentication or permission error");
+  }
+  if (status === "404" || /not.?found/iu.test(error)) {
+    return withStatus("not found (for example, the model does not exist: delegate with a different model)");
+  }
+  if (/timed? ?out/iu.test(error)) return withStatus("timeout");
+  if (/connection|network|econn|fetch failed|socket/iu.test(error)) return withStatus("connection error");
+  if (status?.startsWith("5") === true || /overloaded|unavailable/iu.test(error)) return withStatus("provider error");
+  return withStatus("other error");
+}
+
+/** True when `text` is a value that `errorKind` gives. */
+export function isErrorKind(text: string): boolean {
+  const match = /^(.*?)(?: \(HTTP [45]\d\d\))?$/u.exec(text);
+  return match !== null && (ERROR_KINDS as readonly string[]).includes(match[1]!);
+}
+
+/**
+ * The kind of error when the owner of an in-progress task stopped after an
+ * error and waits for a message (see `AgentRecord.error`), else `undefined`.
+ * The record is in a shared database: a text that `errorKind` does not give
+ * shows as "other error", so that the text in model-facing messages is
+ * always tau text.
+ */
+export function ownerError(list: TaskList, task: Task): string | undefined {
+  if (task.status !== "in_progress" || task.owner === undefined) return undefined;
+  const record = list.agents.find((agent) => agent.name === task.owner);
+  if (record === undefined || record.state === "ended" || record.error === undefined) return undefined;
+  return isErrorKind(record.error) ? record.error : "other error";
 }
 
 /** The maximum number of agent records in a task list. */

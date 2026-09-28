@@ -21,7 +21,8 @@
  */
 
 import { isAgentName } from "./names.ts";
-import { activeTask, isClosed, isDescendant, isInSubtree, LEAD_AGENT, type Task, type TaskList } from "./tasks/model.ts";
+import { activeTask, isClosed, isDescendant, isInSubtree, LEAD_AGENT, ownerError, type Task, type TaskList } from "./tasks/model.ts";
+import { cleanLine } from "./text.ts";
 import { readyTasks, type Actor } from "./tasks/rules.ts";
 
 /** The default number of continuations with no task change before tau stops the rule. */
@@ -139,8 +140,18 @@ export function continuationText(list: TaskList, work: OpenWork, actor: Actor, a
     const it = delegateOnly.length === 1 ? "it" : "them";
     lines.push(`  Ready now: ${ids(delegateOnly)}. Delegate ${it} (you can claim ${it} only after your active task closes).`);
   }
+  // Sub-agents that stopped after an error: a wait for them does not end.
+  const stopped = work.running.filter((task) => ownerError(list, task) !== undefined);
+  if (stopped.length > 0) {
+    const shown = stopped
+      .slice(0, MAX_IDS)
+      .map((task) => `${task.id} (${ownerText(task.owner)}, ${cleanLine(ownerError(list, task)!)})`)
+      .join(", ");
+    const more = stopped.length > MAX_IDS ? `, and ${stopped.length - MAX_IDS} more` : "";
+    lines.push(`  Stopped after an error: ${shown}${more}. Send a message to continue (tau_send), or stop it (tau_abort).`);
+  }
   const waits = [
-    ...work.running.map((task) => `${task.id} (${ownerText(task.owner)})`),
+    ...work.running.filter((task) => !stopped.includes(task)).map((task) => `${task.id} (${ownerText(task.owner)})`),
     ...work.blocked.map((task) => `${task.id} (${blockReason(list, task)})`),
   ];
   if (waits.length > 0) {
@@ -150,7 +161,7 @@ export function continuationText(list: TaskList, work: OpenWork, actor: Actor, a
     // Only tasks of other agents: a wait for a task of this agent cannot end,
     // because this agent must close it.
     const waitIds = [...work.running, ...work.blocked.flatMap((task) => openDependencyTasks(list, task))]
-      .filter((task) => task.status === "in_progress" && task.owner !== actor.name)
+      .filter((task) => task.status === "in_progress" && task.owner !== actor.name && ownerError(list, task) === undefined)
       .map((task) => task.id);
     const unique = [...new Set(waitIds)];
     if (unique.length > 0) {

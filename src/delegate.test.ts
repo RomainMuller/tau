@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative as relativePath } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { checkModel, checkThinking, delegate, firstPrompt, type DelegationContext } from "./delegate.ts";
+import { checkModel, checkThinking, delegate, firstPrompt, ranFirstPrompt, type DelegationContext } from "./delegate.ts";
 import type { HerdrAgent, HerdrClient, PaneMetadata, SplitDirection } from "./herdr-client.ts";
 import { checkSubAgent, resolveIdentity } from "./identity.ts";
 import { agentNameFor, isAgentName } from "./names.ts";
@@ -302,7 +302,14 @@ describe("identity", () => {
       rules.setAgentPane(list, "tau-t0", "w1:p10");
     });
     const list = await read();
+    // A different pane: only when herdr does not show the pane of the record
+    // (it moved, and got a new ID) and the sub-agent did not register yet.
     assert.throws(() => checkSubAgent(list, identity, "w1:p99"), /must run in pane w1:p10/);
+    assert.doesNotThrow(() => checkSubAgent(list, identity, "w1:p99", true));
+    assert.doesNotThrow(() => checkSubAgent(list, identity, "w1:p10"));
+    // After the registration: only the pane of the record.
+    rules.setAgentSession(list, "tau-t0", "/s/2026_tau-t0.jsonl");
+    assert.throws(() => checkSubAgent(list, identity, "w1:p99", true), /must run in pane w1:p10/);
     assert.doesNotThrow(() => checkSubAgent(list, identity, "w1:p10"));
     const wrongParent = resolveIdentity({ ...env, TAU_PARENT_AGENT: "tau-other" }, tau, "x");
     if (wrongParent.role !== "subagent") return;
@@ -1083,6 +1090,117 @@ describe("tau_abort", () => {
     assert.equal(result.agent, "tau-t0");
     assert.equal(findTask(await read(), "T0")?.status, "completed");
     assert.deepEqual(herdr.closed, []);
+  });
+
+  it("is a correct start when herdr did not see work, but the session has the first prompt and an answer", async () => {
+    const sessions = await mkdtemp(join(tmpdir(), "tau-sessions-"));
+    try {
+      const file = join(sessions, "s.jsonl");
+      herdr.recordSession = false;
+      const original = herdr.startPiAgent.bind(herdr);
+      herdr.startPiAgent = async (name, pane, args) => {
+        await original(name, pane, args);
+        const prompt = args.at(-1)!;
+        await writeFile(
+          file,
+          [
+            { type: "session", id: "x" },
+            { type: "message", message: { role: "user", content: [{ type: "text", text: prompt }] } },
+            { type: "message", message: { role: "assistant", stopReason: "stop" } },
+          ]
+            .map((entry) => JSON.stringify(entry))
+            .join("\n"),
+        );
+        await store.mutate((list) => rules.setAgentSession(list, name, file));
+        // herdr shows the new agent with this session.
+        herdr.agents = herdr.agents.map((agent) => (agent.name === name ? { ...agent, session: file } : agent));
+      };
+      herdr.failWait = new TauError("storage", "herdr agent wait failed: timed out");
+      const result = await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+      assert.equal(result.agent, "tau-t0");
+      assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+      assert.deepEqual(herdr.closed, []);
+    } finally {
+      await rm(sessions, { recursive: true, force: true });
+    }
+  });
+
+  it("does not use a session file when herdr shows only a session ID for the new agent", async () => {
+    const sessions = await mkdtemp(join(tmpdir(), "tau-sessions-"));
+    try {
+      // A file whose name ends with the ID: sameSession would match it.
+      const file = join(sessions, "2026_01abc.jsonl");
+      herdr.recordSession = false;
+      const original = herdr.startPiAgent.bind(herdr);
+      herdr.startPiAgent = async (name, pane, args) => {
+        await original(name, pane, args);
+        const lines = [
+          { type: "message", message: { role: "user", content: args.at(-1) } },
+          { type: "message", message: { role: "assistant" } },
+        ];
+        await writeFile(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+        await store.mutate((list) => rules.setAgentSession(list, name, file));
+        herdr.agents = herdr.agents.map((agent) => (agent.name === name ? { ...agent, session: "01abc" } : agent));
+      };
+      herdr.failWait = new TauError("storage", "herdr agent wait failed: timed out");
+      await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /timed out/);
+    } finally {
+      await rm(sessions, { recursive: true, force: true });
+    }
+  });
+
+  it("does not use a session file that herdr does not show for the new agent", async () => {
+    const sessions = await mkdtemp(join(tmpdir(), "tau-sessions-"));
+    try {
+      const file = join(sessions, "old.jsonl");
+      herdr.recordSession = false;
+      const original = herdr.startPiAgent.bind(herdr);
+      herdr.startPiAgent = async (name, pane, args) => {
+        await original(name, pane, args);
+        // An old session file with the prompt and an answer, in the record;
+        // herdr shows a different session for the new agent.
+        const lines = [
+          { type: "message", message: { role: "user", content: args.at(-1) } },
+          { type: "message", message: { role: "assistant" } },
+        ];
+        await writeFile(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+        await store.mutate((list) => rules.setAgentSession(list, name, file));
+      };
+      herdr.failWait = new TauError("storage", "herdr agent wait failed: timed out");
+      await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /timed out/);
+      assert.equal(findTask(await read(), "T0")?.status, "failed");
+    } finally {
+      await rm(sessions, { recursive: true, force: true });
+    }
+  });
+
+  it("finds the first prompt of the agent, then an answer, in a session file, and nothing else", async () => {
+    const sessions = await mkdtemp(join(tmpdir(), "tau-sessions-"));
+    try {
+      const file = join(sessions, "s.jsonl");
+      const write = (...entries: unknown[]) => writeFile(file, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\nnot json\n");
+      const user = (text: string) => ({ type: "message", message: { role: "user", content: text } });
+      const assistant = { type: "message", message: { role: "assistant", stopReason: "error" } };
+      const prompt = firstPrompt("tau-t0", "lead", "T0");
+      await write(user(prompt), assistant);
+      assert.equal(await ranFirstPrompt(file, "tau-t0"), true, "an error answer counts: pi sent the prompt");
+      await write(assistant, user(prompt));
+      assert.equal(await ranFirstPrompt(file, "tau-t0"), false, "an answer before the prompt");
+      await write(user("hello"), assistant);
+      assert.equal(await ranFirstPrompt(file, "tau-t0"), false, "a different prompt");
+      await write(user(firstPrompt("tau-t9", "lead", "T9")), assistant);
+      assert.equal(await ranFirstPrompt(file, "tau-t0"), false, "the prompt of a different agent");
+      await write(user(prompt));
+      assert.equal(await ranFirstPrompt(file, "tau-t0"), false, "no answer");
+      // A relative path to a file that exists, and a session ID.
+      await write(user(prompt), assistant);
+      const relative = relativePath(process.cwd(), file);
+      assert.equal(await ranFirstPrompt(relative, "tau-t0"), false, "a relative path");
+      assert.equal(await ranFirstPrompt(join(sessions, "missing.jsonl"), "tau-t0"), false);
+      assert.equal(await ranFirstPrompt(sessions, "tau-t0"), false, "a directory");
+    } finally {
+      await rm(sessions, { recursive: true, force: true });
+    }
   });
 
   it("fails the start when the sub-agent does not start to work on its first prompt", async () => {

@@ -10,7 +10,7 @@
  * is the work of the reader (see `descriptionIsWork`).
  */
 
-import { activeTask, childrenOf, findTask, isClosed, isDescendant, parentId, SYSTEM_ACTOR, type Task, type TaskList } from "./tasks/model.ts";
+import { activeTask, childrenOf, findTask, isClosed, isDescendant, ownerError, parentId, SYSTEM_ACTOR, type Task, type TaskList } from "./tasks/model.ts";
 import { isAgentUnder, readyTasks } from "./tasks/rules.ts";
 import { cleanLine, cleanText } from "./text.ts";
 
@@ -223,7 +223,7 @@ function claimableNow(list: TaskList, agent: string, scope?: string): Task[] {
 function taskExtras(list: TaskList, task: Task): string {
   const parts: string[] = [];
   if (task.owner !== undefined && task.status === "in_progress") {
-    parts.push(`@${cleanLine(task.owner)}`);
+    parts.push(`@${cleanLine(task.owner)}${ownerError(list, task) === undefined ? "" : " (stopped after an error)"}`);
   }
   const open = task.dependencies.filter((id) => findTask(list, id)?.status !== "completed");
   if (task.status === "waiting" && open.length > 0) {

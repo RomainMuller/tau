@@ -11,7 +11,7 @@ import { Type, type TSchema } from "typebox";
 import { checkModel, checkThinking, delegate, delegationText, THINKING_LEVELS, type DelegationContext } from "./delegate.ts";
 import { agentSummary, descriptionIsWork, formatChange, formatList, formatSection, formatTask, TASK_SECTIONS, type TaskSection } from "./format.ts";
 import { TauError } from "./tasks/errors.ts";
-import { activeTask, findTask, getTask, isClosed, isTaskId, type AgentRecord, type TaskList } from "./tasks/model.ts";
+import { activeTask, findTask, getTask, isClosed, isTaskId, ownerError, type AgentRecord, type TaskList } from "./tasks/model.ts";
 import {
   abortTask,
   addNote,
@@ -509,7 +509,7 @@ function delegationSpecs(): ToolSpec[] {
       name: "tau_wait",
       label: "tau wait",
       description:
-        "Wait until each task in the list is closed. The call uses no tokens while it waits. It returns at once when one task fails, or when a message for you arrives (the result gives the message), so that you can react. Use it to wait for sub-agents, or for tasks of other agents that your work depends on.",
+        "Wait until each task in the list is closed. The call uses no tokens while it waits. It returns at once when one task fails, when the owner of a task stopped after an error, or when a message for you arrives (the result gives the message), so that you can react. Use it to wait for sub-agents, or for tasks of other agents that your work depends on.",
       promptSnippet: "Wait for tasks to close",
       parameters: Type.Object({
         ids: Type.Array(ID("A task ID."), { description: "The tasks to wait for.", minItems: 1 }),
@@ -546,18 +546,23 @@ export async function waitForTasks(
     for (const id of ids) getTask(list, id);
     const tasks = ids.map((id) => getTask(list, id));
     const failed = tasks.filter((task) => task.status === "failed");
+    // The owner stopped after an error, and waits for a message: the wait
+    // would not end (see registerErrorReport in index.ts).
+    const stopped = tasks.filter((task) => ownerError(list, task) !== undefined);
     const done = tasks.every((task) => isClosed(task));
     const timedOut = deadline !== undefined && Date.now() >= deadline;
     const aborted = options.signal?.aborted === true;
     // A message for this agent stops the wait. The tool result gives it.
     const message = (await session.inbox?.hasMessages().catch(() => false)) === true;
-    if (done || failed.length > 0 || timedOut || aborted || message) {
+    if (done || failed.length > 0 || stopped.length > 0 || timedOut || aborted || message) {
       const seconds = Math.round((Date.now() - started) / 1_000);
       const header = done
         ? `All ${tasks.length} tasks are closed (after ${seconds} s).`
         : failed.length > 0
           ? `${failed.map((task) => task.id).join(", ")} failed (after ${seconds} s). Other tasks can still be open.`
-          : aborted
+          : stopped.length > 0
+            ? `${stopped.map((task) => `${task.id} (@${cleanLine(task.owner ?? "")})`).join(", ")}: the owner stopped after an error (after ${seconds} s). For each one: send the owner a message to continue (tau_send), or stop it (tau_abort). Do not call tau_wait for these tasks before that: it returns at once.`
+            : aborted
             ? "The wait was stopped."
             : message
               ? `A message arrived (after ${seconds} s). Read it below, then call tau_wait again if necessary.`
@@ -567,7 +572,7 @@ export async function waitForTasks(
           task.status === "failed"
             ? ` (${task.retryable === true ? "retryable" : "not retryable"})`
             : task.status === "in_progress" && task.owner !== undefined
-              ? ` (@${task.owner})`
+              ? ` (@${task.owner}${ownerError(list, task) === undefined ? "" : `, stopped after an error: ${cleanLine(ownerError(list, task)!)}`})`
               : "";
         return `${task.id}  ${task.status}${extra}  ${cleanTitle(task.title)}`;
       });

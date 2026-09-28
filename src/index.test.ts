@@ -10,7 +10,7 @@ import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
 import tau, { createTau, errorKind, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { seedTaskList } from "./tasks/model.ts";
-import { claimTask, completeTask, createTask, delegateTask, setAgentPane, setAgentSession } from "./tasks/rules.ts";
+import { claimTask, completeTask, createTask, delegateTask, setAgentError, setAgentPane, setAgentSession } from "./tasks/rules.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -1473,8 +1473,14 @@ describe("tau extension", () => {
     assert.match(report?.text ?? "", /send @tau-t0 a message with tau_send/);
     assert.match(report?.text ?? "", /The kind of error: timeout\.$/);
     assert.doesNotMatch(report?.text ?? "", /rm -rf|token|Ignore/);
+    // The agent record has the error: the parent sees it (tau_wait, the
+    // continuation message, the tree).
+    assert.equal((await lead.read())?.agents[0]?.error, "timeout");
     // The inbox stays on: a message of the parent starts a new turn.
     assert.equal(handle.inbox?.paused, false);
+    // A new turn removes the error.
+    await turnStart({ type: "turn_start" }, ctx);
+    assert.equal((await lead.read())?.agents[0]?.error, undefined);
     // An error run that a different extension continues: no report.
     await run({ stopReason: "error", errorMessage: "timed out" }, "error", true);
     assert.deepEqual(await leadMessages(), []);
@@ -1490,6 +1496,35 @@ describe("tau extension", () => {
     await emit(pi, "session_shutdown", ctx);
   });
 
+  it("records the error before it sends the report, also when the report cannot be sent", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-full.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-full", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p1");
+    });
+    // The lead has the maximum of unread messages: the report cannot be sent.
+    for (let index = 0; index < 100; index++) {
+      await lead.sendMessage({ sender: "tau-t0", recipient: "lead", priority: "info", text: `m${index}`, sentAt: "2026-01-01T00:00:00.000Z" }, () => ({}));
+    }
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "sub-full");
+    createTau(pi.api, { ...deps, env });
+    await emit(pi, "session_start", ctx);
+    await all(pi, "turn_start")({ type: "turn_start" }, ctx);
+    await all(pi, "turn_end")({ type: "turn_end", message: { role: "assistant", stopReason: "error", errorMessage: "timed out" }, toolResults: [] }, ctx);
+    await chain(pi, "agent_before_settle")({ type: "agent_before_settle", outcome: "error", entries: [], continue: false }, ctx);
+    await all(pi, "agent_settled")({ type: "agent_settled" }, ctx);
+    // The parent sees the error in the record (tau_wait, continuation).
+    assert.equal((await lead.read())?.agents[0]?.error, "timeout");
+    assert.ok(notices.some((notice) => notice.type === "warning" && /could not tell @lead about the error/.test(notice.message)), JSON.stringify(notices));
+    lead.close();
+    await emit(pi, "session_shutdown", ctx);
+  });
+
   it("pauses the inbox of the lead after an error, and sends no report", async () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
@@ -1501,6 +1536,85 @@ describe("tau extension", () => {
     await all(pi, "agent_settled")({ type: "agent_settled" }, ctx);
     assert.equal(handle.inbox?.paused, true);
     await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("starts as a sub-agent in a pane that moved before pi started, and records the new pane", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-moved.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-moved", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      // The parent made pane w1:p9; the pane moved, and herdr shows w1:p1.
+      setAgentPane(list, "tau-t0", "w1:p9");
+    });
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+    /** A fake pi where herdr shows these panes. */
+    const start = async (name: string, panes: string[]) => {
+      const pi = fakePi((args) =>
+        args[0] === "pane" && args[1] === "list"
+          ? { code: 0, stdout: JSON.stringify({ result: { panes: panes.map((pane_id) => ({ pane_id })) } }) }
+          : { code: 0, stdout: PANE_REPLY },
+      );
+      const fake = fakeCtx(true, name);
+      createTau(pi.api, { ...deps, env });
+      await emit(pi, "session_start", fake.ctx);
+      return { pi, ...fake };
+    };
+    // herdr still shows w1:p9: maybe the correct sub-agent is there. Refuse.
+    const refused = await start("sub-refused", ["w1:p1", "w1:p9"]);
+    assert.match(refused.notices[0]?.message ?? "", /must run in pane w1:p9, not in pane w1:p1/);
+    assert.equal(refused.pi.tools.size, 0);
+    assert.equal((await lead.read())?.agents[0]?.pane, "w1:p9");
+    // herdr does not show w1:p9: the pane moved. Accept, and record it.
+    const { pi, ctx, notices } = await start("sub-moved", ["w1:p1"]);
+    assert.deepEqual(notices, []);
+    assert.ok(pi.tools.has("tau_complete"));
+    const record = (await lead.read())?.agents[0];
+    assert.equal(record?.pane, "w1:p1");
+    assert.equal(record?.session, "/sessions/2026_sub-moved.jsonl");
+    lead.close();
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("removes the error of an old run when a new pi session of the sub-agent starts, not after /reload", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-restart.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-restart", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p1");
+      setAgentSession(list, "tau-t0", "/sessions/2026_same.jsonl");
+      setAgentError(list, "tau-t0", "timeout");
+    });
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+    const start = async (sessionId: string) => {
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, sessionId);
+      createTau(pi.api, { ...deps, env });
+      await emit(pi, "session_start", ctx);
+      await emit(pi, "session_shutdown", ctx);
+    };
+    // /reload: the same pi session. The error stays (no new turn yet).
+    await start("same");
+    assert.equal((await lead.read())?.agents[0]?.error, "timeout");
+    // The first turn of the new runtime (after /reload) removes it.
+    {
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, "same");
+      createTau(pi.api, { ...deps, env });
+      await emit(pi, "session_start", ctx);
+      assert.equal((await lead.read())?.agents[0]?.error, "timeout");
+      await all(pi, "turn_start")({ type: "turn_start" }, ctx);
+      assert.equal((await lead.read())?.agents[0]?.error, undefined);
+      await emit(pi, "session_shutdown", ctx);
+    }
+    await lead.mutate((list) => setAgentError(list, "tau-t0", "timeout"));
+    // A restart: a new pi session. The error goes.
+    await start("new");
+    assert.equal((await lead.read())?.agents[0]?.error, undefined);
+    lead.close();
   });
 
   it("starts as a sub-agent with the identity from the environment", async () => {

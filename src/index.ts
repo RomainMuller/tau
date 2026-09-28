@@ -16,7 +16,9 @@ import { TauError } from "./tasks/errors.ts";
 import { seedTaskList, type TaskList } from "./tasks/model.ts";
 import { tauDir } from "./tasks/paths.ts";
 import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
-import { setAgentSession, type Actor } from "./tasks/rules.ts";
+import { setAgentError, setAgentPane, setAgentSession, type Actor } from "./tasks/rules.ts";
+import { errorKind } from "./tasks/model.ts";
+export { errorKind } from "./tasks/model.ts";
 import { MAX_FILE_BYTES, TaskListStore } from "./tasks/store.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
 import { cleanLine } from "./text.ts";
@@ -156,7 +158,13 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       else report(ctx, message);
       return;
     }
-    const opened = await openTaskList(ctx, deps, status.pane.paneId, event);
+    // A pane that herdr does not show: the pane of a sub-agent moved before
+    // its pi started (see checkSubAgent). When herdr fails, tau does not
+    // know: the pane counts as shown.
+    const paneGone = async (pane: string | undefined) =>
+      pane !== undefined &&
+      !(await new HerdrClient(exec, status.binary).listPanes().then((panes) => panes.has(pane), () => true));
+    const opened = await openTaskList(ctx, deps, status.pane.paneId, event, paneGone);
     const store = opened?.store;
     if (shutDown) {
       store?.close();
@@ -460,26 +468,6 @@ function registerContinuationTracker(pi: ExtensionAPI): () => boolean {
 }
 
 /**
- * The kind of a model provider error, for the parent. The raw error text
- * comes from outside (the provider): it can have instructions, request IDs,
- * or tokens, so the parent gets only this fixed text (the pane of the
- * sub-agent shows the raw error).
- */
-export function errorKind(error: string): string {
-  const status = /\b([45]\d\d)\b/u.exec(error)?.[1];
-  const withStatus = (kind: string) => (status === undefined ? kind : `${kind} (HTTP ${status})`);
-  if (status === "429" || /rate.?limit/iu.test(error)) return withStatus("rate limit");
-  if (status === "401" || status === "403" || /unauthori[sz]ed|forbidden|api key|credential/iu.test(error)) {
-    return withStatus("authentication or permission error");
-  }
-  if (status === "404" || /not.?found/iu.test(error)) return withStatus("not found (for example, the model does not exist: delegate with a different model)");
-  if (/timed? ?out/iu.test(error)) return withStatus("timeout");
-  if (/connection|network|econn|fetch failed|socket/iu.test(error)) return withStatus("connection error");
-  if (status?.startsWith("5") === true || /overloaded|unavailable/iu.test(error)) return withStatus("provider error");
-  return withStatus("other error");
-}
-
-/**
  * Tells the parent of a sub-agent when a run of the sub-agent ends with an
  * error, and its task is still in progress: else the sub-agent stays idle,
  * and nobody fails its task (it is alive). The task stays in progress. The
@@ -498,8 +486,20 @@ function registerErrorReport(pi: ExtensionAPI, session: TaskSession, parent: str
   let lastError: string | undefined;
   /** The error kind of a boundary with the outcome `error` that did not continue. */
   let pending: string | undefined;
-  pi.on("turn_start", () => {
+  pi.on("turn_start", async () => {
     pending = undefined;
+    // A new turn: the sub-agent works again. Read the record (also an error
+    // of a run before a /reload, which makes a new runtime). The read uses
+    // the cache of the store. When the change fails, the next turn tries
+    // again.
+    try {
+      const list = await session.store.read();
+      if (list?.agents.find((agent) => agent.name === self)?.error === undefined) return;
+      await session.store.mutate((current) => setAgentError(current, self, undefined));
+      session.onChange?.();
+    } catch {
+      // The next turn_start tries again.
+    }
   });
   pi.on("turn_end", (event) => {
     const message = event.message as { readonly role?: string; readonly stopReason?: string; readonly errorMessage?: unknown } | undefined;
@@ -523,6 +523,16 @@ function registerErrorReport(pi: ExtensionAPI, session: TaskSession, parent: str
       `The kind of error: ${kind}.`,
     ].join("\n");
     try {
+      // Record the error first: the tau_wait of the parent and its
+      // continuation message use it, also when the message cannot be sent.
+      await session.store.mutate((list) => {
+        const task = list.tasks.find((item) => item.id === scope);
+        if (task?.status !== "in_progress" || task.owner !== self) {
+          throw new TauError("invalid_state", `The task ${scope} is not in progress for @${self}.`);
+        }
+        setAgentError(list, self, kind);
+      });
+      session.onChange?.();
       await session.store.sendMessage({ sender: self, recipient: parent, priority: "steer", text, sentAt: session.now() }, (list) => {
         const task = list.tasks.find((item) => item.id === scope);
         if (task?.status !== "in_progress" || task.owner !== self) {
@@ -613,6 +623,7 @@ async function openTaskList(
   deps: TauDependencies,
   paneId: string,
   event: { readonly reason?: string; readonly previousSessionFile?: string | undefined } = {},
+  paneGone: (pane: string | undefined) => Promise<boolean> = async () => false,
 ): Promise<{ store: TaskListStore; identity: Identity } | undefined> {
   let store: TaskListStore | undefined;
   try {
@@ -633,11 +644,25 @@ async function openTaskList(
       if (list === undefined) {
         throw new TauError("storage", `The task list ${identity.file} of the lead does not exist.`);
       }
-      checkSubAgent(list, identity, paneId);
+      const recordPane = list.agents.find((agent) => agent.name === identity.actor.name)?.pane;
+      const gone = recordPane !== paneId && (await paneGone(recordPane));
+      checkSubAgent(list, identity, paneId, gone);
       // Record the pi session, so that the parent knows this agent in herdr
-      // also after a pane move.
+      // also after a pane move. Check again in the same transaction, and
+      // record the pane too: the pane can have moved before pi started (a
+      // moved pane gets a new ID).
       const session = ctx.sessionManager.getSessionFile() ?? sessionId;
-      await store.mutate((current) => setAgentSession(current, identity.actor.name, session));
+      await store.mutate((current) => {
+        const now = current.agents.find((agent) => agent.name === identity.actor.name)?.pane;
+        checkSubAgent(current, identity, paneId, gone && now === recordPane);
+        const before = current.agents.find((agent) => agent.name === identity.actor.name)?.session;
+        setAgentPane(current, identity.actor.name, paneId);
+        setAgentSession(current, identity.actor.name, session);
+        // A new pi session of this agent (a restart): an error of an old run
+        // is not true now. A /reload keeps the session: the error stays until
+        // the next turn.
+        if (before !== undefined && before !== session) setAgentError(current, identity.actor.name, undefined);
+      });
     }
     return { store, identity };
   } catch (error) {

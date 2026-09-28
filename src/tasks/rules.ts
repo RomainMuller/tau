@@ -6,6 +6,7 @@
  * See the "Task lifecycle" and "Sub-tasks" sections of the README.
  */
 
+import { cleanLine } from "../text.ts";
 import { TauError } from "./errors.ts";
 import {
   activeTask,
@@ -25,6 +26,7 @@ import {
   nextTaskId,
   openDependencies,
   recordEvent,
+  MAX_AGENT_ERROR_CHARS,
   MAX_AGENTS,
   type AgentRecord,
   type Task,
@@ -253,6 +255,17 @@ export function getAgent(list: TaskList, name: string): AgentRecord {
 export function setAgentPane(list: TaskList, name: string, pane: string): AgentRecord {
   const agent = getAgent(list, name);
   agent.pane = pane;
+  return agent;
+}
+
+/**
+ * Records that the last run of a sub-agent ended with an error (`kind`), or
+ * removes it (`undefined`). The sub-agent does this. See `AgentRecord.error`.
+ */
+export function setAgentError(list: TaskList, name: string, kind: string | undefined): AgentRecord {
+  const agent = getAgent(list, name);
+  if (kind === undefined) delete agent.error;
+  else agent.error = [...cleanLine(kind)].slice(0, MAX_AGENT_ERROR_CHARS).join("");
   return agent;
 }
 
