@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { checkModel, checkThinking, delegate, firstPrompt, ranFirstPrompt, type DelegationContext } from "./delegate.ts";
 import type { HerdrAgent, HerdrClient, PaneMetadata, SplitDirection } from "./herdr-client.ts";
 import { checkSubAgent, resolveIdentity } from "./identity.ts";
-import { agentNameFor, isAgentName } from "./names.ts";
+import { agentNameFor, isAgentName, titleSlug } from "./names.ts";
 import { TauError } from "./tasks/errors.ts";
 import { findTask, rollback, seedTaskList, type TaskList } from "./tasks/model.ts";
 import { taskListFile } from "./tasks/paths.ts";
@@ -117,6 +117,17 @@ beforeEach(async () => {
 afterEach(async () => {
   store.close();
   await rm(dir, { recursive: true, force: true });
+});
+
+describe("titleSlug", () => {
+  it("makes a short label from a task title, cut after a full word", () => {
+    assert.equal(titleSlug("Review: tests and validation"), "review-tests-and-validation");
+    assert.equal(titleSlug("Fix: panes of failed sub-agent starts are not closed"), "fix-panes-of-failed-sub");
+    assert.equal(titleSlug("Café déjà vu"), "cafe-deja-vu");
+    assert.equal(titleSlug("x".repeat(40)), "x".repeat(28));
+    assert.equal(titleSlug("  ✨ !! "), undefined);
+    assert.ok(titleSlug("a b c d e f g h i j k l m n o p")!.length <= 28);
+  });
 });
 
 describe("agent names", () => {

@@ -38,3 +38,31 @@ export function agentNameFor(taskId: string, taken: ReadonlySet<string>): string
 function hash(text: string, length: number): string {
   return createHash("sha256").update(text).digest("hex").slice(0, length);
 }
+
+/** The maximum length of a `titleSlug`. */
+export const MAX_SLUG_CHARS = 28;
+
+/**
+ * A short label for a task title, for the herdr side bar: lower-case letters
+ * and digits, with `-` between words, at most `MAX_SLUG_CHARS` characters
+ * (tau cuts it after a full word when it can). For example
+ * "Review: tests and validation" gives `review-tests-and-validation`.
+ * Returns `undefined` when the title has no letter or digit.
+ */
+export function titleSlug(title: string, max = MAX_SLUG_CHARS): string | undefined {
+  const words = title
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== "");
+  if (words.length === 0) return undefined;
+  let slug = "";
+  for (const word of words) {
+    const next = slug === "" ? word : `${slug}-${word}`;
+    if (next.length > max) break;
+    slug = next;
+  }
+  // The first word alone is too long: cut it.
+  return slug === "" ? words[0]!.slice(0, max) : slug;
+}

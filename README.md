@@ -598,8 +598,30 @@ Each tau pi tells herdr what its pane is (`herdr pane report-metadata`):
 
 | Pane      | Title                         | Agent label     | Tokens                                          |
 |-----------|-------------------------------|-----------------|-------------------------------------------------|
-| lead      | `tau lead`                    | `tau lead`      | `tau_role=lead`                                 |
-| sub-agent | `tau-t2-1 · T2.1 <task title>` | `tau sub-agent` | `tau_role=subagent`, `tau_task=T2.1`, `tau_parent=lead` |
+| lead      | `tau lead`                    | `tau lead`      | `tau_role=lead`, `model=<model>`                |
+| sub-agent | `tau-t2-1 · T2.1 <task title>` | `<title label>` | `tau_role=subagent`, `tau_task=T2.1`, `tau_parent=lead`, `model=<model>` |
+
+- The title label is a short form of the task title, for the side bar:
+  lower-case words with `-` between them, at most 28 characters. For
+  example, "Review: tests and validation" gives
+  `review-tests-and-validation`. When the title has no letter or digit,
+  the label is `tau sub-agent`.
+- `<model>` is the name of the model of the agent (for example
+  `GPT-6 Sol`), else its ID. When you select a different model, `tau`
+  reports it again. When pi does not know the model, there is no `model`
+  token.
+
+The herdr side bar shows the agent label as `agent`. To also show the
+model, add the `$model` token to the rows of the side bar, in the herdr
+`config.toml`:
+
+```toml
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "machine", "workspace", "tab"],
+  ["agent", "$model"],
+]
+```
 
 herdr knows each sub-agent by its name (`herdr agent list`), and the herdr
 pi integration reports its state (`working`, `idle`, `blocked`). The badge of

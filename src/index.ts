@@ -24,6 +24,7 @@ export { errorKind } from "./tasks/model.ts";
 import { MAX_FILE_BYTES, TaskListStore } from "./tasks/store.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
 import { cleanLine } from "./text.ts";
+import { titleSlug } from "./names.ts";
 import { TreeWidget } from "./widget.ts";
 import { forkRevision, forkTaskList, REVISION_ENTRY, sessionIdOf } from "./fork.ts";
 import { taskListFile } from "./tasks/paths.ts";
@@ -79,6 +80,8 @@ export interface TauHandle {
   readonly supervisor: Supervisor | undefined;
   readonly identity: Identity | undefined;
   readonly inbox: Inbox | undefined;
+  /** The last pane metadata report (see `reportPane`). */
+  readonly reporting: Promise<void> | undefined;
   /** The removal of old task lists (see `tasks/gc.ts`). Only a lead starts it. */
   readonly collection: Promise<unknown> | undefined;
 }
@@ -303,7 +306,16 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     watcher.start();
     inbox.start();
     void watcher.check();
-    reporting = reportPane(herdr, status.pane.paneId, identity, store);
+    const paneId = status.pane.paneId;
+    const self = identity;
+    reporting = reportPane(herdr, paneId, self, store, modelLabel(ctx.model));
+    // Show the new model in the side bar (see `reportPane`). One report at
+    // a time, in order: shutdown waits for the last one.
+    pi.on("model_select", (event) => {
+      if (shutDown) return;
+      const previous = reporting ?? Promise.resolve();
+      reporting = previous.then(() => (shutDown ? undefined : reportPane(herdr, paneId, self, store, modelLabel(event.model))));
+    });
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -322,7 +334,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       // for the report first, so that it cannot set the metadata again.
       await reporting;
       await herdrClient
-        .clearMetadata(paneOfThisAgent, metadataSource(identity), ["tau_role", "tau_task", "tau_parent"])
+        .clearMetadata(paneOfThisAgent, metadataSource(identity), ["tau_role", "tau_task", "tau_parent", MODEL_TOKEN])
         .catch(() => undefined);
     }
     if (ctx.hasUI) {
@@ -342,6 +354,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     },
     get inbox() {
       return messageInbox;
+    },
+    get reporting() {
+      return reporting;
     },
     get collection() {
       return collection;
@@ -839,17 +854,41 @@ function metadataSource(identity: Identity): string {
 }
 
 /**
+ * The pane metadata token with the model of the agent. The herdr side bar
+ * can show it: `$model` in `[ui.sidebar.agents] rows`.
+ */
+export const MODEL_TOKEN = "model";
+
+/** The text of a model for the side bar: its name, else its ID. */
+function modelLabel(model: { readonly id: string; readonly name?: string } | undefined): string | undefined {
+  if (model === undefined) return undefined;
+  const label = cleanLine(model.name !== undefined && model.name !== "" ? model.name : model.id);
+  return label === "" ? undefined : [...label].slice(0, 40).join("");
+}
+
+/**
  * Tells herdr what this pane is: the title, the agent label, and tokens.
  * herdr shows this metadata. It is display-only: tau does not trust it.
+ *
+ * The agent label is what the herdr side bar shows as `agent`: `tau lead`
+ * for the lead, and a short label of the task title for a sub-agent (see
+ * `titleSlug`). The `model` token has the model of the agent.
  */
-async function reportPane(herdr: HerdrClient, paneId: string, identity: Identity, store: TaskListStore): Promise<void> {
+async function reportPane(
+  herdr: HerdrClient,
+  paneId: string,
+  identity: Identity,
+  store: TaskListStore,
+  model: string | undefined,
+): Promise<void> {
+  const modelToken: Record<string, string> = model === undefined ? {} : { [MODEL_TOKEN]: model };
   try {
     if (identity.role === "lead") {
       await herdr.reportMetadata(paneId, {
         source: metadataSource(identity),
         title: "tau lead",
         displayAgent: "tau lead",
-        tokens: { tau_role: "lead" },
+        tokens: { tau_role: "lead", ...modelToken },
       });
       return;
     }
@@ -859,8 +898,8 @@ async function reportPane(herdr: HerdrClient, paneId: string, identity: Identity
     await herdr.reportMetadata(paneId, {
       source: metadataSource(identity),
       title: [...title].slice(0, 80).join(""),
-      displayAgent: "tau sub-agent",
-      tokens: { tau_role: "subagent", tau_task: identity.actor.scope, tau_parent: identity.parent },
+      displayAgent: (task === undefined ? undefined : titleSlug(task.title)) ?? "tau sub-agent",
+      tokens: { tau_role: "subagent", tau_task: identity.actor.scope, tau_parent: identity.parent, ...modelToken },
     });
   } catch {
     // The metadata is only for display.

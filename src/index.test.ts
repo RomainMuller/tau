@@ -1727,7 +1727,7 @@ describe("tau extension", () => {
       "--title",
       "tau-t0 · T0 Prepare task list",
       "--display-agent",
-      "tau sub-agent",
+      "prepare-task-list",
       "--token",
       "tau_role=subagent",
       "--token",
@@ -1735,6 +1735,15 @@ describe("tau extension", () => {
       "--token",
       "tau_parent=lead",
     ]);
+    // A new model: tau reports the metadata again, with the model token.
+    const before = pi.execCalls.filter((call) => call[2] === "report-metadata").length;
+    for (const handler of pi.handlers.get("model_select") ?? []) {
+      await handler({ type: "model_select", model: { id: "openai/gpt-6-sol", name: "GPT-6 Sol" }, source: "set" }, ctx);
+    }
+    await handle.reporting;
+    const reports = pi.execCalls.filter((call) => call[2] === "report-metadata");
+    assert.equal(reports.length, before + 1);
+    assert.deepEqual(reports.at(-1)?.slice(-2), ["--token", "model=GPT-6 Sol"]);
 
     // The stop rule looks only at the task of the sub-agent.
     const settle = chain(pi, "agent_before_settle");
