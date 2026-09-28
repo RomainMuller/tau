@@ -288,6 +288,15 @@ describe("task tools, more cases", () => {
   });
 });
 
+describe("tau_ask_user", () => {
+  it("is not registered when the configuration names a different ask tool", () => {
+    const configured = register({ ...makeSession("lead"), askTool: "ask_user_question" });
+    assert.equal(configured.has("tau_ask_user"), false);
+    assert.deepEqual([...configured.keys()].sort(), [...TASK_TOOL_NAMES].filter((name) => name !== "tau_ask_user").sort());
+    assert.equal(register(makeSession("lead")).has("tau_ask_user"), true);
+  });
+});
+
 describe("work gate", () => {
   const types = DEFAULT_TASK_TYPE_DEFINITIONS;
 
@@ -295,6 +304,19 @@ describe("work gate", () => {
     const reason = checkGate({ toolName: "bash", tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types });
     assert.match(reason ?? "", /tau blocked bash: you have no active task/);
     assert.match(reason ?? "", /Do only the work that the active task needs/);
+  });
+
+  it("never blocks the configured ask tool, also with no active task or with a read-only task", async () => {
+    const gate = async (toolName: string, askTool?: string) =>
+      checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types, askTool });
+    assert.equal(await gate("ask_user_question", "ask_user_question"), undefined);
+    // Only the configured tool: other tools stay blocked.
+    assert.match((await gate("bash", "ask_user_question")) ?? "", /you have no active task/);
+    assert.match((await gate("ask_user_question")) ?? "", /you have no active task/);
+    await call("tau_create", { title: "Research", type: "research" });
+    await call("tau_claim", { id: "T1" });
+    assert.equal(await gate("ask_user_question", "ask_user_question"), undefined);
+    assert.match((await gate("edit", "ask_user_question")) ?? "", /read-only/);
   });
 
   it("never blocks the tau tools", async () => {

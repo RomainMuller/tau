@@ -43,7 +43,7 @@ export const PROMPT_SECTION = "tau";
  * The system prompt section that tells the rule. pi shows sections also
  * with a custom system prompt, but not the tool guidelines.
  */
-export function promptSection(actor: Actor, askToolActive: boolean): string {
+export function promptSection(actor: Actor, askTool: string | undefined): string {
   const rule =
     actor.scope === undefined
       ? "You are the lead agent. You cannot stop while a task in the tau task list is waiting or in progress."
@@ -51,8 +51,10 @@ export function promptSection(actor: Actor, askToolActive: boolean): string {
   return [
     rule,
     "If you stop too early, tau tells you to continue.",
-    'To get an answer from the user, call an available "ask question" tool. Do not end your turn to ask a question.',
-    ...(askToolActive ? ['If no other "ask question" tool is available, call tau_ask_user alone, then end your turn.'] : []),
+    ...(askTool === undefined || askTool === ASK_TOOL
+      ? ['To get an answer from the user, call an available "ask question" tool. Do not end your turn to ask a question.']
+      : [`To get an answer from the user, call the ${askTool} tool. Do not end your turn to ask a question.`]),
+    ...(askTool === ASK_TOOL ? ['If no other "ask question" tool is available, call tau_ask_user alone, then end your turn.'] : []),
   ].join("\n");
 }
 
@@ -114,7 +116,7 @@ export function openWork(list: TaskList, actor: Actor): OpenWork | undefined {
  * wrote (for example titles), because such text must not look like an
  * instruction of the user.
  */
-export function continuationText(list: TaskList, work: OpenWork, actor: Actor, askToolActive = true): string {
+export function continuationText(list: TaskList, work: OpenWork, actor: Actor, askTool: string | undefined): string {
   const count = work.open.length;
   const lines: string[] = [];
   const subject =
@@ -159,9 +161,11 @@ export function continuationText(list: TaskList, work: OpenWork, actor: Actor, a
     lines.push("  Some tasks wait for a failed or canceled task: retry that task, change the dependencies, or cancel the waiting task.");
   }
   lines.push(
-    askToolActive
+    askTool === ASK_TOOL
       ? "  If you must have an answer from the user, call an ask question tool (or tau_ask_user if no other one is available). Do not end your turn to ask."
-      : "  If you must have an answer from the user, call an ask question tool. Do not end your turn to ask.",
+      : askTool === undefined
+        ? "  If you must have an answer from the user, call an ask question tool. Do not end your turn to ask."
+        : `  If you must have an answer from the user, call the ${askTool} tool. Do not end your turn to ask.`,
   );
   return lines.join("\n");
 }
@@ -212,8 +216,12 @@ export interface StopGuardOptions {
   /** Reads the task list. `undefined` when it does not exist. */
   readonly read: () => Promise<TaskList | undefined>;
   readonly maxIdleContinuations?: number;
-  /** True when `tau_ask_user` is an active tool. The default is true. */
-  readonly askToolActive?: () => boolean;
+  /**
+   * The name of the active tool that asks the user a question (the
+   * configured `askTool`, or `tau_ask_user`), or `undefined` when it is not
+   * active. The default is `tau_ask_user`.
+   */
+  readonly askTool?: () => string | undefined;
 }
 
 /**
@@ -224,7 +232,7 @@ export class StopGuard {
   readonly #actor: Actor;
   readonly #read: () => Promise<TaskList | undefined>;
   readonly #max: number;
-  readonly #askToolActive: () => boolean;
+  readonly #askTool: () => string | undefined;
   /** The task list revision at the last continuation. */
   #lastRevision: number | undefined;
   /** The number of continuations in sequence after which the task list did not change. */
@@ -242,7 +250,7 @@ export class StopGuard {
     this.#actor = options.actor;
     this.#read = options.read;
     this.#max = options.maxIdleContinuations ?? DEFAULT_MAX_IDLE_CONTINUATIONS;
-    this.#askToolActive = options.askToolActive ?? (() => true);
+    this.#askTool = options.askTool ?? (() => ASK_TOOL);
   }
 
   /** A new user message: the rule applies again, from the start. */
@@ -321,6 +329,6 @@ export class StopGuard {
       };
     }
     this.#lastRevision = list.revision;
-    return { kind: "continue", text: continuationText(list, work, this.#actor, this.#askToolActive()) };
+    return { kind: "continue", text: continuationText(list, work, this.#actor, this.#askTool()) };
   }
 }

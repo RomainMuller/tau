@@ -36,6 +36,13 @@ export interface TauConfig {
   readonly maxIdleContinuations: number;
   /** The task types. This list replaces the default list. */
   readonly taskTypes: Readonly<Record<string, TaskTypeDefinition>>;
+  /**
+   * The name of the "ask question" tool of a different extension. When it is
+   * set, tau does not register `tau_ask_user`, the work gate never blocks
+   * this tool, and the text for the models names it. When it is not set,
+   * tau registers `tau_ask_user` as the last resort.
+   */
+  readonly askTool?: string;
 }
 
 export const DEFAULT_CONFIG: TauConfig = {
@@ -55,6 +62,18 @@ export const MAX_CONFIG_BYTES = 64 * 1024;
 export const MAX_TASK_TYPES = 50;
 
 const TASK_TYPE_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+/** A tool name: the text that models get has it, so only these characters. */
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+/**
+ * The built-in tools of pi. They cannot be the ask tool: the work gate never
+ * blocks the ask tool.
+ */
+const BUILT_IN_TOOLS: ReadonlySet<string> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+
+/** True when `value` can be the `askTool`: a tool name, not a tau tool and not a built-in tool. */
+export function isAskToolName(value: string): boolean {
+  return TOOL_NAME.test(value) && !value.startsWith("tau_") && !BUILT_IN_TOOLS.has(value);
+}
 const MAX_DESCRIPTION_LENGTH = 300;
 
 /** The configuration, and the problems that tau found in the file. */
@@ -177,6 +196,7 @@ function parseConfigText(text: string): { config: TauConfig; problems: string[] 
     maxParallelSubAgents: (item) => integerIn(item, 1, 32),
     maxIdleContinuations: (item) => integerIn(item, 0, 100),
     taskTypes: (item) => taskTypes(item, problems),
+    askTool: (item) => (typeof item === "string" && isAskToolName(item) ? item : undefined),
   };
   const expected: Record<string, string> = {
     toggleCompletedKey: 'a key, for example "ctrl+shift+t"',
@@ -185,6 +205,8 @@ function parseConfigText(text: string): { config: TauConfig; problems: string[] 
     maxParallelSubAgents: "an integer from 1 to 32",
     maxIdleContinuations: "an integer from 0 to 100",
     taskTypes: "an object of task types (see the README)",
+    askTool:
+      'the name of an "ask question" tool of a different extension (a letter, then a-z, A-Z, 0-9, _, and -, at most 64 characters; not a tau_ tool or a built-in tool)',
   };
   const config: Record<string, unknown> = { ...DEFAULT_CONFIG };
   for (const [key, item] of Object.entries(value)) {

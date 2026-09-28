@@ -21,11 +21,17 @@ export interface GateInput {
   readonly list: TaskList;
   readonly agent: string;
   readonly taskTypes: Readonly<Record<string, TaskTypeDefinition>>;
+  /**
+   * The configured "ask question" tool. The gate never blocks it: an agent
+   * with no active task (for example a lead that waits for its sub-agents)
+   * must be able to ask the user. The tool only reads an answer.
+   */
+  readonly askTool?: string | undefined;
 }
 
 /** Returns the reason to block the tool call, or `undefined` to allow it. */
 export function checkGate(input: GateInput): string | undefined {
-  if (input.tauTools.has(input.toolName)) {
+  if (input.tauTools.has(input.toolName) || input.toolName === input.askTool) {
     return undefined;
   }
   const active = activeTask(input.list, input.agent);

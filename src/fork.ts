@@ -23,6 +23,7 @@
  * list is not valid, and the old list must be the list of the old session.
  */
 
+import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 
 import { LEAD_AGENT, rollback, seedTaskList, SYSTEM_ACTOR, type TaskList } from "./tasks/model.ts";
@@ -96,7 +97,10 @@ export function forkTaskList(old: TaskList, revision: number | undefined, sessio
 export async function sessionIdOf(file: string): Promise<string | undefined> {
   let handle;
   try {
-    handle = await open(file, "r");
+    // O_NONBLOCK: a named pipe (FIFO) must not stop the start while it waits
+    // for a writer. Read only a regular file (also through a symbolic link).
+    handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!(await handle.stat()).isFile()) return undefined;
     const buffer = Buffer.alloc(MAX_HEADER_BYTES);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     const text = buffer.subarray(0, bytesRead).toString("utf8");

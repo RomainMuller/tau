@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -174,6 +174,25 @@ describe("sessionIdOf", () => {
       await writeFile(file, "not json");
       assert.equal(await sessionIdOf(file), undefined);
       assert.equal(await sessionIdOf(join(dir, "missing.jsonl")), undefined);
+      // A directory is not a session file.
+      assert.equal(await sessionIdOf(dir), undefined);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not wait for a named pipe (FIFO), also through a symbolic link", { timeout: 5_000 }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tau-fork-"));
+    try {
+      const { execFileSync } = await import("node:child_process");
+      try {
+        execFileSync("mkfifo", [join(dir, "pipe.jsonl")]);
+      } catch {
+        return; // no mkfifo on this system
+      }
+      assert.equal(await sessionIdOf(join(dir, "pipe.jsonl")), undefined);
+      await symlink(join(dir, "pipe.jsonl"), join(dir, "link.jsonl"));
+      assert.equal(await sessionIdOf(join(dir, "link.jsonl")), undefined);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

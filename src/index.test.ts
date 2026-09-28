@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { DEFAULT_CONFIG } from "./config.ts";
+import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
 import tau, { createTau, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { seedTaskList } from "./tasks/model.ts";
@@ -853,6 +853,47 @@ describe("tau extension", () => {
     await emit(pi, "session_shutdown", ctx);
   });
 
+  it("uses askTool: no tau_ask_user, the gate allows the tool, and the texts name it", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "askTool": "ask_user_question" }');
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "ask-1");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    assert.equal(pi.tools.has("tau_ask_user"), false);
+    assert.ok(pi.tools.has("tau_list"));
+    // No active task: the gate allows the ask tool, and blocks other tools.
+    const gate = pi.handlers.get("tool_call")![0]!;
+    assert.equal(await gate({ type: "tool_call", toolName: "ask_user_question", toolCallId: "1", input: {} }, ctx), undefined);
+    assert.notEqual(await gate({ type: "tool_call", toolName: "bash", toolCallId: "2", input: {} }, ctx), undefined);
+    // The system prompt names the tool when it is active.
+    const start = async (selectedTools: string[]) => {
+      const event = { type: "before_agent_start", prompt: "x", systemPromptOptions: { selectedTools, sections: {} as Record<string, string> } };
+      await pi.handlers.get("before_agent_start")![0]!(event, ctx);
+      return event.systemPromptOptions.sections.tau ?? "";
+    };
+    const section = await start(["read", "tau_list", "ask_user_question"]);
+    assert.match(section, /call the ask_user_question tool/);
+    assert.doesNotMatch(section, /tau_ask_user/);
+    assert.deepEqual(notices.filter((notice) => /ask tool/.test(notice.message)), []);
+    // The tool is not active: a warning, one time only.
+    assert.doesNotMatch(await start(["read", "tau_list"]), /ask_user_question|tau_ask_user/);
+    await start(["read", "tau_list"]);
+    const warnings = notices.filter((notice) => /The ask tool ask_user_question \(askTool in the configuration\) is not an active tool/.test(notice.message));
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]!.type, "warning");
+    // The continuation names the tool (the fake pi has the registered tools active).
+    pi.tools.set("ask_user_question", {} as never);
+    const settle = chain(pi, "agent_before_settle");
+    const result = (await settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx)) as {
+      entries: Array<{ content: string }>;
+    };
+    assert.match(result.entries.at(-1)!.content, /call the ask_user_question tool/);
+    assert.doesNotMatch(result.entries.at(-1)!.content, /tau_ask_user/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
   it("writes the configuration warnings to stderr when there is no UI", async () => {
     enableHerdr();
     await mkdir(join(root, "tau"), { recursive: true });
@@ -1014,6 +1055,55 @@ describe("tau extension", () => {
       const kept = await forkStart("fork-exists", sessionFile, at(forkPoint));
       assert.deepEqual(kept.list?.tasks.map((task) => task.title), ["Prepare task list", "Mine"]);
       await emit(kept.pi, "session_shutdown", kept.ctx);
+    });
+
+    it("copies the list for `pi --fork` (reason startup, the header tells the old session)", async () => {
+      enableHerdr();
+      const { sessionFile, forkPoint } = await oldSession();
+      /** Starts a lead with `reason`, and a session header with `parentSession`. */
+      const start = async (name: string, reason: string, parentSession: string | undefined, branch: unknown[] = at(forkPoint)) => {
+        const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+        const fake = fakeCtx(true, name, branch);
+        const ctx = {
+          ...fake.ctx,
+          sessionManager: { ...fake.ctx.sessionManager, getHeader: () => ({ type: "session", id: name, parentSession }) },
+        };
+        createTau(pi.api, deps);
+        for (const handler of pi.handlers.get("session_start") ?? []) {
+          await handler({ type: "session_start", reason }, ctx);
+        }
+        const store = new TaskListStore(join(root, "tau", "tasklists", `${name}.db`));
+        const list = await store.read();
+        store.close();
+        await emit(pi, "session_shutdown", ctx);
+        return { list, notices: fake.notices };
+      };
+      const forked = await start("cli-fork", "startup", sessionFile);
+      assert.deepEqual(forked.list?.tasks.map((task) => [task.id, task.status]), [
+        ["T0", "completed"],
+        ["T1", "failed"],
+      ]);
+      assert.equal(forked.list?.sessionId, "cli-fork");
+      assert.deepEqual(forked.notices, []);
+      // A later start of the same session keeps its own list.
+      const again = await start("cli-fork", "startup", sessionFile);
+      assert.equal(again.list?.revision, forked.list?.revision);
+      // No parent session, or a reason other than startup and fork: a new list.
+      for (const [name, reason, parent] of [
+        ["cli-plain", "startup", undefined],
+        ["cli-empty", "startup", ""],
+        ["cli-new", "new", sessionFile],
+        ["cli-resume", "resume", sessionFile],
+      ] as const) {
+        const { list, notices } = await start(name, reason, parent);
+        assert.deepEqual(list?.tasks.map((task) => task.id), ["T0"], name);
+        assert.deepEqual(notices, [], name);
+      }
+      // A new session (/new) also has a parentSession, but no revision
+      // records: it is not a fork. A new list, with no warning.
+      const made = await start("cli-made-by-new", "startup", sessionFile, []);
+      assert.deepEqual(made.list?.tasks.map((task) => task.id), ["T0"]);
+      assert.deepEqual(made.notices, []);
     });
 
     it("writes the revision before each message enters the session, also for changes of sub-agents", async () => {
@@ -1208,6 +1298,41 @@ describe("tau extension", () => {
     assert.match(result.reason, /cannot read the task list/);
   });
 
+  it("does not block the configured ask tool when the task list cannot be read", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "askTool": "ask_user_question" }');
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "broken-ask");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    await rm(join(root, "tau", "tasklists", "broken-ask.db"));
+    await writeFile(join(root, "tau", "tasklists", "broken-ask.db"), "not a database");
+    const gate = pi.handlers.get("tool_call")![0]!;
+    assert.equal(await gate({ type: "tool_call", toolName: "ask_user_question", toolCallId: "1", input: {} }, ctx), undefined);
+    const blocked = (await gate({ type: "tool_call", toolName: "bash", toolCallId: "2", input: {} }, ctx)) as { reason: string };
+    assert.match(blocked.reason, /cannot read the task list/);
+  });
+
+  it("registers nothing when a different extension has tau_ask_user, also if askTool is set", async () => {
+    enableHerdr();
+    await mkdir(join(root, "tau"), { recursive: true });
+    await writeFile(join(root, "tau", "config.json"), '{ "askTool": "ask_user_question" }');
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const other = { execute: async () => undefined };
+    pi.tools.set("tau_ask_user", other);
+    const { ctx, notices } = fakeCtx(true, "ask-conflict");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    // The gate knows the tau tools by name: it must not allow the tool of
+    // the other extension.
+    assert.ok(notices.some((notice) => notice.type === "error" && /tau_ask_user/.test(notice.message)));
+    assert.equal(pi.tools.has("tau_list"), false);
+    assert.equal(pi.handlers.get("tool_call"), undefined);
+    assert.equal(pi.tools.get("tau_ask_user"), other);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
   it("registers no tools and no gate when a different extension uses a tau tool name", async () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
@@ -1271,6 +1396,35 @@ describe("tau extension", () => {
     assert.equal(handle.widget?.running ?? false, false);
     assert.equal(pi.handlers.get("tool_call"), undefined);
     assert.ok(widgets.every((widget) => typeof widget.lines !== "function"));
+  });
+
+  it("uses the askTool of the lead in a sub-agent (TAU_CONFIG)", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "lead-ask.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-ask", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p1");
+    });
+    lead.close();
+    const config = JSON.stringify({ ...DEFAULT_CONFIG, askTool: "ask_user_question" });
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: config };
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx, notices } = fakeCtx(true, "sub-ask");
+    createTau(pi.api, { ...deps, env });
+    await emit(pi, "session_start", ctx);
+    assert.deepEqual(notices, []);
+    assert.ok(pi.tools.has("tau_complete"));
+    assert.equal(pi.tools.has("tau_ask_user"), false);
+    const event = {
+      type: "before_agent_start",
+      prompt: "x",
+      systemPromptOptions: { selectedTools: ["tau_list", "ask_user_question"], sections: {} as Record<string, string> },
+    };
+    await pi.handlers.get("before_agent_start")![0]!(event, ctx);
+    assert.match(event.systemPromptOptions.sections.tau ?? "", /sub-agent for task T0[\s\S]*call the ask_user_question tool/);
+    await emit(pi, "session_shutdown", ctx);
   });
 
   it("starts as a sub-agent with the identity from the environment", async () => {
@@ -1389,7 +1543,7 @@ describe("tau extension", () => {
   it("gives its configuration to a new sub-agent (TAU_CONFIG in the new pane)", async () => {
     enableHerdr();
     await mkdir(join(root, "tau"), { recursive: true });
-    await writeFile(join(root, "tau", "config.json"), '{ "maxTreeLines": 3 }');
+    await writeFile(join(root, "tau", "config.json"), '{ "maxTreeLines": 3, "askTool": "ask_user_question" }');
     const pi = fakePi((args) =>
       args[0] === "agent" && args[1] === "list"
         ? { code: 0, stdout: JSON.stringify({ result: { agents: [] } }) }
@@ -1404,6 +1558,9 @@ describe("tau extension", () => {
     const split = pi.execCalls.find((call) => call[1] === "pane" && call[2] === "split")!;
     const value = split.find((arg) => typeof arg === "string" && arg.startsWith("TAU_CONFIG="))!.slice("TAU_CONFIG=".length);
     assert.equal(JSON.parse(value).maxTreeLines, 3);
+    // The sub-agent reads the same value without a problem (see "uses the
+    // askTool of the lead in a sub-agent").
+    assert.deepEqual(parseConfig(value), { config: { ...DEFAULT_CONFIG, maxTreeLines: 3, askTool: "ask_user_question" }, problems: [] });
     await emit(pi, "session_shutdown", ctx);
   });
 

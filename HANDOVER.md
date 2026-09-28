@@ -5,7 +5,7 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 457
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 469
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. All README steps are built (section 8). Ask Romain what comes next (for
@@ -65,7 +65,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `xnnzlppn` | `95d5be63` | feat: add tau_abort to stop sub-agents                    |
 | `tvkpmnvr` | `4ed71080` | feat: add agent messages with tau_send                    |
 | `ytlvsqzr` | `59bbee67` | feat: read the tau configuration file                     |
-| `stysslnx` | (see log)  | feat: copy the task list at a session fork                |
+| `stysslnx` | `adbd6384` | feat: copy the task list at a session fork                |
+| `oowynxku` | (see log)  | fix: copy the list for pi --fork, and add askTool         |
 
 The working copy after that is empty.
 
@@ -85,7 +86,7 @@ The working copy after that is empty.
 | `messages.ts` | Messages: `checkRecipient` (sub-agents at any depth, parent, siblings; ended agents refused), `checkMessageText`, `messagesText` (header + `\| ` quote, `cleanText`). |
 | `inbox.ts` | `Inbox`: delivers only while the agent is idle (`pi.sendMessage` with `triggerTurn`), at most one turn per 5 s, `pause`/`resume`, gives messages back (`untakeMessages`) when the state changed or the delivery threw, `stop`/`drain`. |
 | `fork.ts` | Fork copy: `REVISION_ENTRY` custom entries (written by `index.ts` `registerRevisionRecord` in `message_end` of each message and in `session_before_compact`, lead only), `forkRevision(branch)`, `forkTaskList` (rollback; sub-agent tasks failed `owner is in a different session`, their waiting sub-tasks canceled; records ended), `sessionIdOf(file)`. `index.ts` `forkedList` checks the header ID, the stored `sessionId`, the revision range 1..N, and the copy size; else a warning and a new list. |
-| `config.ts` | `~/.pi/tau/config.json` (JSON with comments): `loadConfig` (never throws; O_NONBLOCK open + fstat + bounded read; symlink allowed), `parseConfig` (per-field defaults + problem lines, max 20; `Object.hasOwn`), `isKeyId` (needs ctrl/alt/super; no Escape, `+`, `[ ] \\`, ctrl+h/i/j/m), `configFor` (lead: the file; sub-agent: `TAU_CONFIG` or `fatal`). |
+| `config.ts` | `~/.pi/tau/config.json` (JSON with comments): `loadConfig` (never throws; O_NONBLOCK open + fstat + bounded read; symlink allowed), `parseConfig` (per-field defaults + problem lines, max 20; `Object.hasOwn`), `isKeyId` (needs ctrl/alt/super; no Escape, `+`, `[ ] \\`, ctrl+h/i/j/m), `isAskToolName` (`askTool`: tool name regex, not `tau_*`, not a pi built-in), `configFor` (lead: the file; sub-agent: `TAU_CONFIG` or `fatal`). |
 | `gate.ts` | Work gate on `tool_call`: no active task → block non-tau tools; read-only type (or unknown type) → block `edit`/`write`. |
 | `format.ts` | Model-facing text. Agent text is quoted with `| ` and labeled as data. `tau_get` previews (2000 chars, last 10 notes/events) and `section`+`offset` paging by code points. |
 | `text.ts` | Removes ANSI/OSC sequences, control chars, bidi and zero-width chars. |
@@ -148,6 +149,32 @@ Nothing: all planned README features are built. The README header still
 says "Status: DRAFT".
 
 ## 9. Known limits and open items
+
+- Live tests of 2026-09-28 (all passed as the README says): `/fork` with a
+  running sub-agent, fork of a fork, `/clone`, mixed batch with
+  `tau_ask_user` (the rule applies to the next stop), resume of the old
+  session closes the pane of a sub-agent that finished after the fork.
+  Found and fixed: `pi --fork` made a new list (F3); the gate blocked other
+  ask tools with no active task (F2, new `askTool`). Not live-tested yet:
+  `askTool` and `pi --fork` after the fix (unit tests only).
+- `askTool` (Romain's design): when set, no `tau_ask_user`; the gate never
+  blocks it (also with no task, a read-only task, or a list read error);
+  prompt and continuation name it; a warning one time per load of tau when
+  it is not in `selectedTools`. Any `tau_*` name conflict still stops tau
+  (also `tau_ask_user` with `askTool`): the gate and the delivery know tau
+  tools by name. README warns that a tool that does more than ask works
+  outside the gate.
+- `before_agent_start` order: tau reads `selectedTools` in its handler. A
+  later extension handler can change the tools: then the prompt and the
+  one-time missing-tool warning can be wrong for that run.
+- `pi --fork`: the start reason is `startup`; tau copies when the header has
+  `parentSession` and the branch has a `tau-revision` entry. No entry -> new
+  list, no warning (a `/new` session also has `parentSession`). A `/new`
+  session that wrote its own revision entries and then lost its list would
+  copy its parent's list (abnormal case, accepted).
+- After `/fork`, sub-agents of the old session keep working with no
+  supervisor; their panes close only when the old session opens again (and
+  the safe-close rule permits it).
 
 - A pane move before a sub-agent's pi starts makes that sub-agent register
   nothing; its task fails after the 2-minute grace.

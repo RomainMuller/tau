@@ -302,7 +302,8 @@ cancel │                                   │         │ owner gone  │ cla
    claims a sub-task of its active task, the sub-task becomes the active task.
    When the sub-task closes, the parent becomes the active task again.
 4. An agent must own a task before it can do work. Until then, `tau` blocks all
-   tools except the `tau_*` tools. See [Work gate](#work-gate).
+   tools except the `tau_*` tools (and the `askTool`, if you set one). See
+   [Work gate](#work-gate).
 5. Only the owner can **complete** or **fail** a task. The owner must give a
    `result`.
 6. An agent cannot give a task back. If it cannot do the task, it fails the
@@ -411,8 +412,9 @@ resume the lead session, `tau` compares the task owners with
 
 ### Work gate
 
-If an agent calls a tool that is not a `tau_*` tool, and it owns no
-`in_progress` task, `tau` blocks the call:
+If an agent calls a tool that is not a `tau_*` tool (or the
+[`askTool`](#set-the-ask-tool-asktool)), and it owns no `in_progress` task,
+`tau` blocks the call:
 
 ```text
 ✖ bash
@@ -452,6 +454,12 @@ system prompt tell the agent to do only that work.
 
 A lead that delegates all tasks owns no task while it waits. This is correct:
 it calls only `tau_*` tools.
+
+The work gate never blocks the [ask tool](#questions-to-the-user) that you
+set in `askTool` (see [Configuration](#configuration)): an agent with no
+active task (for example a lead that waits for its sub-agents) must be able
+to ask you a question. The gate blocks all other "ask question" tools while
+the agent has no active task.
 
 ---
 
@@ -594,7 +602,8 @@ An agent cannot stop while its task list has open work.
   `in_progress`.
 - **Sub-agent:** it cannot stop while its task is `in_progress`.
 
-When the agent tries to stop too early, `tau` sends a continuation message:
+When the agent tries to stop too early, `tau` sends a continuation message
+(this example is without an `askTool`; with one, the last line names it):
 
 ```text
 ⟳ tau: 5 tasks are open (T1, T2, T3, T2.1, T2.2). Continue the work. Do not stop before the work is done.
@@ -651,14 +660,44 @@ call, so it does not stop. In a sub-agent, the question shows in the sub-agent
 pane, and herdr shows that pane as `blocked`.
 
 `tau` adds a `<tau>` section to the system prompt. It tells the rule, and
-this instruction:
+this instruction (without an `askTool`):
 
 > To get an answer from the user, call an available "ask question" tool. Do
 > not end your turn to ask a question.
 
-#### If no "ask question" tool is available: `tau_ask_user`
+#### Set the ask tool: `askTool`
 
-If no "ask question" tool is available, the agent can call `tau_ask_user`
+Set `askTool` in the [configuration](#configuration) to the name of the "ask
+question" tool that the agents must use (for example `ask_user_question`).
+Then:
+
+1. `tau` does not register `tau_ask_user`: the models do not see it.
+2. The work gate never blocks this tool, also when the agent has no active
+   task.
+3. The `<tau>` section and the continuation messages tell the agent to call
+   this tool:
+
+   > To get an answer from the user, call the ask_user_question tool. Do not
+   > end your turn to ask a question.
+
+If the tool is not an active tool when a run starts (for example, its
+extension is not installed), `tau` shows a warning. It shows it one time
+after each start or `/reload` of `tau`. Then the agent cannot use this tool,
+and `tau_ask_user` is not available.
+
+> [!WARNING]
+> Set `askTool` only to a tool that asks you a question and does nothing
+> else. The work gate never blocks this tool: also when the agent has no
+> active task, and also for a read-only task. A tool that runs commands or
+> changes files (for example an MCP tool that calls other tools) then works
+> outside the gate. `tau` cannot know what a tool does from its name. If a
+> different extension registers a tool with this name, the gate allows that
+> tool too.
+
+#### If no "ask question" tool is set: `tau_ask_user`
+
+When `askTool` is not set, `tau` registers `tau_ask_user` as the last
+resort. If no "ask question" tool is available, the agent can call `tau_ask_user`
 with a plain-text question. The tool shows the question and ends the turn. The
 "do not stop" rule does not apply for this stop. Your next prompt is the
 answer, and the agent continues the work from there.
@@ -826,7 +865,7 @@ All tools exist only when herdr is available.
 | `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). |
 | `tau_send`      | Send a message to an agent, with a priority.                  |
 | `tau_note`      | Add a note to a task.                                         |
-| `tau_ask_user`  | Ask the user a question, then end the turn. Only when no other "ask question" tool is available. |
+| `tau_ask_user`  | Ask the user a question, then end the turn. Only when no other "ask question" tool is available. It does not exist when `askTool` is set. |
 
 ### `tau_list`
 
@@ -971,8 +1010,8 @@ an error and does not change the file.
 
 ### Fork
 
-When you fork a session (`/fork`, or `/clone`), the new session gets a copy
-of the task list. `tau` uses the `history` of each task to roll the copy back
+When you fork a session (`/fork`, `/clone`, or `pi --fork <session>`), the
+new session gets a copy of the task list. `tau` uses the `history` of each task to roll the copy back
 to its state at the fork point. Changes after the fork point are not in the
 copy. The task list of the original session does not change.
 
@@ -991,6 +1030,13 @@ a sub-agent task, the sub-agent task (and a `waiting` sub-task between them)
 stays open: close or cancel them, then `tau` fails the sub-agent task
 (rule 11). Messages between agents are not copied.
 
+The sub-agents of the original session continue their work after the fork.
+Nobody watches them while the original session is not open: their panes
+stay open when they finish. When you open the original session again, its
+liveness check ends these sub-agents, and closes their panes when this is
+safe (see [Liveness](#liveness)): herdr must show the sub-agent in its pane.
+Else the pane stays open, and you close it yourself.
+
 How `tau` finds the fork point: before each message enters the session of
 the lead (your prompts, the answers of the model, and the tool results),
 `tau` writes the revision of the task list into the session when it
@@ -1007,6 +1053,12 @@ The fork gets a new task list, and `tau` shows a warning, when:
   list of the old session.
 - The copy is too large for a task list (the failed tasks add changes).
 - `tau` cannot read the old task list.
+
+An exception: with `pi --fork <session>`, a session with no revision entry
+gets a new task list with no warning. pi gives the same start event for
+`pi --fork` and for a session that `/new` made (both have a parent
+session), so `tau` copies the list only when the session has a revision
+entry.
 
 The revision entries and the header of the old session file are not a
 security boundary: a program of your user that changes them can change what
@@ -1041,7 +1093,8 @@ that does not get a valid configuration from its lead does not work (see
 
 After `/reload`, the new configuration of the lead applies to the lead and
 to the sub-agents that start after it. Sub-agents that run already keep the
-configuration that they got. To use one configuration for all agents,
+configuration that they got. To use one
+configuration for all agents,
 change the file before you start the work.
 
 `tau` gives the configuration to a sub-agent in the arguments of a `herdr`
@@ -1057,6 +1110,7 @@ file is not valid JSON, `tau` uses the default configuration.
 | `maxTreeLines`         | An integer from 1 to 100.                                 |
 | `maxParallelSubAgents` | An integer from 1 to 32.                                  |
 | `maxIdleContinuations` | An integer from 0 to 100. With 0, the "do not stop" rule gives up at the first early stop. |
+| `askTool`              | The name of the "ask question" tool of a different extension: a letter, then `a-z`, `A-Z`, `0-9`, `_`, and `-` (at most 64 characters). Not a `tau_*` tool, and not a built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`). Not set by default. See [Set the ask tool](#set-the-ask-tool-asktool). |
 | `taskTypes`            | 1 to 50 types. A name starts with `a-z`, then has `a-z`, `0-9`, and `-` (at most 32 characters). Each type has a `description` (1 to 300 characters) and an optional `readOnly`. The list must have `plan`, the type of the first task `T0`. If one type is not valid, `tau` uses the default list. |
 
 ```jsonc
@@ -1076,6 +1130,11 @@ file is not valid JSON, `tau` uses the default configuration.
   // Number of continuations with no task change before tau stops the
   // "do not stop" rule and notifies you.
   "maxIdleContinuations": 3,
+
+  // The "ask question" tool of a different extension. When it is set, tau
+  // does not register tau_ask_user. Not set by default. Read the warning in
+  // "Set the ask tool" before you set it.
+  // "askTool": "ask_user_question",
 
   // Task types. This list replaces the default list.
   "taskTypes": {

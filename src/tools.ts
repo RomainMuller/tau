@@ -63,6 +63,12 @@ export interface TaskSession {
   readonly inbox?: {
     readonly hasMessages: () => Promise<boolean>;
   };
+  /**
+   * The configured "ask question" tool of a different extension. When it is
+   * set, tau does not register `tau_ask_user` (the last resort), and the
+   * work gate never blocks this tool.
+   */
+  readonly askTool?: string | undefined;
   /** Called when the agent asks the user a question with `tau_ask_user`. */
   readonly onAskUser?: (question: string, ctx: ExtensionContext | undefined) => void;
 }
@@ -590,7 +596,10 @@ export function conflictingTools(pi: ExtensionAPI): string[] {
 
 /** Registers the task tools. */
 export function registerTaskTools(pi: ExtensionAPI, session: TaskSession): void {
-  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), sendSpec(), abortSpec(), askSpec()]) {
+  // tau_ask_user is the last resort: the model does not see it when the
+  // configuration names a different ask tool.
+  const ask = session.askTool === undefined ? [askSpec()] : [];
+  for (const spec of [...specs(session.taskTypes), ...delegationSpecs(), sendSpec(), abortSpec(), ...ask]) {
     pi.registerTool({
       name: spec.name,
       label: spec.label,

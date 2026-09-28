@@ -134,18 +134,22 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       if (isSubAgent(env)) failClosed(ctx, "This sub-agent cannot use herdr.");
       return;
     }
+    // Read the configuration before the task list: after the last await
+    // below, the registration must run without an await (see the checks).
+    const { config, file: configFile, problems, fatal } = await configFor(env, tauDir(deps.agentDir()));
+    if (shutDown) return;
+    if (fatal !== undefined) {
+      failClosed(ctx, fatal);
+      return;
+    }
+    // All tau names, also tau_ask_user when askTool is set: the gate and the
+    // message delivery know the tau tools by name, so a tool of a different
+    // extension with a tau name must not exist.
     const conflicts = conflictingTools(pi);
     if (conflicts.length > 0) {
       const message = `A different extension has tools with the names of tau tools (${conflicts.join(", ")}). tau does not register its tools or its work gate.`;
       if (isSubAgent(env)) failClosed(ctx, message);
       else report(ctx, message);
-      return;
-    }
-    // Read the configuration before the task list: after the last await
-    // below, the registration must run without an await (see the checks).
-    const { config, file: configFile, problems, fatal } = await configFor(env, tauDir(deps.agentDir()));
-    if (fatal !== undefined) {
-      failClosed(ctx, fatal);
       return;
     }
     const opened = await openTaskList(ctx, deps, status.pane.paneId, event);
@@ -208,13 +212,14 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       maxIdleContinuations: config.maxIdleContinuations,
       actor: identity.actor,
       read: () => store.read(),
-      askToolActive: () => pi.getActiveTools().includes(ASK_TOOL),
+      askTool: () => activeAskTool(config.askTool, pi.getActiveTools()),
     });
     session = {
       store,
       actor: identity.actor,
       now: deps.now,
       taskTypes: config.taskTypes,
+      askTool: config.askTool,
       onChange: () => void tree.refresh(),
       delegation: {
         herdr,
@@ -256,7 +261,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     // give the delivery a function that reads its state.
     let continuationPending: () => boolean = () => false;
     registerMessageDelivery(pi, inbox, guard, () => continuationPending());
-    registerStopRule(pi, guard, identity.actor);
+    registerStopRule(pi, guard, identity.actor, config.askTool);
     continuationPending = registerContinuationTracker(pi);
     if (identity.role === "lead") registerRevisionRecord(pi, store);
     registerCommands(pi, store, tree, badgeLabel(status, identity), {
@@ -324,7 +329,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
  */
 function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
   pi.on("tool_call", async (event) => {
-    if (TASK_TOOL_NAMES.has(event.toolName)) {
+    // The ask tool only reads an answer of the user: also when tau cannot
+    // read the task list, the agent can ask the user what to do.
+    if (TASK_TOOL_NAMES.has(event.toolName) || event.toolName === session.askTool) {
       return undefined;
     }
     let reason: string | undefined;
@@ -339,6 +346,7 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
               list,
               agent: session.actor.name,
               taskTypes: session.taskTypes,
+              askTool: session.askTool,
             });
     } catch (error) {
       reason = `tau blocked the tool: it cannot read the task list (${error instanceof Error ? error.message : String(error)}).`;
@@ -449,10 +457,20 @@ export const MAX_MESSAGE_CONTINUATIONS = 5;
  * tau adds a continuation message when the agent has open work, and asks pi
  * for one more model request.
  */
-function registerStopRule(pi: ExtensionAPI, guard: StopGuard, actor: Actor): void {
-  pi.on("before_agent_start", (event) => {
-    const askToolActive = event.systemPromptOptions.selectedTools.includes(ASK_TOOL);
-    event.systemPromptOptions.sections[PROMPT_SECTION] = promptSection(actor, askToolActive);
+function registerStopRule(pi: ExtensionAPI, guard: StopGuard, actor: Actor, configuredAskTool: string | undefined): void {
+  let warned = false;
+  pi.on("before_agent_start", (event, ctx) => {
+    const askTool = activeAskTool(configuredAskTool, event.systemPromptOptions.selectedTools);
+    event.systemPromptOptions.sections[PROMPT_SECTION] = promptSection(actor, askTool);
+    if (configuredAskTool !== undefined && askTool === undefined && !warned) {
+      // Tell it one time for each load of tau (a /reload tells it again).
+      warned = true;
+      report(
+        ctx,
+        `The ask tool ${configuredAskTool} (askTool in the configuration) is not an active tool. The agent cannot use it, and tau_ask_user is not available. Install the extension of this tool, or change askTool.`,
+        "warning",
+      );
+    }
     return undefined;
   });
   // Input from the user (in the terminal, or from an RPC client) starts the
@@ -512,8 +530,9 @@ async function openTaskList(
     if (identity.role === "lead") {
       let seed = () => seedTaskList(sessionId, deps.now());
       // A fork: a copy of the task list of the old session, at the fork point.
-      if (event.reason === "fork" && event.previousSessionFile !== undefined && (await store.read()) === undefined) {
-        const forked = await forkedList(ctx, deps, sessionId, event.previousSessionFile);
+      const source = forkSource(ctx, event);
+      if (source !== undefined && (await store.read()) === undefined) {
+        const forked = await forkedList(ctx, deps, sessionId, source);
         if (forked !== undefined) seed = () => forked;
       }
       await store.ensure(seed);
@@ -534,6 +553,31 @@ async function openTaskList(
     report(ctx, error instanceof TauError ? error.message : `tau cannot open the task list: ${String(error)}`);
     return undefined;
   }
+}
+
+/**
+ * The session file that this session is a fork of, or `undefined` when it is
+ * not a fork:
+ *
+ * - `/fork` and `/clone` give the reason `fork`, with the old session file.
+ * - `pi --fork <session>` starts a new process: the reason is `startup`, and
+ *   the header of the new session tells the old session file.
+ *
+ * The caller copies the list only when this session has no list yet: so a
+ * later start of a forked session does not copy the list again.
+ */
+function forkSource(
+  ctx: ExtensionContext,
+  event: { readonly reason?: string; readonly previousSessionFile?: string | undefined },
+): string | undefined {
+  if (event.reason === "fork") return event.previousSessionFile;
+  if (event.reason !== "startup") return undefined;
+  const parent = ctx.sessionManager.getHeader?.()?.parentSession;
+  if (typeof parent !== "string" || parent === "") return undefined;
+  // pi also sets parentSession for a new session (/new), which is not a
+  // fork. A fork has a copy of the entries of its old session, with the
+  // revision records of tau.
+  return forkRevision(ctx.sessionManager.getBranch()) === undefined ? undefined : parent;
 }
 
 /**
@@ -607,6 +651,15 @@ function registerRevisionRecord(pi: ExtensionAPI, store: TaskListStore): void {
   // A compaction entry has no message_end: record before it too (a clone at
   // the compaction entry must have the changes up to it).
   pi.on("session_before_compact", record);
+}
+
+/**
+ * The name of the tool that asks the user a question, when it is one of the
+ * `active` tools: the configured ask tool, else `tau_ask_user`.
+ */
+function activeAskTool(configured: string | undefined, active: readonly string[]): string | undefined {
+  const name = configured ?? ASK_TOOL;
+  return active.includes(name) ? name : undefined;
 }
 
 /** True when this process is a tau sub-agent (its parent set `TAU_TASKLIST`). */

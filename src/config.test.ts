@@ -58,7 +58,7 @@ describe("parseConfig", () => {
     assert.deepEqual(parseConfig("{}"), { config: DEFAULT_CONFIG, problems: [] });
   });
 
-  it("reads all fields of the README example", () => {
+  it("reads all fields (as in the README example, with askTool set)", () => {
     const { config, problems } = parseConfig(`{
       // Key that shows or hides completed and canceled tasks.
       "toggleCompletedKey": "ctrl+shift+y",
@@ -66,6 +66,8 @@ describe("parseConfig", () => {
       "maxTreeLines": 8,
       "maxParallelSubAgents": 2,
       "maxIdleContinuations": 5,
+      // "askTool" is commented out in the README example.
+      "askTool": "ask_user_question",
       "taskTypes": {
         "plan":  { "description": "Make or change the task list." },
         "spike": { "description": "Try an idea.", "readOnly": true }
@@ -78,6 +80,7 @@ describe("parseConfig", () => {
       maxTreeLines: 8,
       maxParallelSubAgents: 2,
       maxIdleContinuations: 5,
+      askTool: "ask_user_question",
       taskTypes: {
         plan: { description: "Make or change the task list.", readOnly: false },
         spike: { description: "Try an idea.", readOnly: true },
@@ -234,6 +237,40 @@ describe("loadConfig", () => {
     const loaded = await loadConfig(dir);
     assert.deepEqual(loaded.config, DEFAULT_CONFIG);
     assert.match(loaded.problems[0] ?? "", /has more than 65536 bytes/);
+  });
+});
+
+describe("askTool", () => {
+  it("is not set by default, and keeps a valid tool name", () => {
+    assert.equal(DEFAULT_CONFIG.askTool, undefined);
+    assert.equal(parseConfig("{}").config.askTool, undefined);
+    for (const name of ["ask_user_question", "AskUser", "ask-user", `a${"b".repeat(63)}`]) {
+      const { config, problems } = parseConfig(JSON.stringify({ askTool: name }));
+      assert.deepEqual(problems, [], name);
+      assert.equal(config.askTool, name);
+    }
+  });
+
+  it("refuses names that are not valid, tau tools, and built-in tools", () => {
+    for (const value of ["", "1ask", "_ask", "ask user", "ask\u001b[31m", `a${"b".repeat(64)}`, "tau_ask_user", "tau_list", "bash", "edit", "write", "read", 3, null, true]) {
+      const { config, problems } = parseConfig(JSON.stringify({ askTool: value }));
+      assert.equal(config.askTool, undefined, JSON.stringify(value));
+      assert.equal(problems.length, 1, JSON.stringify(value));
+      assert.match(problems[0]!, /^askTool must be the name of an "ask question" tool of a different extension/);
+    }
+  });
+
+  it("goes to sub-agents in TAU_CONFIG", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "tau-config-"));
+    try {
+      const inherited = await configFor({ TAU_TASKLIST: "/x.db", TAU_CONFIG: JSON.stringify({ ...DEFAULT_CONFIG, askTool: "ask_user_question" }) }, dir);
+      assert.equal(inherited.config.askTool, "ask_user_question");
+      assert.equal(inherited.fatal, undefined);
+      // Without the field, a sub-agent has no ask tool of the configuration.
+      assert.equal((await configFor({ TAU_TASKLIST: "/x.db", TAU_CONFIG: JSON.stringify(DEFAULT_CONFIG) }, dir)).config.askTool, undefined);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
