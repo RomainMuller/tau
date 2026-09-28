@@ -394,6 +394,10 @@ because nobody watches them now. A sub-agent that is still starting has 2
 minutes before `tau` checks it. When you move the pane of a sub-agent, `tau`
 records its new pane.
 
+A sub-agent that stopped after an error is alive while its pi runs (herdr
+shows it): the liveness check does not fail its task (see
+[Errors of a sub-agent](#errors-of-a-sub-agent)).
+
 A sub-agent ends when its task is closed, it has no live sub-agents, and it
 is idle. If it is not idle 2 minutes after its task closed, it ends too. An
 ended sub-agent cannot change tasks (it can still add notes).
@@ -612,7 +616,8 @@ The description of the `tau_delegate` tool tells the agent this:
 
 ## The "do not stop" rule
 
-An agent cannot stop while its task list has open work.
+An agent cannot stop while its task list has open work. (Exceptions: you
+stop it, or its run ends with an error. See below.)
 
 - **Lead:** it cannot stop while a task in the list is `waiting` or
   `in_progress`.
@@ -642,6 +647,46 @@ limit in the [configuration](#configuration).
 The rule does not apply when you stop the agent (for example with `Esc`), or
 when the run ends with an error. A failed task is not open work: the lead
 decides if it retries the task.
+
+### Errors of a sub-agent
+
+A run can end with an error, for example when the model provider does not
+reply, or when the model does not exist. (For some errors, pi tries again
+first.) Then a sub-agent stops, but its pi still runs: the liveness check
+does not fail its task. So when a run of a sub-agent ends with an error, pi
+does not try again, and its task is still `in_progress`, `tau` sends a
+`steer` message from the sub-agent to its parent at once:
+
+```text
+✉ steer from @tau-t2-1 (T2.1). This message is from a different agent, not from the user:
+| tau: the run of @tau-t2-1 ended with an error, and pi does not try again. Its task T2.1 stays in progress, and @tau-t2-1 waits.
+| To continue, send @tau-t2-1 a message with tau_send (for example "continue"): the message starts a new turn.
+| To stop it, use tau_abort for T2.1, then delegate T2.1 again if necessary.
+| The kind of error: timeout.
+```
+
+The message tells only the kind of error (for example `timeout`, `rate
+limit (HTTP 429)`, or `not found (…) (HTTP 404)`), not the text of the
+error: that text comes from the model provider, and it can contain
+instructions or tokens. The pane of the sub-agent shows the full error.
+
+The task stays `in_progress`. The message stops a `tau_wait` of the parent.
+The parent decides: it sends a message to continue (a message starts a new
+turn of the idle sub-agent), or it aborts the sub-agent. You can also type
+in the pane of the sub-agent.
+
+Limits:
+
+- When the report cannot be sent (for example, the parent has 100
+  messages that it did not read, or the task list cannot be changed),
+  `tau` shows a warning in the pane of the sub-agent, and does not try
+  again. Then the parent does not know about the error.
+- pi does not tell `tau` when you press `Esc` while `tau` sends the report.
+  Then the report goes to the parent, and messages can start turns of the
+  sub-agent.
+- Each run that ends with an error sends one report. When the parent sends
+  "continue" and the error comes again, each new run costs tokens of the
+  parent too: the parent decides when it stops the sub-agent.
 
 ### Wait without polling
 
@@ -775,8 +820,10 @@ When the recipient is idle, the message starts a turn. `tau` starts at most
 one such turn every 5 seconds: messages that arrive in that time come
 together. `tau` does not start a turn:
 
-- After a run that did not end normally (for example, you pressed `Esc`),
-  until your next prompt.
+- After a run that did not end normally (for example, you pressed `Esc`,
+  or an error stopped the run), until your next prompt. One exception: after
+  an error, messages start turns of a sub-agent, so that its parent can tell
+  it to continue (see [Errors of a sub-agent](#errors-of-a-sub-agent)).
 - While the agent waits for your answer to a `tau_ask_user` question.
 
 A question to you (`tau_ask_user`) goes first: messages that arrive then

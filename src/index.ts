@@ -4,7 +4,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 
 import { badgeText, WIDGET_KEY, widgetLines } from "./badge.ts";
 import { Inbox } from "./inbox.ts";
-import { MESSAGE_TYPE, messagesText } from "./messages.ts";
+import { checkRecipient, MESSAGE_TYPE, messagesText } from "./messages.ts";
 import { registerCommands } from "./commands.ts";
 import { configFor } from "./config.ts";
 import { checkGate } from "./gate.ts";
@@ -264,9 +264,11 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     // the delivery reads it in agent_settled: register the tracker last, and
     // give the delivery a function that reads its state.
     let continuationPending: () => boolean = () => false;
-    registerMessageDelivery(pi, inbox, guard, () => continuationPending());
+    registerMessageDelivery(pi, inbox, guard, () => continuationPending(), identity.role === "subagent");
     registerStopRule(pi, guard, identity.actor, config.askTool);
     continuationPending = registerContinuationTracker(pi);
+    // After the tracker: the report needs the final decision of the boundary.
+    if (identity.role === "subagent") registerErrorReport(pi, session, identity.parent);
     if (identity.role === "lead") registerRevisionRecord(pi, store);
     registerCommands(pi, store, tree, badgeLabel(status, identity), {
       toggleKey: config.toggleCompletedKey,
@@ -379,6 +381,8 @@ function registerMessageDelivery(
   inbox: Inbox,
   guard: StopGuard,
   continuationPending: () => boolean,
+  /** True for a sub-agent: after an error, a message starts a new turn (see `registerErrorReport`). */
+  resumeAfterError: boolean,
 ): void {
   /** Continuations for messages since the last user input. See `MAX_MESSAGE_CONTINUATIONS`. */
   let continuations = 0;
@@ -399,13 +403,16 @@ function registerMessageDelivery(
   });
   // True after a settle boundary with the outcome `completed`, until the next
   // turn ends. pi skips the boundary after an abort: then this stays false.
+  // For a sub-agent, also after an error: its parent gets a report, and a
+  // message of the parent (for example "continue") starts a new turn. The
+  // lead stays paused after an error, until the next input of the user.
   let settledNormally = false;
   pi.on("turn_end", () => {
     settledNormally = false;
     return undefined;
   });
   pi.on("agent_before_settle", async (event) => {
-    settledNormally = event.outcome === "completed";
+    settledNormally = event.outcome === "completed" || (resumeAfterError && event.outcome === "error");
     if (event.outcome !== "completed" || event.continue) return undefined;
     if (guard.awaitingAnswer) {
       inbox.pause();
@@ -450,6 +457,87 @@ function registerContinuationTracker(pi: ExtensionAPI): () => boolean {
     pending = false;
   });
   return () => pending;
+}
+
+/**
+ * The kind of a model provider error, for the parent. The raw error text
+ * comes from outside (the provider): it can have instructions, request IDs,
+ * or tokens, so the parent gets only this fixed text (the pane of the
+ * sub-agent shows the raw error).
+ */
+export function errorKind(error: string): string {
+  const status = /\b([45]\d\d)\b/u.exec(error)?.[1];
+  const withStatus = (kind: string) => (status === undefined ? kind : `${kind} (HTTP ${status})`);
+  if (status === "429" || /rate.?limit/iu.test(error)) return withStatus("rate limit");
+  if (status === "401" || status === "403" || /unauthori[sz]ed|forbidden|api key|credential/iu.test(error)) {
+    return withStatus("authentication or permission error");
+  }
+  if (status === "404" || /not.?found/iu.test(error)) return withStatus("not found (for example, the model does not exist: delegate with a different model)");
+  if (/timed? ?out/iu.test(error)) return withStatus("timeout");
+  if (/connection|network|econn|fetch failed|socket/iu.test(error)) return withStatus("connection error");
+  if (status?.startsWith("5") === true || /overloaded|unavailable/iu.test(error)) return withStatus("provider error");
+  return withStatus("other error");
+}
+
+/**
+ * Tells the parent of a sub-agent when a run of the sub-agent ends with an
+ * error, and its task is still in progress: else the sub-agent stays idle,
+ * and nobody fails its task (it is alive). The task stays in progress. The
+ * parent decides: it sends a message to continue (a message starts a turn
+ * of the idle sub-agent, see `registerMessageDelivery`), or it stops the
+ * sub-agent with tau_abort.
+ *
+ * tau sends the report in `agent_settled`: pi fires it after all retries and
+ * continuations. Register this after all other `agent_before_settle`
+ * handlers of tau. When a different extension continues the run, the next
+ * `turn_start` clears the report.
+ */
+function registerErrorReport(pi: ExtensionAPI, session: TaskSession, parent: string): void {
+  const self = session.actor.name;
+  const scope = session.actor.scope;
+  let lastError: string | undefined;
+  /** The error kind of a boundary with the outcome `error` that did not continue. */
+  let pending: string | undefined;
+  pi.on("turn_start", () => {
+    pending = undefined;
+  });
+  pi.on("turn_end", (event) => {
+    const message = event.message as { readonly role?: string; readonly stopReason?: string; readonly errorMessage?: unknown } | undefined;
+    if (message?.role === "assistant") {
+      lastError = message.stopReason === "error" ? String(message.errorMessage ?? "") : undefined;
+    }
+    return undefined;
+  });
+  pi.on("agent_before_settle", (event) => {
+    pending = event.outcome === "error" && !event.continue ? errorKind(lastError ?? "") : undefined;
+    return undefined;
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    const kind = pending;
+    pending = undefined;
+    if (kind === undefined || scope === undefined) return;
+    const text = [
+      `tau: the run of @${self} ended with an error, and pi does not try again. Its task ${scope} stays in progress, and @${self} waits.`,
+      `To continue, send @${self} a message with tau_send (for example "continue"): the message starts a new turn.`,
+      `To stop it, use tau_abort for ${scope}, then delegate ${scope} again if necessary.`,
+      `The kind of error: ${kind}.`,
+    ].join("\n");
+    try {
+      await session.store.sendMessage({ sender: self, recipient: parent, priority: "steer", text, sentAt: session.now() }, (list) => {
+        const task = list.tasks.find((item) => item.id === scope);
+        if (task?.status !== "in_progress" || task.owner !== self) {
+          throw new TauError("invalid_state", `The task ${scope} is not in progress for @${self}.`);
+        }
+        checkRecipient(list, self, parent);
+        return { senderTask: scope };
+      });
+      session.onChange?.();
+    } catch (error) {
+      if (!(error instanceof TauError && error.code === "invalid_state")) {
+        report(ctx, `tau could not tell @${parent} about the error (${error instanceof Error ? cleanLine(error.message) : String(error)}).`, "warning");
+      }
+    }
+  });
 }
 
 /** The maximum number of continuations for messages between two user inputs. */

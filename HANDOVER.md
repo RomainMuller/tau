@@ -5,7 +5,7 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 475
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 478
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
 3. All README steps are built (section 8). Ask Romain what comes next (for
@@ -68,7 +68,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `stysslnx` | `adbd6384` | feat: copy the task list at a session fork                |
 | `oowynxku` | `6370cd11` | fix: copy the list for pi --fork, and add askTool         |
 | `pusnsqqy` | `a2be470d` | fix: resend a lost first prompt, and trust own task text  |
-| `kwumsxzr` | (see log)  | fix: give the first prompt as a pi argument               |
+| `kwumsxzr` | `e2508b85` | fix: give the first prompt as a pi argument               |
+| `wyuwqoom` | (see log)  | feat: tell the parent when a sub-agent run fails          |
 
 The working copy after that is empty.
 
@@ -186,11 +187,25 @@ says "Status: DRAFT".
   that cannot send the prompt (no login) stays idle, and the start fails
   (retryable). A very fast agent that herdr shows as idle before its task is
   complete makes a false failure (not seen live).
-  Open: an error later in a run (for example gateway timeouts, seen live)
-  leaves pi idle with the task in progress; the supervisor sees a live
-  agent, so nothing fails the task, and `tau_wait` of the parent waits. A sub-agent
-  that fails closed also returns `{ action: "handled" }` for `input`, so the
-  first prompt does not reach the model. `HerdrClient.prompt` is removed.
+- Errors of a sub-agent (Romain's design: tell the parent, keep the task,
+  no grace time). `registerErrorReport` in `index.ts` (sub-agents only,
+  registered after the continuation tracker): `turn_end` keeps the
+  `errorMessage` of an assistant message with `stopReason: "error"`;
+  `agent_before_settle` with `outcome: "error"` and no continue marks a
+  report; `turn_start` clears it (a different extension continued);
+  `agent_settled` sends a `steer` message to the parent when the own task
+  is in progress. The message has a fixed kind (`errorKind`: timeout, rate
+  limit, auth, not found, connection, provider, other, + HTTP status), not
+  the raw provider text (it can have instructions or tokens). The inbox of
+  a sub-agent does not pause after an error (the lead's does): a message of
+  the parent ("continue") starts a new turn. Tested live (before the
+  errorKind change): a 404 model -> report -> the lead's tau_wait returned
+  -> "continue" started a new turn -> a second report -> the lead aborted
+  and delegated again. Limits (README): a report that cannot be sent is a
+  warning only; Esc during the report is not seen; one report per error
+  run. The continuation of the lead after the report still says "use
+  tau_wait". Errors before pi starts the turn (no login) have no settle:
+  `waitForWork` covers the first prompt only.
 - Own task text (F4, seen in a live test: a sub-agent asked if its task was a prompt
   injection): `descriptionIsWork` in `format.ts`. The description is "the
   work of your task" only for the owner of an in-progress task, when the
@@ -252,7 +267,8 @@ says "Status: DRAFT".
     `tool_result` (steer for every tool, all for `tau_*`; not for a
     successful `tau_ask_user`) and `agent_before_settle` (before the stop
     rule; at most 5 message continuations between user inputs). The inbox
-    pauses after a run that did not settle normally, and while a question
+    pauses after a run that did not settle normally (for a sub-agent: not
+    after an error, see "Errors of a sub-agent"), and while a question
     waits; user input resumes it. pi emits no abort event: an Esc is found
     when no settle boundary completed after the last turn, or when the last
     boundary asked to continue and no `turn_start` came

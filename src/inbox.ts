@@ -15,7 +15,8 @@
  * poll does not do this:
  *
  * - After a run that did not end normally (for example, the user pressed
- *   `Esc`), until the next input of the user.
+ *   `Esc`), until the next input of the user. Exception: a sub-agent after
+ *   an error (its parent can tell it to continue; see `index.ts`).
  * - While the agent waits for an answer of the user (`tau_ask_user`).
  * - More than one time in `MIN_TURN_GAP_MS`, so that many messages do not
  *   start many turns.
