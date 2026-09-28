@@ -82,6 +82,7 @@ export class Supervisor {
   readonly #createdPanes: Set<string>;
   #timer: ReturnType<typeof setInterval> | undefined;
   #running: Promise<void> | undefined;
+  #stopped = false;
   /** Panes to close. A failed close stays here for the next check. */
   #toClose = new Map<string, PaneToClose>();
   /** Requested panes that tau did not close, because it was not safe (at most the last 100). */
@@ -93,12 +94,14 @@ export class Supervisor {
   }
 
   start(): void {
-    if (this.#timer !== undefined) return;
+    if (this.#timer !== undefined || this.#stopped) return;
     this.#timer = setInterval(() => void this.check(), this.#options.intervalMs ?? SUPERVISE_MS);
     this.#timer.unref?.();
   }
 
+  /** Stops the checks. After this, `check` and `checkAgain` start no new check. */
   stop(): void {
+    this.#stopped = true;
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
   }
@@ -132,8 +135,14 @@ export class Supervisor {
     return this.#kept.has(pane) ? "kept" : "closed";
   }
 
+  /** Waits for the check that runs now, if one runs. */
+  async drain(): Promise<void> {
+    await this.#running;
+  }
+
   /** Runs one check. Two calls at the same time share one check. */
   check(): Promise<void> {
+    if (this.#stopped) return this.#running ?? Promise.resolve();
     this.#running ??= this.#check()
       .catch(() => {
         // The next check tries again. herdr or the store can fail for a

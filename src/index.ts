@@ -13,14 +13,17 @@ import { detectHerdr, type Exec, type HerdrStatus } from "./herdr.ts";
 import { checkSubAgent, ENV_TASKLIST, resolveIdentity, type Identity } from "./identity.ts";
 import { Supervisor } from "./supervisor.ts";
 import { TauError } from "./tasks/errors.ts";
-import { seedTaskList } from "./tasks/model.ts";
+import { seedTaskList, type TaskList } from "./tasks/model.ts";
 import { tauDir } from "./tasks/paths.ts";
 import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
 import { setAgentSession, type Actor } from "./tasks/rules.ts";
-import { TaskListStore } from "./tasks/store.ts";
+import { MAX_FILE_BYTES, TaskListStore } from "./tasks/store.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
 import { cleanLine } from "./text.ts";
 import { TreeWidget } from "./widget.ts";
+import { forkRevision, forkTaskList, REVISION_ENTRY, sessionIdOf } from "./fork.ts";
+import { taskListFile } from "./tasks/paths.ts";
+import { encodeTaskList } from "./tasks/codec.ts";
 
 /** Things that tests can replace. */
 export interface TauDependencies {
@@ -107,7 +110,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   /** True after session_shutdown. A session_start that still waits then stops. */
   let shutDown = false;
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     // Keep the promise, not the result, so that two events that start at the
     // same time share one herdr call.
     detection ??= detectHerdr(exec);
@@ -145,7 +148,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       failClosed(ctx, fatal);
       return;
     }
-    const opened = await openTaskList(ctx, deps, status.pane.paneId);
+    const opened = await openTaskList(ctx, deps, status.pane.paneId, event);
     const store = opened?.store;
     if (shutDown) {
       store?.close();
@@ -255,6 +258,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     registerMessageDelivery(pi, inbox, guard, () => continuationPending());
     registerStopRule(pi, guard, identity.actor);
     continuationPending = registerContinuationTracker(pi);
+    if (identity.role === "lead") registerRevisionRecord(pi, store);
     registerCommands(pi, store, tree, badgeLabel(status, identity), {
       toggleKey: config.toggleCompletedKey,
       pills: config.idPills,
@@ -279,8 +283,11 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     widget?.stop();
     supervisor?.stop();
     messageInbox?.stop();
-    // A poll can run now: wait for it before the store closes.
-    await messageInbox?.drain();
+    // A poll, a check, or a refresh can run now: wait for them before the
+    // store closes. The inbox and the supervisor can start a refresh of the
+    // tree when they end: so wait for the tree last.
+    await Promise.all([messageInbox?.drain(), supervisor?.drain()]);
+    await widget?.drain();
     session?.store.close();
     if (herdrClient !== undefined && paneOfThisAgent !== undefined && identity !== undefined) {
       // The pane can stay open after pi stops: remove the tau metadata. Wait
@@ -495,6 +502,7 @@ async function openTaskList(
   ctx: ExtensionContext,
   deps: TauDependencies,
   paneId: string,
+  event: { readonly reason?: string; readonly previousSessionFile?: string | undefined } = {},
 ): Promise<{ store: TaskListStore; identity: Identity } | undefined> {
   let store: TaskListStore | undefined;
   try {
@@ -502,7 +510,13 @@ async function openTaskList(
     const identity = resolveIdentity(deps.env ?? process.env, tauDir(deps.agentDir()), sessionId);
     store = new TaskListStore(identity.file);
     if (identity.role === "lead") {
-      await store.ensure(() => seedTaskList(sessionId, deps.now()));
+      let seed = () => seedTaskList(sessionId, deps.now());
+      // A fork: a copy of the task list of the old session, at the fork point.
+      if (event.reason === "fork" && event.previousSessionFile !== undefined && (await store.read()) === undefined) {
+        const forked = await forkedList(ctx, deps, sessionId, event.previousSessionFile);
+        if (forked !== undefined) seed = () => forked;
+      }
+      await store.ensure(seed);
     } else {
       const list = await store.read();
       if (list === undefined) {
@@ -520,6 +534,79 @@ async function openTaskList(
     report(ctx, error instanceof TauError ? error.message : `tau cannot open the task list: ${String(error)}`);
     return undefined;
   }
+}
+
+/**
+ * The task list of a forked session: the list of the old session, rolled back
+ * to the fork point (see `fork.ts`). `undefined` when the old session has no
+ * task list. When tau cannot read it, it tells the user, and the fork gets a
+ * new list.
+ */
+async function forkedList(
+  ctx: ExtensionContext,
+  deps: TauDependencies,
+  sessionId: string,
+  previousSessionFile: string,
+): Promise<TaskList | undefined> {
+  const oldId = await sessionIdOf(previousSessionFile);
+  if (oldId === undefined || oldId === sessionId) return undefined;
+  let old: TaskListStore | undefined;
+  try {
+    old = new TaskListStore(taskListFile(tauDir(deps.agentDir()), oldId));
+    const list = await old.read();
+    if (list === undefined) return undefined;
+    const warn = (reason: string) => {
+      report(ctx, `tau does not copy the task list of the old session: ${reason} The fork gets a new task list.`, "warning");
+      return undefined;
+    };
+    if (list.sessionId !== oldId) return warn("its task list belongs to a different session.");
+    const revision = forkRevision(ctx.sessionManager.getBranch());
+    if (revision === undefined) return warn("tau cannot find the fork point (the session has no revision record before it).");
+    if (revision < 1 || revision > list.revision) return warn(`the fork point (revision ${revision}) is not in its task list.`);
+    const forked = forkTaskList(list, revision, sessionId, deps.now());
+    // The copy has more events (the failed tasks): it must fit in the store.
+    if (Buffer.byteLength(encodeTaskList(forked)) > MAX_FILE_BYTES) return warn("the copy is too large.");
+    return forked;
+  } catch (error) {
+    report(
+      ctx,
+      `tau cannot copy the task list of the old session (${error instanceof Error ? cleanLine(error.message) : String(error)}). The fork gets a new task list.`,
+      "warning",
+    );
+    return undefined;
+  } finally {
+    old?.close();
+  }
+}
+
+/**
+ * Writes the revision of the task list into the session of the lead when it
+ * changed (see `fork.ts`). So a fork knows the state of the list at its fork
+ * point.
+ *
+ * tau does this in `message_end`, for each message (the user prompt, the
+ * answers of the model, and the tool results): pi runs this event before it
+ * writes the message into the session. So the revision entry comes before
+ * each message entry, and a fork at any message has the changes up to it
+ * (also the changes of sub-agents while the lead was idle).
+ */
+function registerRevisionRecord(pi: ExtensionAPI, store: TaskListStore): void {
+  let recorded: number | undefined;
+  const record = async (): Promise<undefined> => {
+    const list = await store.read().catch(() => undefined);
+    if (list === undefined || list.revision === recorded) return undefined;
+    try {
+      pi.appendEntry(REVISION_ENTRY, { revision: list.revision });
+      recorded = list.revision;
+    } catch {
+      // The next message tries again.
+    }
+    return undefined;
+  };
+  pi.on("message_end", record);
+  // A compaction entry has no message_end: record before it too (a clone at
+  // the compaction entry must have the changes up to it).
+  pi.on("session_before_compact", record);
 }
 
 /** True when this process is a tau sub-agent (its parent set `TAU_TASKLIST`). */

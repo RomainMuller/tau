@@ -5,11 +5,12 @@ what is done, how the code is organized, how we work, and what comes next.
 
 ## 1. First action for the new session
 
-1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 438
+1. Run `npm run check` in `~/Development/RomainMuller/tau` (typecheck + 457
    tests, about 15 s). All must pass.
 2. Run `jj log -r '::@' --limit 10` to see the commits below.
-3. Ask Romain which next step to start (see section 8). The proposal is
-   fork (section 8, item 1), the last planned step.
+3. All README steps are built (section 8). Ask Romain what comes next (for
+   example: a live test pass of the open gaps in section 9, a README clean-up
+   from DRAFT, or publishing).
 
 ## 2. What tau is
 
@@ -63,7 +64,8 @@ yet). Local run: `pi -e ./src/index.ts` from the repo, inside a herdr pane.
 | `tmrzoyxo` | `2676a1d7` | feat: add the do-not-stop rule and tau_ask_user           |
 | `xnnzlppn` | `95d5be63` | feat: add tau_abort to stop sub-agents                    |
 | `tvkpmnvr` | `4ed71080` | feat: add agent messages with tau_send                    |
-| `ytlvsqzr` | (see log)  | feat: read the tau configuration file                     |
+| `ytlvsqzr` | `59bbee67` | feat: read the tau configuration file                     |
+| `stysslnx` | (see log)  | feat: copy the task list at a session fork                |
 
 The working copy after that is empty.
 
@@ -82,6 +84,7 @@ The working copy after that is empty.
 | `stop.ts` | "Do not stop" rule. `openWork` (lead: all open tasks; sub-agent: its scope while its task is in progress), `continuationText` (task IDs, statuses, and tau-made agent names only: no agent text, because it is a user-role message; never a `tau_wait` for own tasks), `promptSection` (the `<tau>` system prompt section), `StopGuard` (idle count by list `revision`, give up after 3, ask exemption). |
 | `messages.ts` | Messages: `checkRecipient` (sub-agents at any depth, parent, siblings; ended agents refused), `checkMessageText`, `messagesText` (header + `\| ` quote, `cleanText`). |
 | `inbox.ts` | `Inbox`: delivers only while the agent is idle (`pi.sendMessage` with `triggerTurn`), at most one turn per 5 s, `pause`/`resume`, gives messages back (`untakeMessages`) when the state changed or the delivery threw, `stop`/`drain`. |
+| `fork.ts` | Fork copy: `REVISION_ENTRY` custom entries (written by `index.ts` `registerRevisionRecord` in `message_end` of each message and in `session_before_compact`, lead only), `forkRevision(branch)`, `forkTaskList` (rollback; sub-agent tasks failed `owner is in a different session`, their waiting sub-tasks canceled; records ended), `sessionIdOf(file)`. `index.ts` `forkedList` checks the header ID, the stored `sessionId`, the revision range 1..N, and the copy size; else a warning and a new list. |
 | `config.ts` | `~/.pi/tau/config.json` (JSON with comments): `loadConfig` (never throws; O_NONBLOCK open + fstat + bounded read; symlink allowed), `parseConfig` (per-field defaults + problem lines, max 20; `Object.hasOwn`), `isKeyId` (needs ctrl/alt/super; no Escape, `+`, `[ ] \\`, ctrl+h/i/j/m), `configFor` (lead: the file; sub-agent: `TAU_CONFIG` or `fatal`). |
 | `gate.ts` | Work gate on `tool_call`: no active task → block non-tau tools; read-only type (or unknown type) → block `edit`/`write`. |
 | `format.ts` | Model-facing text. Agent text is quoted with `| ` and labeled as data. `tau_get` previews (2000 chars, last 10 notes/events) and `section`+`offset` paging by code points. |
@@ -139,13 +142,10 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
 - tau replaces Romain's old task-list extension (he removed it). No
   detection of other task extensions (his choice).
 
-## 8. What is left (from README), in the proposed order
+## 8. What is left (from README)
 
-1. **Fork** (next; about 2 h with review): on `session_start` with reason `fork`, copy the list rolled back
-   to the fork point (`rollback` by revision exists; need to map the fork
-   entry to a revision, for example with `pi.appendEntry` after each change),
-   new session ID, in-progress tasks of other-session owners → failed
-   `owner is in a different session`.
+Nothing: all planned README features are built. The README header still
+says "Status: DRAFT".
 
 ## 9. Known limits and open items
 
@@ -212,6 +212,21 @@ herdr agent prompt tau-lead "/quit"; sleep 3; herdr pane close $P
   old configuration (README limit). `/tau` with `idPills: false` has no
   command test. A sub-agent with a different `PI_CODING_AGENT_DIR` than its
   lead is refused by the identity check (pre-existing).
+- Fork (decisions and limits): the fork point is the last `tau-revision`
+  entry in the new branch (pi copies the branch). No entry (older sessions),
+  a revision outside 1..N, a list of a different session, a read error, or a
+  copy over 16 MiB -> warning + new list; no old list -> new list, no
+  warning. Only saved sessions (pi gives `previousSessionFile` then). A
+  custom message of another extension while the lead is idle does not
+  trigger a record (README limit). A lead-owned task under a sub-agent task
+  keeps that task (and waiting tasks between) open until the lead closes or
+  cancels them (rule 11). The size fallback has no test (needs a ~16 MiB
+  list). Not live-tested: fork with a running sub-agent, fork of a fork,
+  `/clone`.
+- Shutdown stops the tree, the supervisor, and the inbox (after `stop()`,
+  they start no new work: `check`, `checkAgain`, `refresh` do nothing), waits
+  for the inbox poll and the supervisor check, then for the tree refresh, and
+  then closes the store.
 - Not tested: `index.ts` passes the session to `closeLater` (one line, no
   end-to-end test); the `checkAgain` concurrency test uses the test copy of
   the stop hook, not the `index.ts` one.

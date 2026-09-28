@@ -34,6 +34,7 @@ export class TreeWidget {
   #tui: TUI | undefined;
   #timer: ReturnType<typeof setInterval> | undefined;
   #refreshing: Promise<void> | undefined;
+  #stopped = false;
 
   constructor(store: TaskListStore, options: TreeWidgetOptions) {
     this.#store = store;
@@ -86,6 +87,8 @@ export class TreeWidget {
    * Errors do not throw: the widget keeps the last list that it read.
    */
   refresh(): Promise<void> {
+    // After stop (the session ends), start no new read of the store.
+    if (this.#stopped) return this.#refreshing ?? Promise.resolve();
     this.#refreshing ??= (async () => {
       try {
         const list = await this.#store.read();
@@ -107,9 +110,14 @@ export class TreeWidget {
     return this.#refreshing;
   }
 
+  /** Waits for the refresh that runs now, if one runs. */
+  async drain(): Promise<void> {
+    await this.#refreshing;
+  }
+
   /** Starts to read the task list at an interval (`pollMs`). */
   start(): void {
-    if (this.#timer !== undefined) return;
+    if (this.#timer !== undefined || this.#stopped) return;
     this.#timer = setInterval(() => void this.refresh(), this.#options.pollMs);
     this.#timer.unref?.();
   }
@@ -118,7 +126,9 @@ export class TreeWidget {
     return this.#timer !== undefined;
   }
 
+  /** Stops the reads. After this, `refresh` starts no new read. */
   stop(): void {
+    this.#stopped = true;
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
   }

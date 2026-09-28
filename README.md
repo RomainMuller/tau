@@ -971,9 +971,10 @@ an error and does not change the file.
 
 ### Fork
 
-When you fork a session (`/fork`), the new session gets a copy of the task
-list. `tau` uses the `history` of each task to roll the copy back to its state
-at the fork point. Changes after the fork point are not in the copy.
+When you fork a session (`/fork`, or `/clone`), the new session gets a copy
+of the task list. `tau` uses the `history` of each task to roll the copy back
+to its state at the fork point. Changes after the fork point are not in the
+copy. The task list of the original session does not change.
 
 Each change has a revision number, which is unique in the task list. The fork
 point is a revision, not a time, so two changes in the same millisecond are
@@ -982,7 +983,43 @@ not a problem.
 At the fork point, a sub-agent can own an `in_progress` task. That sub-agent
 works for the original session, not for the fork. In the copy, these tasks
 become `failed`, with the result `owner is in a different session` and
-`retryable: true`.
+`retryable: true`, and the records of all sub-agents end. First, `tau`
+cancels the `waiting` sub-tasks of these tasks (they are the plan of the old
+sub-agent; a retry makes its own plan). A task of the lead stays
+`in_progress`: the lead works in the fork too. If the lead owns a task under
+a sub-agent task, the sub-agent task (and a `waiting` sub-task between them)
+stays open: close or cancel them, then `tau` fails the sub-agent task
+(rule 11). Messages between agents are not copied.
+
+How `tau` finds the fork point: before each message enters the session of
+the lead (your prompts, the answers of the model, and the tool results),
+`tau` writes the revision of the task list into the session when it
+changed (a custom entry that the model does not get). So the entries also
+have the changes of sub-agents while the lead was idle. pi copies these
+entries up to the fork point into the new session. The last one is the fork
+point.
+
+The fork gets a new task list, and `tau` shows a warning, when:
+
+- The session has no revision entry before the fork point (for example, a
+  session from before this version of `tau`).
+- The revision is not in the old task list, or the old task list is not the
+  list of the old session.
+- The copy is too large for a task list (the failed tasks add changes).
+- `tau` cannot read the old task list.
+
+The revision entries and the header of the old session file are not a
+security boundary: a program of your user that changes them can change what
+`tau` copies.
+
+When the old session has no task list, the fork gets a new task list with
+no warning. `tau` can copy the list only for a saved session: pi gives the
+file of the old session only then.
+
+A limit: `tau` records the revision before each message and before each
+compaction. A custom message that a different extension adds while the lead
+is idle does not trigger a record. A clone at such a message can miss the
+changes of sub-agents after the last record.
 
 ---
 

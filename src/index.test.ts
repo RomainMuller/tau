@@ -10,7 +10,7 @@ import { DEFAULT_CONFIG } from "./config.ts";
 import tau, { createTau, type TauDependencies } from "./index.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { seedTaskList } from "./tasks/model.ts";
-import { completeTask, createTask, delegateTask, setAgentPane, setAgentSession } from "./tasks/rules.ts";
+import { claimTask, completeTask, createTask, delegateTask, setAgentPane, setAgentSession } from "./tasks/rules.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -27,6 +27,8 @@ interface FakePi {
   readonly sent: Array<[unknown, unknown]>;
   /** The keys of pi.registerShortcut. */
   readonly shortcuts: string[];
+  /** The calls of pi.appendEntry: the custom type and the data. */
+  readonly entries: Array<[string, unknown]>;
 }
 
 /**
@@ -44,7 +46,9 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
   const inactive = new Set<string>();
   const sent: Array<[unknown, unknown]> = [];
   const shortcuts: string[] = [];
+  const entries: Array<[string, unknown]> = [];
   const known = {
+    appendEntry: (customType: string, data: unknown) => void entries.push([customType, data]),
     registerShortcut: (key: string) => void shortcuts.push(key),
     sendMessage: (message: unknown, options: unknown) => void sent.push([message, options]),
     getAllTools: () => [...tools.keys()].map((name) => ({ name })),
@@ -72,10 +76,10 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
       };
     },
   }) as unknown as ExtensionAPI;
-  return { api, handlers, execCalls, otherCalls, tools, inactive, sent, shortcuts };
+  return { api, handlers, execCalls, otherCalls, tools, inactive, sent, shortcuts, entries };
 }
 
-function fakeCtx(hasUI = true, sessionId = "session-1") {
+function fakeCtx(hasUI = true, sessionId = "session-1", branch: unknown[] = []) {
   const widgets: Array<{ key: string; lines: unknown }> = [];
   const notices: Array<{ message: string; type: unknown }> = [];
   const shutdowns: number[] = [];
@@ -86,7 +90,11 @@ function fakeCtx(hasUI = true, sessionId = "session-1") {
     ctx: {
       hasUI,
       shutdown: () => void shutdowns.push(1),
-      sessionManager: { getSessionId: () => sessionId, getSessionFile: () => `/sessions/2026_${sessionId}.jsonl` },
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionFile: () => `/sessions/2026_${sessionId}.jsonl`,
+        getBranch: () => branch,
+      },
       ui: {
         setWidget(key: string, lines: unknown) {
           widgets.push({ key, lines });
@@ -862,6 +870,249 @@ describe("tau extension", () => {
     }
     assert.ok(errors.some((line) => /"colour" is not a configuration field/.test(line)), errors.join("\n"));
     await emit(pi, "session_shutdown", ctx);
+  });
+
+  describe("fork", () => {
+    /** An old session with a task list: T0 done, T1 delegated to tau-t1, T2 made after the fork point. */
+    async function oldSession(): Promise<{ sessionFile: string; forkPoint: number }> {
+      const store = new TaskListStore(join(root, "tau", "tasklists", "old-1.db"));
+      await store.ensure(() => seedTaskList("old-1", "2026-01-01T00:00:00.000Z"));
+      const lead = { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" };
+      const { list } = await store.mutate((current) => {
+        claimTask(current, lead, "T0");
+        createTask(current, lead, { title: "Delegated", type: "code" });
+        completeTask(current, lead, "T0", "planned");
+        delegateTask(current, lead, { id: "T1", agent: "tau-t1" });
+      });
+      await store.mutate((current) => {
+        createTask(current, lead, { title: "After the fork point", type: "code" });
+      });
+      store.close();
+      const sessionFile = join(root, "old-1.jsonl");
+      await writeFile(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: "old-1", timestamp: "x", cwd: "/" })}\n`);
+      return { sessionFile, forkPoint: list.revision };
+    }
+
+    it("copies the task list of the old session at the fork point", async () => {
+      enableHerdr();
+      const { sessionFile, forkPoint } = await oldSession();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const branch = [{ type: "custom", customType: "tau-revision", data: { revision: forkPoint } }];
+      const { ctx } = fakeCtx(true, "fork-1", branch);
+      createTau(pi.api, deps);
+      for (const handler of pi.handlers.get("session_start") ?? []) {
+        await handler({ type: "session_start", reason: "fork", previousSessionFile: sessionFile }, ctx);
+      }
+      const store = new TaskListStore(join(root, "tau", "tasklists", "fork-1.db"));
+      const list = (await store.read())!;
+      store.close();
+      assert.equal(list.sessionId, "fork-1");
+      assert.deepEqual(list.tasks.map((task) => [task.id, task.status]), [
+        ["T0", "completed"],
+        ["T1", "failed"],
+      ]);
+      assert.equal(list.tasks[1]?.result, "owner is in a different session");
+      // The list of the old session does not change.
+      const old = new TaskListStore(join(root, "tau", "tasklists", "old-1.db"));
+      assert.deepEqual((await old.read())?.tasks.map((task) => [task.id, task.status]), [
+        ["T0", "completed"],
+        ["T1", "in_progress"],
+        ["T2", "waiting"],
+      ]);
+      old.close();
+      await emit(pi, "session_shutdown", ctx);
+    });
+
+    it("starts with a new list when the old session has no task list", async () => {
+      enableHerdr();
+      const sessionFile = join(root, "none.jsonl");
+      await writeFile(sessionFile, `${JSON.stringify({ type: "session", id: "none-1" })}\n`);
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx, notices } = fakeCtx(true, "fork-2", [{ type: "custom", customType: "tau-revision", data: { revision: 3 } }]);
+      createTau(pi.api, deps);
+      for (const handler of pi.handlers.get("session_start") ?? []) {
+        await handler({ type: "session_start", reason: "fork", previousSessionFile: sessionFile }, ctx);
+      }
+      const store = new TaskListStore(join(root, "tau", "tasklists", "fork-2.db"));
+      assert.deepEqual((await store.read())?.tasks.map((task) => task.id), ["T0"]);
+      store.close();
+      assert.deepEqual(notices, []);
+      await emit(pi, "session_shutdown", ctx);
+    });
+
+    /** Starts a lead in a fork of `sessionFile`, with `branch` as the new session branch. */
+    async function forkStart(name: string, sessionFile: string, branch: unknown[]) {
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx, notices } = fakeCtx(true, name, branch);
+      createTau(pi.api, deps);
+      for (const handler of pi.handlers.get("session_start") ?? []) {
+        await handler({ type: "session_start", reason: "fork", previousSessionFile: sessionFile }, ctx);
+      }
+      const store = new TaskListStore(join(root, "tau", "tasklists", `${name}.db`));
+      const list = await store.read();
+      store.close();
+      return { pi, ctx, notices, list };
+    }
+    const at = (revision: unknown) => [{ type: "custom", customType: "tau-revision", data: { revision } }];
+
+    it("warns and starts a new list when the fork point is not known or not valid", async () => {
+      enableHerdr();
+      const { sessionFile } = await oldSession();
+      for (const [name, branch, message] of [
+        ["fork-none", [], /cannot find the fork point/],
+        ["fork-high", at(999), /the fork point \(revision 999\) is not in its task list/],
+        ["fork-zero", at(0), /the fork point \(revision 0\) is not in its task list/],
+      ] as const) {
+        const { pi, ctx, notices, list } = await forkStart(name, sessionFile, [...branch]);
+        assert.deepEqual(list?.tasks.map((task) => task.id), ["T0"], name);
+        assert.ok(notices.some((notice) => notice.type === "warning" && message.test(notice.message)), `${name}: ${JSON.stringify(notices)}`);
+        await emit(pi, "session_shutdown", ctx);
+      }
+    });
+
+    it("does not copy a list of a different session, or a list that is not valid, and does not change the old list", async () => {
+      enableHerdr();
+      const { sessionFile, forkPoint } = await oldSession();
+      const oldFile = join(root, "tau", "tasklists", "old-1.db");
+      // The header tells old-1, but the stored list is of a different session.
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(oldFile);
+      const row = db.prepare("SELECT json FROM tasklist").get() as { json: string };
+      db.prepare("UPDATE tasklist SET json = ?").run(JSON.stringify({ ...JSON.parse(row.json), sessionId: "other" }));
+      db.close();
+      const other = await forkStart("fork-other", sessionFile, at(forkPoint));
+      assert.deepEqual(other.list?.tasks.map((task) => task.id), ["T0"]);
+      assert.ok(other.notices.some((notice) => /belongs to a different session/.test(notice.message)));
+      await emit(other.pi, "session_shutdown", other.ctx);
+      // A list that is not valid.
+      const broken = new DatabaseSync(oldFile);
+      broken.prepare("UPDATE tasklist SET json = ?").run("{ not json");
+      broken.close();
+      const bad = await forkStart("fork-bad", sessionFile, at(forkPoint));
+      assert.deepEqual(bad.list?.tasks.map((task) => task.id), ["T0"]);
+      assert.ok(bad.notices.some((notice) => notice.type === "warning" && /cannot copy the task list of the old session/.test(notice.message)));
+      await emit(bad.pi, "session_shutdown", bad.ctx);
+      const check = new DatabaseSync(oldFile);
+      assert.equal((check.prepare("SELECT json FROM tasklist").get() as { json: string }).json, "{ not json");
+      check.close();
+    });
+
+    it("does not copy for the same session ID, or when the new session has a list already", async () => {
+      enableHerdr();
+      const { sessionFile, forkPoint } = await oldSession();
+      // The header ID is the new ID.
+      const same = await forkStart("old-1", sessionFile, at(forkPoint));
+      assert.equal(same.list?.tasks.length, 3, "the list of old-1 itself, not changed");
+      await emit(same.pi, "session_shutdown", same.ctx);
+      // The new session has a list already.
+      const existing = new TaskListStore(join(root, "tau", "tasklists", "fork-exists.db"));
+      await existing.ensure(() => seedTaskList("fork-exists", "2026-01-01T00:00:00.000Z"));
+      await existing.mutate((list) => {
+        createTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { title: "Mine", type: "code" });
+      });
+      existing.close();
+      const kept = await forkStart("fork-exists", sessionFile, at(forkPoint));
+      assert.deepEqual(kept.list?.tasks.map((task) => task.title), ["Prepare task list", "Mine"]);
+      await emit(kept.pi, "session_shutdown", kept.ctx);
+    });
+
+    it("writes the revision before each message enters the session, also for changes of sub-agents", async () => {
+      enableHerdr();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, "record-2");
+      createTau(pi.api, deps);
+      await emit(pi, "session_start", ctx);
+      const revisions = () => pi.entries.filter(([type]) => type === "tau-revision").map(([, data]) => (data as { revision: number }).revision);
+      const messageEnd = (role: string) => all(pi, "message_end")({ type: "message_end", message: { role } }, ctx);
+      await pi.tools.get("tau_create")!.execute("1", { title: "x", type: "code" });
+      await messageEnd("toolResult");
+      assert.deepEqual(revisions(), [2]);
+      // A sub-agent (a different process) changes the list while the lead is idle.
+      const other = new TaskListStore(join(root, "tau", "tasklists", "record-2.db"));
+      await other.mutate((list) => {
+        createTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { title: "y", type: "code" });
+      });
+      other.close();
+      // The next user prompt: its message_end runs before pi writes it.
+      await messageEnd("user");
+      await messageEnd("assistant");
+      assert.deepEqual(revisions(), [2, 3]);
+      // Before a compaction entry too.
+      const again = new TaskListStore(join(root, "tau", "tasklists", "record-2.db"));
+      await again.mutate((list) => {
+        createTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { title: "z", type: "code" });
+      });
+      again.close();
+      await all(pi, "session_before_compact")({ type: "session_before_compact" }, ctx);
+      assert.deepEqual(revisions(), [2, 3, 4]);
+      await emit(pi, "session_shutdown", ctx);
+    });
+
+    it("a sub-agent writes no revision entries", async () => {
+      enableHerdr();
+      const file = join(root, "tau", "tasklists", "lead-rev.db");
+      const lead = new TaskListStore(file);
+      await lead.ensure(() => seedTaskList("lead-rev", "2026-01-01T00:00:00.000Z"));
+      await lead.mutate((list) => {
+        delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+        setAgentPane(list, "tau-t0", "w1:p1");
+      });
+      lead.close();
+      const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, "sub-rev");
+      createTau(pi.api, { ...deps, env });
+      // A valid old session with a list: a sub-agent must not copy it.
+      const oldFile = join(root, "sub-old.jsonl");
+      await writeFile(oldFile, `${JSON.stringify({ type: "session", id: "lead-rev" })}\n`);
+      for (const handler of pi.handlers.get("session_start") ?? []) {
+        await handler({ type: "session_start", reason: "fork", previousSessionFile: oldFile }, ctx);
+      }
+      await assert.rejects(readFile(join(root, "tau", "tasklists", "sub-rev.db")), { code: "ENOENT" });
+      await pi.tools.get("tau_note")!.execute("1", { task: "T0", text: "x" });
+      await all(pi, "message_end")({ type: "message_end", message: { role: "toolResult" } }, ctx);
+      await all(pi, "turn_end")({ type: "turn_end", toolResults: [] }, ctx);
+      await all(pi, "agent_settled")({ type: "agent_settled" }, ctx);
+      assert.deepEqual(pi.entries, []);
+      await emit(pi, "session_shutdown", ctx);
+    });
+
+    it("writes the revision into the session when the list changed", async () => {
+      enableHerdr();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, "record-1");
+      createTau(pi.api, deps);
+      await emit(pi, "session_start", ctx);
+      const messageEnd = () => all(pi, "message_end")({ type: "message_end", message: { role: "assistant" } }, ctx);
+      await messageEnd();
+      await pi.tools.get("tau_create")!.execute("1", { title: "x", type: "code" });
+      await messageEnd();
+      // No change: no new entry.
+      await messageEnd();
+      assert.deepEqual(
+        pi.entries.filter(([type]) => type === "tau-revision").map(([, data]) => (data as { revision: number }).revision),
+        [1, 2],
+      );
+      await emit(pi, "session_shutdown", ctx);
+    });
+  });
+
+  it("starts no new check or refresh after shutdown", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "late-1");
+    const handle = createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    await emit(pi, "session_shutdown", ctx);
+    const calls = pi.execCalls.length;
+    // A tool that ends after the shutdown calls onChange (a refresh), and a
+    // stop of aborted agents calls checkAgain: nothing must use herdr or the store.
+    await handle.widget!.refresh();
+    await handle.supervisor!.check();
+    await handle.supervisor!.checkAgain();
+    assert.equal(pi.execCalls.length, calls);
+    assert.equal(handle.widget!.running, false);
+    assert.equal(handle.supervisor!.running, false);
   });
 
   it("adds the tau section to the system prompt", async () => {
