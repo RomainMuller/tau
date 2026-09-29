@@ -123,16 +123,19 @@ function headerLine(list: TaskList | undefined, options: TreeOptions): string {
 
 /**
  * The tasks to show, in tree order, with their tree characters. When
- * `showClosed` is false, a closed task shows only if it has a sub-task that
- * shows.
+ * `showClosed` is false, a completed task and all its sub-tasks do not show
+ * (a completed task has only closed sub-tasks, so none of them needs work). A
+ * canceled task shows only if it has a sub-task that shows.
  */
 function visibleRows(list: TaskList, showClosed: boolean): Row[] {
   const visible = new Map<string, boolean>();
   const isVisible = (task: Task): boolean => {
     const known = visible.get(task.id);
     if (known !== undefined) return known;
-    const own = showClosed || (task.status !== "completed" && task.status !== "canceled");
-    const result = own || childrenOf(list, task.id).some(isVisible);
+    let result: boolean;
+    if (showClosed) result = true;
+    else if (task.status === "completed") result = false;
+    else result = task.status !== "canceled" || childrenOf(list, task.id).some(isVisible);
     visible.set(task.id, result);
     return result;
   };

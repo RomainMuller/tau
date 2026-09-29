@@ -101,7 +101,7 @@ describe("renderTree", () => {
     assert.equal(lines.at(-1), "└─ … 7 more (/tau to see all)");
   });
 
-  it("shows a closed parent when one of its sub-tasks shows", () => {
+  it("hides a completed parent and its failed sub-tasks", () => {
     const l = seedTaskList("s1", NOW);
     createTask(l, ctx(), { title: "Sub", type: "code", parent: "T0" });
     claimTask(l, ctx(), "T0");
@@ -109,7 +109,9 @@ describe("renderTree", () => {
     failTask(l, ctx(), "T0.1", "broken", true);
     completeTask(l, ctx(), "T0", "done anyway");
     const rows = renderTree(l, PLAIN).slice(1).map((line) => line.replace(/ +/g, " "));
-    assert.deepEqual(rows, ["└─ ✔ T0 Prepare task list @lead", " └─ ✖ T0.1 Sub @lead · broken"]);
+    assert.deepEqual(rows, []);
+    const all = renderTree(l, { ...PLAIN, showClosed: true }).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.deepEqual(all, ["└─ ✔ T0 Prepare task list @lead", " └─ ✖ T0.1 Sub @lead · broken"]);
   });
 
   it("fits each line in a narrow width", () => {
