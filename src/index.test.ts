@@ -430,8 +430,8 @@ describe("tau extension", () => {
     const list = (await new TaskListStore(file).read())!;
     assert.equal(list.sessionId, "abc-123");
     assert.deepEqual(
-      list.tasks.map((task: { id: string; title: string; status: string }) => [task.id, task.title, task.status]),
-      [["T0", "Prepare task list", "waiting"]],
+      list.tasks.map((task: { id: string; title: string; status: string; owner?: string }) => [task.id, task.title, task.status, task.owner]),
+      [["T0", "Prepare task list", "in_progress", "lead"]],
     );
     assert.deepEqual(notices, []);
   });
@@ -503,6 +503,10 @@ describe("tau extension", () => {
     assert.ok(pi.tools.has("tau_claim"));
     const gate = pi.handlers.get("tool_call")?.[0];
     assert.ok(gate, "a tool_call handler is registered");
+    // The lead owns T0 from the start: its work needs no claim.
+    assert.equal(await gate({ type: "tool_call", toolName: "bash", toolCallId: "0", input: {} }, ctx), undefined);
+    await pi.tools.get("tau_create")!.execute("0", { title: "Next", type: "code" });
+    await pi.tools.get("tau_complete")!.execute("0", { result: "planned" });
     const blocked = (await gate({ type: "tool_call", toolName: "bash", toolCallId: "1", input: {} }, ctx)) as {
       block: boolean;
       reason: string;
@@ -511,7 +515,7 @@ describe("tau extension", () => {
     assert.match(blocked.reason, /no active task/);
     assert.equal(await gate({ type: "tool_call", toolName: "tau_list", toolCallId: "2", input: {} }, ctx), undefined);
 
-    await pi.tools.get("tau_claim")!.execute("3", { id: "T0" });
+    await pi.tools.get("tau_claim")!.execute("3", { id: "T1" });
     assert.equal(await gate({ type: "tool_call", toolName: "bash", toolCallId: "4", input: {} }, ctx), undefined);
   });
 
@@ -570,7 +574,7 @@ describe("tau extension", () => {
     assert.equal(first?.entries[1]?.type, "custom_message");
     assert.equal(first?.entries[1]?.customType, "tau-continue");
     assert.equal(first?.entries[1]?.display, true);
-    assert.match(first!.entries[1]!.content, /1 task is open \(T0\)\. .*\n  Ready now: T0\./);
+    assert.match(first!.entries[1]!.content, /1 task is open \(T0\)\. .*\n  Your active task: T0\./);
 
     // No continuation after an abort, or when a different extension continues.
     assert.equal(await boundary("aborted"), undefined);
@@ -609,7 +613,6 @@ describe("tau extension", () => {
     assert.equal((await boundary())?.continue, true);
 
     // After T0 closes, the lead can stop.
-    await pi.tools.get("tau_claim")!.execute("2", { id: "T0" });
     await pi.tools.get("tau_complete")!.execute("3", { result: "done" });
     assert.equal(await boundary(), undefined);
     await emit(pi, "session_shutdown", ctx);
@@ -889,6 +892,7 @@ describe("tau extension", () => {
     // The task types of the configuration.
     await assert.rejects(pi.tools.get("tau_create")!.execute("1", { title: "x", type: "code" }), /is not a task type/);
     await pi.tools.get("tau_create")!.execute("2", { title: "Try it", type: "spike" });
+    await pi.tools.get("tau_complete")!.execute("3", { result: "planned" });
     await pi.tools.get("tau_claim")!.execute("3", { id: "T1" });
     // spike is read-only: the work gate blocks edit.
     const gate = pi.handlers.get("tool_call")![0]!;
@@ -901,7 +905,7 @@ describe("tau extension", () => {
     const boundary = () => settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx);
     assert.notEqual(await boundary(), undefined);
     assert.equal(await boundary(), undefined);
-    // maxTreeLines: 2 lines for 4 open tasks (the last line tells the rest).
+    // maxTreeLines: 2 lines for 3 open tasks (the last line tells the rest).
     await pi.tools.get("tau_create")!.execute("5", { title: "More", type: "plan" });
     await pi.tools.get("tau_create")!.execute("6", { title: "Even more", type: "plan" });
     // A refresh can run already (a tool started it): wait for it, then refresh.
@@ -910,8 +914,8 @@ describe("tau extension", () => {
     const lines = handle.widget!.lines(100);
     // The header, 2 task lines, and the line that tells the rest.
     assert.equal(lines.length, 1 + 2 + 1, lines.join("\n"));
-    assert.match(lines[0]!, /3 waiting/);
-    assert.match(lines.at(-1)!, /… 2 more/);
+    assert.match(lines[0]!, /2 waiting/);
+    assert.match(lines.at(-1)!, /… 1 more/);
     await emit(pi, "session_shutdown", ctx);
   });
 
@@ -960,6 +964,9 @@ describe("tau extension", () => {
     assert.equal(pi.tools.has("tau_ask_user"), false);
     assert.ok(pi.tools.has("tau_list"));
     // No active task: the gate allows the ask tool, and blocks other tools.
+    // T1 stays open, so that the stop rule continues below.
+    await pi.tools.get("tau_create")!.execute("0", { title: "Next", type: "code" });
+    await pi.tools.get("tau_complete")!.execute("0", { result: "planned" });
     const gate = pi.handlers.get("tool_call")![0]!;
     assert.equal(await gate({ type: "tool_call", toolName: "ask_user_question", toolCallId: "1", input: {} }, ctx), undefined);
     assert.notEqual(await gate({ type: "tool_call", toolName: "bash", toolCallId: "2", input: {} }, ctx), undefined);
@@ -1212,7 +1219,7 @@ describe("tau extension", () => {
       const messageEnd = (role: string) => all(pi, "message_end")({ type: "message_end", message: { role } }, ctx);
       await pi.tools.get("tau_create")!.execute("1", { title: "x", type: "code" });
       await messageEnd("toolResult");
-      assert.deepEqual(revisions(), [2]);
+      assert.deepEqual(revisions(), [3]);
       // A sub-agent (a different process) changes the list while the lead is idle.
       const other = new TaskListStore(join(root, "tau", "tasklists", "record-2.db"));
       await other.mutate((list) => {
@@ -1222,7 +1229,7 @@ describe("tau extension", () => {
       // The next user prompt: its message_end runs before pi writes it.
       await messageEnd("user");
       await messageEnd("assistant");
-      assert.deepEqual(revisions(), [2, 3]);
+      assert.deepEqual(revisions(), [3, 4]);
       // Before a compaction entry too.
       const again = new TaskListStore(join(root, "tau", "tasklists", "record-2.db"));
       await again.mutate((list) => {
@@ -1230,7 +1237,7 @@ describe("tau extension", () => {
       });
       again.close();
       await all(pi, "session_before_compact")({ type: "session_before_compact" }, ctx);
-      assert.deepEqual(revisions(), [2, 3, 4]);
+      assert.deepEqual(revisions(), [3, 4, 5]);
       await emit(pi, "session_shutdown", ctx);
     });
 
@@ -1277,7 +1284,7 @@ describe("tau extension", () => {
       await messageEnd();
       assert.deepEqual(
         pi.entries.filter(([type]) => type === "tau-revision").map(([, data]) => (data as { revision: number }).revision),
-        [1, 2],
+        [2, 3],
       );
       await emit(pi, "session_shutdown", ctx);
     });
@@ -1852,7 +1859,8 @@ describe("tau extension", () => {
     const { ctx } = fakeCtx(true, "handoff-1");
     createTau(pi.api, deps);
     await emit(pi, "session_start", ctx);
-    await pi.tools.get("tau_delegate")!.execute("1", { id: "T0", model: "p/m", thinking: "low" });
+    await pi.tools.get("tau_create")!.execute("0", { title: "Work", type: "code" });
+    await pi.tools.get("tau_delegate")!.execute("1", { id: "T1", model: "p/m", thinking: "low" });
     const split = pi.execCalls.find((call) => call[1] === "pane" && call[2] === "split")!;
     const value = split.find((arg) => typeof arg === "string" && arg.startsWith("TAU_CONFIG="))!.slice("TAU_CONFIG=".length);
     assert.equal(JSON.parse(value).maxTreeLines, 3);

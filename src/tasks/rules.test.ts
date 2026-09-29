@@ -61,6 +61,19 @@ describe("seedTaskList", () => {
     assert.equal(t0.status, "waiting");
     assert.equal(t0.history.length, 1);
   });
+
+  it("gives T0 to an owner when one is set", () => {
+    const owned = seedTaskList("s1", ctx().now, "lead");
+    const t0 = getTask(owned, "T0");
+    assert.equal(t0.status, "in_progress");
+    assert.equal(t0.owner, "lead");
+    assert.deepEqual(t0.history.map((event) => [event.kind, event.actor, event.seq]), [["created", "tau", 1], ["claimed", "lead", 2]]);
+    assert.equal(owned.revision, 2);
+    assert.equal(activeTask(owned, "lead")?.id, "T0");
+    // The lead cannot claim a different root task before it closes T0.
+    createTask(owned, ctx(), { title: "Other", type: "code" });
+    throwsTau(() => claimTask(owned, ctx(), "T1"), "busy", /You work on task T0/);
+  });
 });
 
 describe("createTask", () => {

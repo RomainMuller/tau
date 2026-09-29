@@ -61,6 +61,9 @@ describe("forkTaskList", () => {
     const forked = forkTaskList(oldList().list, undefined, "new", NOW);
     assert.equal(forked.sessionId, "new");
     assert.deepEqual(forked.tasks.map((task) => task.id), ["T0"]);
+    // The lead of the fork owns T0 from the start.
+    assert.equal(findTask(forked, "T0")?.status, "in_progress");
+    assert.equal(findTask(forked, "T0")?.owner, "lead");
   });
 
   it("does not copy the transcript path of the old session", () => {

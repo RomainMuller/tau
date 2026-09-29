@@ -102,11 +102,13 @@ a lead session starts and has no task list, `tau` creates one with a single
 task (a [fork](#fork) can get a copy of the list of its old session):
 
 ```text
-T0    waiting      Prepare task list
+T0    in_progress  Prepare task list    @lead
 ```
 
 This task tells the agent to read the user prompt, plan the work, and create the
-tasks it needs.
+tasks it needs. The lead owns `T0` from the start: it does not claim it. While
+`T0` is open, the lead can claim only sub-tasks of `T0`. To work on a different
+root task, the lead closes `T0` first.
 
 ### Task fields
 
@@ -176,9 +178,9 @@ By default, task IDs show as [colored pills](#colored-id-pills). The previews
 in this section show the status marks instead (the `idPills: false` option),
 because a text preview cannot show colors.
 
-**Default view.** `completed` and `canceled` tasks are hidden. A closed task
-shows only when one of its sub-tasks shows (for example, a `failed` sub-task
-of a `completed` task). `⧗` shows only on `waiting` tasks, and only the
+**Default view.** `completed` and `canceled` tasks are hidden. The sub-tasks
+of a `completed` task are hidden too, also the `failed` ones. A `canceled` task
+shows only when one of its sub-tasks shows. `⧗` shows only on `waiting` tasks, and only the
 dependencies that are not complete.
 
 ```text

@@ -16,7 +16,7 @@ import { checkSubAgent, ENV_LEAD_PANE, ENV_TASKLIST, resolveIdentity, type Ident
 import { isPaneId } from "./layout.ts";
 import { Supervisor } from "./supervisor.ts";
 import { TauError } from "./tasks/errors.ts";
-import { seedTaskList, type TaskList } from "./tasks/model.ts";
+import { LEAD_AGENT, seedTaskList, type TaskList } from "./tasks/model.ts";
 import { tauDir } from "./tasks/paths.ts";
 import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
 import { setAgentError, setAgentPane, setAgentSession, type Actor } from "./tasks/rules.ts";
@@ -668,7 +668,7 @@ async function openTaskList(
     if (identity.role === "lead") {
       // The transcript of this session (see `tasks/gc.ts`).
       const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
-      let seed = (): TaskList => ({ ...seedTaskList(sessionId, deps.now()), sessionFile });
+      let seed = (): TaskList => ({ ...seedTaskList(sessionId, deps.now(), LEAD_AGENT), sessionFile });
       // A fork: a copy of the task list of the old session, at the fork point.
       const source = forkSource(ctx, event);
       if (source !== undefined && (await store.read()) === undefined) {

@@ -57,7 +57,7 @@ export function forkRevision(branch: readonly { readonly type: string; readonly 
  * session. With no revision, a new list (the task `T0` only).
  */
 export function forkTaskList(old: TaskList, revision: number | undefined, sessionId: string, now: string): TaskList {
-  if (revision === undefined) return seedTaskList(sessionId, now);
+  if (revision === undefined) return seedTaskList(sessionId, now, LEAD_AGENT);
   // The transcript of the old session is not the transcript of the fork:
   // the lead records its own (see `openTaskList`).
   const { sessionFile: _oldFile, ...rest } = rollback(old, revision);

@@ -450,10 +450,15 @@ export function replay(list: TaskList, revision: number = list.revision): Task[]
   return tasks;
 }
 
-/** Makes a new task list with the task `T0 Prepare task list`. */
-export function seedTaskList(sessionId: string, now: string): TaskList {
+/**
+ * Makes a new task list with the task `T0 Prepare task list`. When `owner` is
+ * set, this agent owns `T0` from the start (`in_progress`). tau gives `T0` to
+ * the lead: the lead does not need a claim, and it cannot claim a different
+ * root task before it closes `T0`.
+ */
+export function seedTaskList(sessionId: string, now: string, owner?: string): TaskList {
   const list: TaskList = { version: 1, sessionId, createdAt: now, revision: 0, tasks: [], agents: [] };
-  addTask(list, "T0", {
+  const task = addTask(list, "T0", {
         kind: "created",
         at: now,
         actor: SYSTEM_ACTOR,
@@ -466,6 +471,7 @@ export function seedTaskList(sessionId: string, now: string): TaskList {
         ].join("\n"),
         dependencies: [],
   });
+  if (owner !== undefined) recordEvent(list, task, { kind: "claimed", at: now, actor: owner });
   return list;
 }
 
