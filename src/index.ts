@@ -213,6 +213,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       badge: badgeLabel(status, identity),
       maxLines: config.maxTreeLines,
       pills: config.idPills,
+      // A sub-agent shows only the tree of its task.
+      ...(identity.role === "subagent" ? { root: identity.actor.scope } : {}),
     });
     widget = tree;
     const watcher = new Supervisor({

@@ -174,6 +174,12 @@ sub-task for each deliverable (a part of the tree, without the header):
 The task list shows as a tree under the herdr badge. The tree starts below
 the 🟢 badge.
 
+In a sub-agent, the tree shows only the task of the sub-agent and its
+sub-tasks (all levels). The header counts only these tasks. The root task
+always shows, also when it is closed. In the header, `@agent ✉n` shows only
+for an agent that owns a task of this tree, and only when its active task is
+not in this tree (or it has no active task). `/tau` still shows all tasks.
+
 By default, task IDs show as [colored pills](#colored-id-pills). The previews
 in this section show the status marks instead (the `idPills: false` option),
 because a text preview cannot show colors.

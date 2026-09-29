@@ -30,6 +30,8 @@ interface FakePi {
   readonly shortcuts: string[];
   /** The calls of pi.appendEntry: the custom type and the data. */
   readonly entries: Array<[string, unknown]>;
+  /** The commands of pi.registerCommand, by name. */
+  readonly commands: Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>;
 }
 
 /**
@@ -48,7 +50,13 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
   const sent: Array<[unknown, unknown]> = [];
   const shortcuts: string[] = [];
   const entries: Array<[string, unknown]> = [];
+  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
   const known = {
+    // Also in otherCalls: the tests without herdr check that tau uses no other API.
+    registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+      otherCalls.push("registerCommand");
+      commands.set(name, command);
+    },
     appendEntry: (customType: string, data: unknown) => void entries.push([customType, data]),
     registerShortcut: (key: string) => void shortcuts.push(key),
     sendMessage: (message: unknown, options: unknown) => void sent.push([message, options]),
@@ -77,7 +85,7 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
       };
     },
   }) as unknown as ExtensionAPI;
-  return { api, handlers, execCalls, otherCalls, tools, inactive, sent, shortcuts, entries };
+  return { api, handlers, execCalls, otherCalls, tools, inactive, sent, shortcuts, entries, commands };
 }
 
 function fakeCtx(hasUI = true, sessionId = "session-1", branch: unknown[] = []) {
@@ -290,6 +298,46 @@ describe("tau extension", () => {
       assert.deepEqual(await lists(), ["lead-gc.db", "old-session.db"]);
       await emit(pi, "session_shutdown", ctx);
     });
+  });
+
+  it("shows only the tree of its task in the widget of a sub-agent, and all tasks in /tau", async () => {
+    enableHerdr();
+    const file = taskListFile(join(root, "tau"), "lead-scope");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("lead-scope", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      const rule = { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" };
+      createTask(list, rule, { title: "Other work", type: "code" });
+      createTask(list, rule, { title: "Assigned", type: "code", parent: "T0" });
+      createTask(list, rule, { title: "Sibling", type: "code", parent: "T0" });
+      createTask(list, rule, { title: "Sub of assigned", type: "code", parent: "T0.1" });
+      claimTask(list, rule, "T0");
+      // A nested task: the scope is T0.1, not its top-level ancestor T0.
+      delegateTask(list, rule, { id: "T0.1", agent: "tau-t0-1" });
+      setAgentPane(list, "tau-t0-1", "w1:p1");
+    });
+    lead.close();
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0.1", TAU_AGENT_NAME: "tau-t0-1", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "sub-scope");
+    const handle = createTau(pi.api, { ...deps, env });
+    await emit(pi, "session_start", ctx);
+    assert.equal(handle.identity?.role, "subagent");
+    await handle.widget!.refresh();
+    const plain = (text: string) => text.replace(/\u001b\[[0-9;]*m/gu, "").replace(/[\ue0b4\ue0b6]/gu, "");
+    const rows = handle.widget!.lines(100).map((line) => plain(line).replace(/ +/g, " "));
+    assert.deepEqual(rows, [
+      "🟢 Herdr @tau-t0-1 (T0.1) ─ 1 waiting · 1 running",
+      "└─ T0.1 Assigned @tau-t0-1",
+      " └─ T0.1.1 Sub of assigned",
+    ]);
+    // /tau still shows all tasks.
+    const notices: string[] = [];
+    await pi.commands.get("tau")?.handler("", { mode: "print", ui: { notify: (message: string) => notices.push(message) } });
+    const all = plain(notices.join("\n"));
+    assert.match(all, /Other work/);
+    assert.match(all, /Sibling/);
+    await emit(pi, "session_shutdown", ctx);
   });
 
   it("reports the model of the lead, and nothing after shutdown", async () => {

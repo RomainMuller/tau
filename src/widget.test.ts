@@ -46,6 +46,20 @@ describe("TreeWidget", () => {
     assert.equal(renders, 1);
   });
 
+  it("shows only the tree of the root task when root is set", async () => {
+    await new TaskListStore(store.file).mutate((list) => {
+      createTask(list, LEAD, { title: "Other", type: "code" });
+      createTask(list, LEAD, { title: "Sub", type: "code", parent: "T1" });
+    });
+    const widget = new TreeWidget(store, { badge: "🟢 Herdr", pills: false, color: false, root: "T1" });
+    await widget.refresh();
+    assert.deepEqual(widget.lines(80).map((line) => line.replace(/ +/g, " ")), [
+      "🟢 Herdr ─ 2 waiting",
+      "└─ ○ T1 Other",
+      " └─ ○ T1.1 Sub",
+    ]);
+  });
+
   it("draws again only when the task list changed", async () => {
     const widget = new TreeWidget(store, { badge: "🟢 Herdr", pills: false, color: false });
     widget.factory(tui);

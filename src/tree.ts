@@ -26,6 +26,12 @@ export interface TreeOptions {
   readonly badge: string;
   /** The number of messages that each agent did not read. Shows as `✉n` on its active task. */
   readonly unread?: ReadonlyMap<string, number>;
+  /**
+   * Show only this task and its sub-tasks (all levels). A sub-agent sets it
+   * to its task. The header counts only these tasks. When the task does not
+   * exist, no task line shows.
+   */
+  readonly root?: string;
 }
 
 export const DEFAULT_MAX_TREE_LINES = 6;
@@ -74,7 +80,7 @@ export function renderTree(list: TaskList | undefined, options: TreeOptions): st
   if (list === undefined) {
     return [fit(header, options.width)];
   }
-  const rows = visibleRows(list, options.showClosed);
+  const rows = visibleRows(list, options.showClosed, options.root);
   const shown = rows.slice(0, options.maxLines);
   const more = rows.length - shown.length;
 
@@ -106,17 +112,26 @@ export function renderTree(list: TaskList | undefined, options: TreeOptions): st
 
 /** The header: the badge and the number of tasks for each status. Counts of 0 do not show. */
 function headerLine(list: TaskList | undefined, options: TreeOptions): string {
-  if (list === undefined || list.tasks.length === 0) {
+  const tasks = list === undefined ? [] : scopedTasks(list, options.root);
+  if (list === undefined || tasks.length === 0) {
     return options.badge;
   }
   const counts = COUNT_LABELS.map(([status, label]) => {
-    const count = list.tasks.filter((task) => task.status === status).length;
+    const count = tasks.filter((task) => task.status === status).length;
     return count === 0 ? undefined : `${count} ${label}`;
   }).filter((item) => item !== undefined);
   // An agent with unread messages and no active task: its count cannot show
-  // on a task line, so it shows here.
+  // on a task line, so it shows here. With a root, only the agents that own
+  // a task in the scope show, and an active task out of the scope counts as
+  // no active task (its line does not show).
+  const owners = options.root === undefined ? undefined : new Set(tasks.map((task) => task.owner));
+  const ids = options.root === undefined ? undefined : new Set(tasks.map((task) => task.id));
+  const noTaskLine = (agent: string): boolean => {
+    const active = activeTask(list, agent);
+    return active === undefined || (ids !== undefined && !ids.has(active.id));
+  };
   const mail = [...(options.unread ?? new Map<string, number>())]
-    .filter(([agent, count]) => count > 0 && activeTask(list, agent) === undefined)
+    .filter(([agent, count]) => count > 0 && (owners?.has(agent) ?? true) && noTaskLine(agent))
     .map(([agent, count]) => style(`@${cleanLine(agent)} ✉${count}`, "accent", options));
   return `${options.badge} ${dim("─", options)} ${[...counts, ...mail].join(dim(" · ", options))}`;
 }
@@ -126,8 +141,11 @@ function headerLine(list: TaskList | undefined, options: TreeOptions): string {
  * `showClosed` is false, a completed task and all its sub-tasks do not show
  * (a completed task has only closed sub-tasks, so none of them needs work). A
  * canceled task shows only if it has a sub-task that shows.
+ *
+ * With a `root`, the walk starts at the root task, and the root task always
+ * shows (it is the task of the agent that looks at the tree).
  */
-function visibleRows(list: TaskList, showClosed: boolean): Row[] {
+function visibleRows(list: TaskList, showClosed: boolean, root?: string): Row[] {
   const visible = new Map<string, boolean>();
   const isVisible = (task: Task): boolean => {
     const known = visible.get(task.id);
@@ -149,11 +167,29 @@ function visibleRows(list: TaskList, showClosed: boolean): Row[] {
       walk(childrenOf(list, task.id), `${indent}${last ? "   " : "│  "}`);
     });
   };
-  walk(
-    list.tasks.filter((task) => parentId(task.id) === undefined),
-    "",
-  );
+  if (root === undefined) {
+    walk(
+      list.tasks.filter((task) => parentId(task.id) === undefined),
+      "",
+    );
+  } else {
+    const task = findTask(list, root);
+    if (task !== undefined && task.status === "completed" && !showClosed) {
+      // The root shows, but not its sub-tasks: a completed task hides them.
+      rows.push({ task, prefix: "└─ " });
+    } else if (task !== undefined) {
+      visible.set(task.id, true);
+      walk([task], "");
+    }
+  }
   return rows;
+}
+
+/** All tasks, or with a `root`, the root task and its sub-tasks (all levels). */
+function scopedTasks(list: TaskList, root: string | undefined): Task[] {
+  if (root === undefined) return list.tasks;
+  const prefix = `${root}.`;
+  return list.tasks.filter((task) => task.id === root || task.id.startsWith(prefix));
 }
 
 function extrasText(list: TaskList, task: Task, options: TreeOptions): string {

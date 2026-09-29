@@ -159,6 +159,112 @@ describe("renderTree", () => {
     assert.match(pill("T5"), /\u001b\[48;5;208m\u001b\[38;5;15m\u001b\[9m/); // orange, strikethrough
   });
 
+  it("shows only the root task and its sub-tasks when root is set", () => {
+    const lines = renderTree(list, { ...PLAIN, root: "T2" });
+    assert.equal(lines[0], "🟢 Herdr ─ 1 waiting · 2 running");
+    assert.deepEqual(
+      lines.slice(1).map((line) => line.replace(/ +/g, " ")),
+      [
+        "└─ ◐ T2 Add magic-link login endpoint @lead",
+        " ├─ ◐ T2.1 Create login_tokens table @tau-t2-1",
+        " └─ ○ T2.2 Write endpoint tests ⧗ T2.1",
+      ],
+    );
+  });
+
+  it("does not take tasks with a similar ID prefix into the root scope", () => {
+    const l = seedTaskList("s1", NOW);
+    for (let i = 1; i <= 12; i++) createTask(l, ctx(), { title: `Task ${i}`, type: "code" });
+    createTask(l, ctx(), { title: "Sub of T1", type: "code", parent: "T1" });
+    const rows = renderTree(l, { ...PLAIN, root: "T1" }).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.deepEqual(rows, ["└─ ○ T1 Task 1", " └─ ○ T1.1 Sub of T1"]);
+  });
+
+  it("shows the root task also when it is closed", () => {
+    const rows = renderTree(list, { ...PLAIN, root: "T1" }).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.deepEqual(rows, ["└─ ✔ T1 Map the current login flow @tau-t1"]);
+  });
+
+  it("hides the sub-tasks of a completed root, but shows the root", () => {
+    const l = seedTaskList("s1", NOW);
+    createTask(l, ctx(), { title: "Sub", type: "code", parent: "T0" });
+    claimTask(l, ctx(), "T0");
+    claimTask(l, ctx(), "T0.1");
+    failTask(l, ctx(), "T0.1", "broken", true);
+    completeTask(l, ctx(), "T0", "done anyway");
+    const rows = renderTree(l, { ...PLAIN, root: "T0" }).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.deepEqual(rows, ["└─ ✔ T0 Prepare task list @lead"]);
+    const all = renderTree(l, { ...PLAIN, root: "T0", showClosed: true }).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.deepEqual(all, ["└─ ✔ T0 Prepare task list @lead", " └─ ✖ T0.1 Sub @lead · broken"]);
+  });
+
+  it("shows a canceled root with its visible sub-tasks", () => {
+    const l = seedTaskList("s1", NOW);
+    createTask(l, ctx(), { title: "Sub", type: "code", parent: "T0" });
+    createTask(l, ctx(), { title: "Done sub", type: "code", parent: "T0" });
+    claimTask(l, ctx("tau-a"), "T0.1");
+    failTask(l, ctx("tau-a"), "T0.1", "broken", true);
+    claimTask(l, ctx("tau-b"), "T0.2");
+    completeTask(l, ctx("tau-b"), "T0.2", "ok");
+    cancelTask(l, ctx(), "T0", "not needed");
+    const rows = renderTree(l, { ...PLAIN, root: "T0" }).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.deepEqual(rows, ["└─ ⊘ T0 Prepare task list canceled", " └─ ✖ T0.1 Sub @tau-a · broken"]);
+  });
+
+  it("shows a nested root without its siblings or parent", () => {
+    const lines = renderTree(list, { ...PLAIN, root: "T2.1" });
+    assert.equal(lines[0], "🟢 Herdr ─ 1 running");
+    assert.deepEqual(
+      lines.slice(1).map((line) => line.replace(/ +/g, " ")),
+      ["└─ ◐ T2.1 Create login_tokens table @tau-t2-1"],
+    );
+  });
+
+  it("counts only the tasks of the root scope in the line limit", () => {
+    const l = seedTaskList("s1", NOW);
+    for (let i = 1; i <= 5; i++) createTask(l, ctx(), { title: `Top ${i}`, type: "code" });
+    for (let i = 1; i <= 8; i++) createTask(l, ctx(), { title: `Sub ${i}`, type: "code", parent: "T1" });
+    const lines = renderTree(l, { ...PLAIN, root: "T1" });
+    assert.equal(lines[0], "🟢 Herdr ─ 9 waiting");
+    assert.equal(lines.length, 1 + 6 + 1);
+    assert.equal(lines.at(-1), "└─ … 3 more (/tau to see all)");
+  });
+
+  it("shows mail on a task line in the root scope", () => {
+    const lines = renderTree(list, { ...PLAIN, root: "T2", unread: new Map([["tau-t2-1", 4]]) });
+    assert.equal(lines[0], "🟢 Herdr ─ 1 waiting · 2 running");
+    assert.match(lines[2] ?? "", /T2\.1 .*@tau-t2-1 ✉4/);
+  });
+
+  it("shows mail in the header for an owner in scope whose active task is out of scope", () => {
+    const l = seedTaskList("s1", NOW);
+    createTask(l, ctx(), { title: "Sub", type: "code", parent: "T0" });
+    createTask(l, ctx(), { title: "Elsewhere", type: "code" });
+    claimTask(l, ctx("tau-t0"), "T0");
+    claimTask(l, ctx("lead"), "T0.1");
+    completeTask(l, ctx("lead"), "T0.1", "ok");
+    claimTask(l, ctx("lead"), "T1");
+    const header = renderTree(l, { ...PLAIN, root: "T0", unread: new Map([["lead", 2]]) })[0];
+    assert.equal(header, "🟢 Herdr ─ 1 running · 1 done · @lead ✉2");
+    // Without a root, the mail shows on the line of T1, not in the header.
+    assert.doesNotMatch(renderTree(l, { ...PLAIN, unread: new Map([["lead", 2]]) })[0] ?? "", /✉/);
+  });
+
+  it("shows only the badge when the root task does not exist", () => {
+    assert.deepEqual(renderTree(list, { ...PLAIN, root: "T9" }), ["🟢 Herdr"]);
+  });
+
+  it("shows header mail only for the agents of the root scope", () => {
+    const unread = new Map([
+      ["tau-t1", 2],
+      ["tau-t4", 3],
+    ]);
+    assert.match(renderTree(list, { ...PLAIN, unread })[0] ?? "", /@tau-t1 ✉2 · @tau-t4 ✉3/);
+    const scoped = renderTree(list, { ...PLAIN, unread, root: "T1" })[0] ?? "";
+    assert.match(scoped, /@tau-t1 ✉2/);
+    assert.doesNotMatch(scoped, /tau-t4/);
+  });
+
   it("removes control characters from titles, owners, and results", () => {
     const l = seedTaskList("s1", NOW);
     claimTask(l, ctx("evil\u001b[2J"), "T0");

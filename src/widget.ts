@@ -23,11 +23,13 @@ export interface TreeWidgetOptions {
   readonly color?: boolean;
   /** The time between two reads, in milliseconds. The default is `POLL_MS`. */
   readonly pollMs?: number;
+  /** Show only this task and its sub-tasks. A sub-agent sets it to its task. */
+  readonly root?: string;
 }
 
 export class TreeWidget {
   readonly #store: TaskListStore;
-  readonly #options: Required<TreeWidgetOptions>;
+  readonly #options: Required<Omit<TreeWidgetOptions, "root">> & Pick<TreeWidgetOptions, "root">;
   #list: TaskList | undefined;
   #unread: ReadonlyMap<string, number> = new Map();
   #showClosed = false;
@@ -44,6 +46,7 @@ export class TreeWidget {
       pills: options.pills ?? true,
       color: options.color ?? true,
       pollMs: options.pollMs ?? POLL_MS,
+      ...(options.root === undefined ? {} : { root: options.root }),
     };
   }
 
@@ -61,6 +64,7 @@ export class TreeWidget {
       width,
       badge: this.#options.badge,
       unread: this.#unread,
+      ...(this.#options.root === undefined ? {} : { root: this.#options.root }),
     });
   }
 
