@@ -17,6 +17,8 @@ import { registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts
 
 interface RegisteredTool {
   name: string;
+  description: string;
+  parameters: { properties: Record<string, { type?: string; enum?: string[]; anyOf?: unknown }> };
   execute: (id: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
 }
 
@@ -342,6 +344,40 @@ describe("task tools, more cases", () => {
       .join("");
     assert.equal(joined, text);
     assert.ok(pages.every((page) => page.isWellFormed()));
+  });
+
+  it("gives the values of each choice parameter as a flat string enum", () => {
+    const schema = (tool: string, param: string) => tools.get(tool)!.parameters.properties[param]!;
+    const types = Object.keys(DEFAULT_TASK_TYPE_DEFINITIONS);
+    const expected: Array<[string, string, readonly string[]]> = [
+      ["tau_get", "section", ["description", "result", "notes", "history"]],
+      ["tau_create", "type", types],
+      ["tau_update", "type", types],
+      ["tau_send", "priority", ["steer", "info"]],
+      ["tau_delegate", "thinking", ["off", "minimal", "low", "medium", "high", "xhigh", "max"]],
+    ];
+    for (const [tool, param, values] of expected) {
+      const s = schema(tool, param);
+      assert.equal(s.type, "string", `${tool}.${param} is a string`);
+      assert.deepEqual(s.enum, [...values], `${tool}.${param} lists its values`);
+      assert.equal(s.anyOf, undefined, `${tool}.${param} has no anyOf`);
+    }
+  });
+
+  it("lists the configured task types in the type enums", () => {
+    const custom = register({
+      ...makeSession("lead"),
+      taskTypes: { plan: { description: "Plan.", readOnly: false }, spike: { description: "Try an idea.", readOnly: true } },
+    });
+    for (const tool of ["tau_create", "tau_update"]) {
+      assert.deepEqual(custom.get(tool)!.parameters.properties.type!.enum, ["plan", "spike"], `${tool}.type`);
+    }
+  });
+
+  it("names in the tau_get description only the fields that are sections", () => {
+    const description = tools.get("tau_get")!.description;
+    assert.match(description, /set section to one of: description, result, notes, history\./);
+    assert.match(description, /Other fields are always complete, and have no section\./);
   });
 
   it("rejects a section that does not exist", async () => {

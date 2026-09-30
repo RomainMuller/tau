@@ -105,6 +105,15 @@ interface ToolSpec {
 const ID = (description: string) => Type.String({ description, pattern: "^T(0|[1-9][0-9]*)(\\.[1-9][0-9]*)*$" });
 const OPTIONAL_ID = (description: string) => Type.Optional(ID(description));
 
+/**
+ * A string schema with a fixed list of values, as a flat JSON Schema `enum`.
+ * It is the same as `StringEnum` of pi-ai: some providers (Google) do not
+ * accept `anyOf` of literals. The model sees the values in the schema, so it
+ * does not have to find them in the description.
+ */
+const StringEnum = (values: readonly string[], description: string) =>
+  Type.Unsafe<string>({ type: "string", enum: [...values], description });
+
 function typeDescription(types: Readonly<Record<string, TaskTypeDefinition>>): string {
   const lines = Object.entries(types).map(
     ([name, type]) => `${name}: ${type.description}${type.readOnly ? " (read-only)" : ""}`,
@@ -140,14 +149,12 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       name: "tau_get",
       label: "tau get",
       description:
-        "Show one task with all its fields: description, result, notes, dependencies, sub-tasks, and history. Long fields are cut, and only recent notes and events show. To read a complete field, set section, and offset for the next pages.",
+        `Show one task with all its fields: description, result, notes, dependencies, sub-tasks, and history. Long fields are cut, and only recent notes and events show. To read one complete field, set section to one of: ${TASK_SECTIONS.join(", ")}. Other fields are always complete, and have no section. For the next pages, set offset.`,
       promptSnippet: "Show one task with all fields",
       parameters: Type.Object({
         id: ID("The task ID, for example T2 or T2.1."),
         section: Type.Optional(
-          Type.String({
-            description: `Show only this field, complete, in pages. One of: ${TASK_SECTIONS.join(", ")}.`,
-          }),
+          StringEnum(TASK_SECTIONS, `Show only this field, complete, in pages. One of: ${TASK_SECTIONS.join(", ")}.`),
         ),
         offset: Type.Optional(
           Type.Integer({ minimum: 0, description: "The first character of the page. Use the value that the last page gives." }),
@@ -177,7 +184,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       promptSnippet: "Create a task or sub-task",
       parameters: Type.Object({
         title: Type.String({ description: "A short title (one line) that tells what the task does." }),
-        type: Type.String({ description: typeDescription(taskTypes) }),
+        type: StringEnum(Object.keys(taskTypes), typeDescription(taskTypes)),
         description: Type.Optional(Type.String({ description: "Details, in Markdown." })),
         parent: OPTIONAL_ID("The parent task, to make a sub-task."),
         dependencies: Type.Optional(
@@ -205,7 +212,9 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       parameters: Type.Object({
         id: ID("The task ID."),
         title: Type.Optional(Type.String({ description: "The new title." })),
-        type: Type.Optional(Type.String({ description: `The new ${typeDescription(taskTypes).replace(/^The task type/u, "task type")}` })),
+        type: Type.Optional(
+          StringEnum(Object.keys(taskTypes), `The new ${typeDescription(taskTypes).replace(/^The task type/u, "task type")}`),
+        ),
         description: Type.Optional(Type.String({ description: "The new description. Empty removes it." })),
         dependencies: Type.Optional(Type.Array(ID("A task ID."), { description: "The new list of dependencies." })),
       }),
@@ -323,7 +332,7 @@ function sendSpec(): ToolSpec {
     promptSnippet: "Send a message to a different agent",
     parameters: Type.Object({
       to: Type.String({ description: 'The agent name, for example "lead" or "tau-t2-1".' }),
-      priority: Type.String({ description: 'The priority: "steer" or "info".' }),
+      priority: StringEnum(PRIORITIES, 'The priority: "steer" or "info".'),
       text: Type.String({ description: "The message, in Markdown.", minLength: 1 }),
     }),
     run: async (session, params) => {
@@ -483,7 +492,7 @@ function delegationSpecs(): ToolSpec[] {
         id: ID("The task to give to the sub-agent."),
         model: Type.Optional(Type.String({ description: "The pi model ID, as provider/model-id. The default is your model." })),
         thinking: Type.Optional(
-          Type.String({ description: `The thinking level: ${THINKING_LEVELS.join(", ")}. The default is your thinking level.` }),
+          StringEnum(THINKING_LEVELS, `The thinking level: ${THINKING_LEVELS.join(", ")}. The default is your thinking level.`),
         ),
       }),
       run: async (session, params) => {
