@@ -19,7 +19,8 @@ While work is open, `tau` tells each agent to continue (see
 9. [Tools](#tools)
 10. [Commands and keys](#commands-and-keys)
 11. [Storage](#storage)
-12. [Configuration](#configuration)
+12. [Sticky devices](#sticky-devices)
+13. [Configuration](#configuration)
 
 ---
 
@@ -1202,6 +1203,8 @@ compaction, or a session resume.
 ```text
 ~/.pi/tau/
 ├── config.json
+├── sticky-devices/        (macOS: see Sticky devices)
+│   └── <device-id>
 └── tasklists/
     └── <lead-session-id>.db
 ```
@@ -1383,6 +1386,87 @@ changes of sub-agents after the last record.
 
 ---
 
+## Sticky devices
+
+On macOS, each agent (the lead and each sub-agent) sends its state to the
+Sticky devices nearby, over
+Bluetooth LE. The Agents app of the sticky shows the agents. A sub-agent
+shows under its parent.
+
+To use it:
+
+1. Pair the sticky with the Mac one time: open the Bluetooth tab of the
+   sticky (pair mode), then run `sticky read environmental_sensing.temperature`
+   and accept the pairing dialog (the sticky CLI of the sticky repository).
+2. Open the Agents app on the sticky.
+3. Start pi. On the first start, macOS asks for the Bluetooth permission
+   of the terminal application.
+
+| Event in pi                                         | State on the sticky                          |
+|-----------------------------------------------------|----------------------------------------------|
+| The session starts                                  | `idle`                                       |
+| A run starts (`agent_start`, `turn_start`)          | `working`                                    |
+| An "ask question" tool runs (the `askTool`, `ask_user_question`, or `tau_ask_user`) | `question`, then the state before the call |
+| An extension shows a UI prompt (for example a confirmation) | `question`, then the state before it  |
+| `tau_wait` runs                                     | `waiting`, then the state before the call    |
+| The run ends with an error                          | `error`                                      |
+| The run ends after `tau_ask_user`                   | `question`, until the next run               |
+| The run ends (other cases)                          | `idle`                                       |
+| The session stops                                   | `terminated` (the sticky removes the agent)  |
+
+Before an "ask question" tool or `tau_wait` runs, `tau` waits for the
+writes to the connected stickies, 2 seconds at most. Thus the sticky
+usually shows `question` before the question shows in pi. This is not a
+guarantee: when a write is slow or fails, the tool runs, and the sticky
+can show the state later, or not at all (for example, when the tool ends
+first). For a UI prompt, pi does not wait: the sticky shows `question` a
+short time after the prompt.
+
+The metadata of an agent:
+
+| Key         | Value                                                              |
+|-------------|--------------------------------------------------------------------|
+| `name`      | `lead` for the lead. For a sub-agent, the short label of the title of its task (the same label as in the herdr side bar), else its agent name. |
+| `workspace` | The working directory of pi.                                       |
+| `parent`    | The sticky session ID of the parent agent (sub-agents only).       |
+| `model`     | The name of the model. It changes when you select a different model. |
+
+How it works:
+
+- `tau` uses [`@stoprocent/noble`](https://www.npmjs.com/package/@stoprocent/noble)
+  (an optional dependency) with the CoreBluetooth bindings. macOS shares
+  one Bluetooth link to the sticky between all processes, and uses the
+  bonds of the Mac. Thus all agents (and `sticky server`) can use the
+  sticky at the same time.
+- A connected sticky does not advertise. `tau` keeps the identifiers of the
+  stickies that it found in `~/.pi/tau/sticky-devices/` (one empty file
+  for each sticky), and connects
+  to them without a scan. It also scans for the sticky service (again each
+  30 seconds), to find other stickies.
+- The sticky keeps the agents only while its Agents app is open. `tau`
+  sends the full state again each 30 seconds: after you open the app, the
+  agents show in 30 seconds at most.
+- The sticky session ID of an agent is
+  `tau-<12 hex digits of the task list file name>-<agent name>`.
+- When no sticky is near, when Bluetooth is off, or when the native module
+  does not load, `tau` shows nothing and continues. Not on macOS, `tau` does
+  not use Bluetooth.
+- To find problems, set `TAU_STICKY_LOG` to the path of a log file before
+  you start pi.
+
+> [!WARNING]
+> `tau` cannot make sure that a device is a real sticky. The protocol has
+> no device authentication, and CoreBluetooth does not tell if a link is
+> encrypted with a bond. A device near the Mac (Bluetooth range) that
+> advertises the sticky service can get the metadata (the full path of the
+> working directory, the model, the task labels) and the states. The
+> `sticky` CLI has the same limit. If this is a problem, stop the Sticky
+> support.
+
+To stop it, set `"sticky": false` in the [configuration](#configuration).
+
+---
+
 ## Configuration
 
 Edit `~/.pi/tau/config.json` (in the [tau directory](#storage)). All fields
@@ -1421,6 +1505,7 @@ file is not valid JSON, `tau` uses the default configuration.
 | `maxParallelSubAgents` | An integer from 1 to 32.                                  |
 | `maxIdleContinuations` | An integer from 0 to 100. With 0, the "do not stop" rule gives up at the first early stop. |
 | `askTool`              | The name of the "ask question" tool of a different extension: a letter, then `a-z`, `A-Z`, `0-9`, `_`, and `-` (at most 64 characters). Not a `tau_*` tool, and not a built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`). Not set by default. See [Set the ask tool](#set-the-ask-tool-asktool). |
+| `sticky`               | `true` or `false`. Send the agent states to the Sticky devices nearby (macOS only). The default is `true`. See [Sticky devices](#sticky-devices). |
 | `taskTypes`            | 1 to 50 types. A name starts with `a-z`, then has `a-z`, `0-9`, and `-` (at most 32 characters). Each type has a `description` (1 to 300 characters) and an optional `readOnly`. The list must have `plan`, the type of the first task `T0`. If one type is not valid, `tau` uses the default list. |
 
 Rules for `toggleCompletedKey`:
@@ -1458,6 +1543,9 @@ uses the default configuration.
   // does not register tau_ask_user. Not set by default. Read the warning in
   // "Set the ask tool" before you set it.
   // "askTool": "ask_user_question",
+
+  // Send the agent states to the Sticky devices nearby (macOS only).
+  "sticky": true,
 
   // Task types. This list replaces the default list.
   "taskTypes": {

@@ -66,6 +66,7 @@ describe("parseConfig", () => {
       "maxTreeLines": 8,
       "maxParallelSubAgents": 2,
       "maxIdleContinuations": 5,
+      "sticky": false,
       // "askTool" is commented out in the README example.
       "askTool": "ask_user_question",
       "taskTypes": {
@@ -80,6 +81,7 @@ describe("parseConfig", () => {
       maxTreeLines: 8,
       maxParallelSubAgents: 2,
       maxIdleContinuations: 5,
+      sticky: false,
       askTool: "ask_user_question",
       taskTypes: {
         plan: { description: "Make or change the task list.", readOnly: false },

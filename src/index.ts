@@ -31,6 +31,10 @@ import { forkRevision, forkTaskList, REVISION_ENTRY, sessionIdOf } from "./fork.
 import { taskListFile } from "./tasks/paths.ts";
 import { collectOrphanedTaskLists } from "./tasks/gc.ts";
 import { encodeTaskList } from "./tasks/codec.ts";
+import type { StickyCentral } from "./sticky/central.ts";
+import { startSticky } from "./sticky/index.ts";
+import { loadNobleCentral } from "./sticky/noble.ts";
+import type { StickyReporter } from "./sticky/reporter.ts";
 
 /** Things that tests can replace. */
 export interface TauDependencies {
@@ -44,12 +48,24 @@ export interface TauDependencies {
   readonly superviseMs?: number;
   /** The time between two polls of the inbox, in milliseconds. */
   readonly inboxMs?: number;
+  /**
+   * Makes the Bluetooth central for the stickies. The default is noble on
+   * macOS. Without it (for example in tests), tau does not use stickies.
+   */
+  readonly stickyCentral?: () => StickyCentral | undefined;
 }
 
 const DEFAULT_DEPENDENCIES: TauDependencies = {
   agentDir: getAgentDir,
   now: () => new Date().toISOString(),
+  stickyCentral: () => loadNobleCentral(),
 };
+
+/**
+ * The usual name of an "ask question" tool of a different extension. Also
+ * when `askTool` is not set, the stickies show `question` while it runs.
+ */
+const COMMON_ASK_TOOL = "ask_user_question";
 
 /** The path of this extension. A sub-agent loads the same file. */
 const EXTENSION_PATH = fileURLToPath(import.meta.url);
@@ -85,6 +101,8 @@ export interface TauHandle {
   readonly reporting: Promise<void> | undefined;
   /** The removal of old task lists (see `tasks/gc.ts`). Only a lead starts it. */
   readonly collection: Promise<unknown> | undefined;
+  /** The Sticky support, when it runs (see `sticky/index.ts`). */
+  readonly sticky: StickyReporter | undefined;
 }
 
 export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
@@ -125,6 +143,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   let reporting: Promise<void> | undefined;
   /** True after session_shutdown. A session_start that still waits then stops. */
   let shutDown = false;
+  /** The Sticky support (see `sticky/index.ts`), when it runs. */
+  let sticky: StickyReporter | undefined;
 
   pi.on("session_start", async (event, ctx) => {
     // Keep the promise, not the result, so that two events that start at the
@@ -304,6 +324,34 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       toggleKey: config.toggleCompletedKey,
       pills: config.idPills,
     });
+    if (config.sticky && deps.stickyCentral !== undefined) {
+      const self = identity;
+      sticky = startSticky(pi, {
+        tauDirectory: tauDir(deps.agentDir()),
+        taskListFile: self.file,
+        agentName: self.actor.name,
+        ...(self.role === "subagent" ? { parentAgentName: self.parent } : {}),
+        // The task title gives the name of a sub-agent (see below).
+        displayName: self.actor.name,
+        workspace: ctx.cwd,
+        model: modelLabel(ctx.model),
+        modelLabel,
+        isAskTool: (name) => name === ASK_TOOL || name === config.askTool || name === COMMON_ASK_TOOL,
+        env,
+        central: deps.stickyCentral,
+      });
+      if (sticky !== undefined && self.role === "subagent") {
+        const reporter = sticky;
+        void store
+          .read()
+          .then((list) => {
+            const task = list?.tasks.find((item) => item.id === self.actor.scope);
+            const slug = task === undefined ? undefined : titleSlug(task.title);
+            if (slug !== undefined) reporter.setName(slug);
+          })
+          .catch(() => undefined);
+      }
+    }
     await tree.refresh();
     if (shutDown) {
       store.close();
@@ -330,6 +378,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     shutDown = true;
+    // Tell the stickies first: the other steps can take some time.
+    await sticky?.close();
     widget?.stop();
     supervisor?.stop();
     messageInbox?.stop();
@@ -370,6 +420,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     },
     get collection() {
       return collection;
+    },
+    get sticky() {
+      return sticky;
     },
   };
 }

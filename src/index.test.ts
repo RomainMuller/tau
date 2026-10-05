@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
 import tau, { createTau, errorKind, type TauDependencies } from "./index.ts";
+import type { StickyCentral } from "./sticky/central.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { taskListFile } from "./tasks/paths.ts";
 import { seedTaskList } from "./tasks/model.ts";
@@ -227,6 +228,81 @@ describe("tau extension", () => {
     assert.deepEqual(badges(widgets), [{ key: "tau", lines: ["🟢 Herdr"] }]);
     assert.equal(typeof widgets.at(-1)?.lines, "function", "the tree widget replaces the badge");
     assert.deepEqual(detections(pi), [[HERDR_BIN, "pane", "current", "--current"]]);
+  });
+
+  describe("sticky support", () => {
+    /** A central with Bluetooth off: the link starts and stops, and connects to nothing. */
+    function offCentral(): { central: StickyCentral; calls: string[] } {
+      const calls: string[] = [];
+      const central: StickyCentral = {
+        waitForPoweredOn: async () => false,
+        onPowerChange: () => void calls.push("onPowerChange"),
+        startScan: async () => void calls.push("startScan"),
+        stopScan: async () => void calls.push("stopScan"),
+        connect: async () => {
+          throw new Error("off");
+        },
+        stop: () => void calls.push("stop"),
+      };
+      return { central, calls };
+    }
+
+    it("reports the lifecycle of the lead, and stops the link at shutdown", async () => {
+      enableHerdr();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx();
+      const { central, calls } = offCentral();
+      const handle = createTau(pi.api, { ...deps, stickyCentral: () => central });
+
+      await emit(pi, "session_start", ctx);
+      assert.equal(handle.sticky?.state, "idle");
+      await all(pi, "agent_start")({ type: "agent_start" }, ctx);
+      assert.equal(handle.sticky?.state, "working");
+      await all(pi, "tool_execution_start")({ type: "tool_execution_start", toolName: "tau_wait", toolCallId: "w" }, ctx);
+      assert.equal(handle.sticky?.state, "waiting");
+      await all(pi, "tool_execution_end")({ type: "tool_execution_end", toolName: "tau_wait", toolCallId: "w" }, ctx);
+      assert.equal(handle.sticky?.state, "working");
+      // The usual ask tool, also when askTool is not set.
+      await all(pi, "tool_execution_start")({ type: "tool_execution_start", toolName: "ask_user_question", toolCallId: "q" }, ctx);
+      assert.equal(handle.sticky?.state, "question");
+      await all(pi, "tool_execution_end")({ type: "tool_execution_end", toolName: "ask_user_question", toolCallId: "q" }, ctx);
+      assert.equal(handle.sticky?.state, "working");
+      await emit(pi, "session_shutdown", ctx);
+      assert.deepEqual(calls, ["onPowerChange", "stop"]);
+    });
+
+    it("does not start when the configuration has sticky: false", async () => {
+      enableHerdr();
+      await mkdir(join(root, "tau"), { recursive: true });
+      await writeFile(join(root, "tau", "config.json"), JSON.stringify({ sticky: false }));
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx();
+      const { central } = offCentral();
+      let made = 0;
+      const handle = createTau(pi.api, {
+        ...deps,
+        stickyCentral: () => {
+          made += 1;
+          return central;
+        },
+      });
+
+      await emit(pi, "session_start", ctx);
+      assert.equal(handle.sticky, undefined);
+      assert.equal(made, 0);
+      await emit(pi, "session_shutdown", ctx);
+    });
+
+    it("does not start when Bluetooth LE is not available", async () => {
+      enableHerdr();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx();
+      const handle = createTau(pi.api, { ...deps, stickyCentral: () => undefined });
+
+      await emit(pi, "session_start", ctx);
+      assert.equal(handle.sticky, undefined);
+      await emit(pi, "session_shutdown", ctx);
+    });
   });
 
   describe("removal of old task lists", () => {

@@ -43,6 +43,11 @@ export interface TauConfig {
    * tau registers `tau_ask_user` as the last resort.
    */
   readonly askTool?: string;
+  /**
+   * Send the state of each agent to the Sticky devices nearby, over
+   * Bluetooth LE (macOS only). See `sticky/reporter.ts`.
+   */
+  readonly sticky: boolean;
 }
 
 export const DEFAULT_CONFIG: TauConfig = {
@@ -52,6 +57,7 @@ export const DEFAULT_CONFIG: TauConfig = {
   maxParallelSubAgents: DEFAULT_MAX_SUB_AGENTS,
   maxIdleContinuations: DEFAULT_MAX_IDLE_CONTINUATIONS,
   taskTypes: DEFAULT_TASK_TYPE_DEFINITIONS,
+  sticky: true,
 };
 
 /** The name of the configuration file in the tau directory. */
@@ -197,6 +203,7 @@ function parseConfigText(text: string): { config: TauConfig; problems: string[] 
     maxIdleContinuations: (item) => integerIn(item, 0, 100),
     taskTypes: (item) => taskTypes(item, problems),
     askTool: (item) => (typeof item === "string" && isAskToolName(item) ? item : undefined),
+    sticky: (item) => (typeof item === "boolean" ? item : undefined),
   };
   const expected: Record<string, string> = {
     toggleCompletedKey: 'a key, for example "ctrl+shift+t"',
@@ -207,6 +214,7 @@ function parseConfigText(text: string): { config: TauConfig; problems: string[] 
     taskTypes: "an object of task types (see the README)",
     askTool:
       'the name of an "ask question" tool of a different extension (a letter, then a-z, A-Z, 0-9, _, and -, at most 64 characters; not a tau_ tool or a built-in tool)',
+    sticky: "true or false",
   };
   const config: Record<string, unknown> = { ...DEFAULT_CONFIG };
   for (const [key, item] of Object.entries(value)) {
