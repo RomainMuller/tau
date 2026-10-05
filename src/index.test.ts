@@ -8,7 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
 import tau, { createTau, errorKind, type TauDependencies } from "./index.ts";
-import type { StickyCentral } from "./sticky/central.ts";
+import { ServerAbsentError, type StickyServer } from "./sticky/server.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { taskListFile } from "./tasks/paths.ts";
 import { seedTaskList } from "./tasks/model.ts";
@@ -231,28 +231,25 @@ describe("tau extension", () => {
   });
 
   describe("sticky support", () => {
-    /** A central with Bluetooth off: the link starts and stops, and connects to nothing. */
-    function offCentral(): { central: StickyCentral; calls: string[] } {
+    /** A server that is not there: the link starts and stops, and sends nothing. */
+    function absentServer(): { server: StickyServer; calls: string[] } {
       const calls: string[] = [];
-      const central: StickyCentral = {
-        waitForPoweredOn: async () => false,
-        onPowerChange: () => void calls.push("onPowerChange"),
-        startScan: async () => void calls.push("startScan"),
-        stopScan: async () => void calls.push("stopScan"),
-        connect: async () => {
-          throw new Error("off");
+      const server: StickyServer = {
+        write: async () => {
+          calls.push("write");
+          throw new ServerAbsentError("no socket");
         },
-        stop: () => void calls.push("stop"),
+        close: () => void calls.push("close"),
       };
-      return { central, calls };
+      return { server, calls };
     }
 
     it("reports the lifecycle of the lead, and stops the link at shutdown", async () => {
       enableHerdr();
       const pi = fakePi({ code: 0, stdout: PANE_REPLY });
       const { ctx } = fakeCtx();
-      const { central, calls } = offCentral();
-      const handle = createTau(pi.api, { ...deps, stickyCentral: () => central });
+      const { server, calls } = absentServer();
+      const handle = createTau(pi.api, { ...deps, stickyServer: () => server });
 
       await emit(pi, "session_start", ctx);
       assert.equal(handle.sticky?.state, "idle");
@@ -268,7 +265,8 @@ describe("tau extension", () => {
       await all(pi, "tool_execution_end")({ type: "tool_execution_end", toolName: "ask_user_question", toolCallId: "q" }, ctx);
       assert.equal(handle.sticky?.state, "working");
       await emit(pi, "session_shutdown", ctx);
-      assert.deepEqual(calls, ["onPowerChange", "stop"]);
+      assert.equal(calls.at(-1), "close");
+      assert.ok(calls.includes("write"), "the link tries to send the record");
     });
 
     it("does not start when the configuration has sticky: false", async () => {
@@ -277,13 +275,13 @@ describe("tau extension", () => {
       await writeFile(join(root, "tau", "config.json"), JSON.stringify({ sticky: false }));
       const pi = fakePi({ code: 0, stdout: PANE_REPLY });
       const { ctx } = fakeCtx();
-      const { central } = offCentral();
+      const { server } = absentServer();
       let made = 0;
       const handle = createTau(pi.api, {
         ...deps,
-        stickyCentral: () => {
+        stickyServer: () => {
           made += 1;
-          return central;
+          return server;
         },
       });
 
@@ -293,11 +291,11 @@ describe("tau extension", () => {
       await emit(pi, "session_shutdown", ctx);
     });
 
-    it("does not start when Bluetooth LE is not available", async () => {
+    it("does not start when there is no socket path for the sticky server", async () => {
       enableHerdr();
       const pi = fakePi({ code: 0, stdout: PANE_REPLY });
       const { ctx } = fakeCtx();
-      const handle = createTau(pi.api, { ...deps, stickyCentral: () => undefined });
+      const handle = createTau(pi.api, { ...deps, stickyServer: () => undefined });
 
       await emit(pi, "session_start", ctx);
       assert.equal(handle.sticky, undefined);

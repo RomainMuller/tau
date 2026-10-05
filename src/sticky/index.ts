@@ -1,7 +1,8 @@
 /**
  * The Sticky support of tau: each pi process (the lead and each sub-agent)
  * sends the state of its agent to the stickies nearby. See `reporter.ts`
- * for the states, and `link.ts` for the Bluetooth part.
+ * for the states, and `link.ts` and `server.ts` for the link to the stickies
+ * (through `sticky server`).
  *
  * Sticky session IDs come from the task list and the agent name, so that a
  * sub-agent knows the session ID of its parent without a message:
@@ -15,12 +16,11 @@ import { basename } from "node:path";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import type { StickyCentral } from "./central.ts";
-import { DeviceCache } from "./devices.ts";
 import { StickyLink } from "./link.ts";
 import { registerStickyReporter, type StickyReporter } from "./reporter.ts";
+import type { StickyServer } from "./server.ts";
 
-/** A file for the log of the Bluetooth link. Only for problems: by default, there is no log. */
+/** A file for the log of the link to the sticky server. Only for problems: by default, there is no log. */
 export const ENV_STICKY_LOG = "TAU_STICKY_LOG";
 
 export function stickySessionId(taskListFile: string, agentName: string): string {
@@ -31,7 +31,6 @@ export function stickySessionId(taskListFile: string, agentName: string): string
 }
 
 export interface StartStickyOptions {
-  readonly tauDirectory: string;
   /** The task list of the lead (also for a sub-agent). */
   readonly taskListFile: string;
   readonly agentName: string;
@@ -43,25 +42,26 @@ export interface StartStickyOptions {
   readonly modelLabel: (model: { readonly id: string; readonly name?: string }) => string | undefined;
   readonly isAskTool: (toolName: string) => boolean;
   readonly env: NodeJS.ProcessEnv;
-  /** Makes the Bluetooth central (noble on macOS). */
-  readonly central: () => StickyCentral | undefined;
+  /** Makes the client of `sticky server` (see `server.ts`). */
+  readonly server: () => StickyServer | undefined;
 }
 
 /**
  * Starts the Sticky support. Returns `undefined` (and does nothing) when
- * Bluetooth LE is not available (for example, not macOS, or the native
- * module did not load). When no sticky is near, it does nothing visible.
+ * there is no socket path for `sticky server` (not macOS, and no
+ * `STICKY_SOCKET`). When no server runs, or no sticky is near, it does
+ * nothing visible.
  */
 export function startSticky(pi: ExtensionAPI, options: StartStickyOptions): StickyReporter | undefined {
-  const central = options.central();
-  if (central === undefined) return undefined;
+  const server = options.server();
+  if (server === undefined) return undefined;
   const logFile = options.env[ENV_STICKY_LOG];
   const log =
     logFile === undefined || logFile === ""
       ? undefined
       : (message: string) =>
           void appendFile(logFile, `${new Date().toISOString()} ${options.agentName}: ${message}\n`).catch(() => undefined);
-  const link = new StickyLink({ central, cache: new DeviceCache(options.tauDirectory), ...(log === undefined ? {} : { log }) });
+  const link = new StickyLink({ server, ...(log === undefined ? {} : { log }) });
   const reporter = registerStickyReporter(pi, {
     link,
     sessionId: stickySessionId(options.taskListFile, options.agentName),

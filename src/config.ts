@@ -44,8 +44,8 @@ export interface TauConfig {
    */
   readonly askTool?: string;
   /**
-   * Send the state of each agent to the Sticky devices nearby, over
-   * Bluetooth LE (macOS only). See `sticky/reporter.ts`.
+   * Send the state of each agent to the Sticky devices, through
+   * `sticky server` (macOS). See `sticky/reporter.ts`.
    */
   readonly sticky: boolean;
 }

@@ -31,10 +31,9 @@ import { forkRevision, forkTaskList, REVISION_ENTRY, sessionIdOf } from "./fork.
 import { taskListFile } from "./tasks/paths.ts";
 import { collectOrphanedTaskLists } from "./tasks/gc.ts";
 import { encodeTaskList } from "./tasks/codec.ts";
-import type { StickyCentral } from "./sticky/central.ts";
 import { startSticky } from "./sticky/index.ts";
-import { loadNobleCentral } from "./sticky/noble.ts";
 import type { StickyReporter } from "./sticky/reporter.ts";
+import { socketStickyServer, type StickyServer } from "./sticky/server.ts";
 
 /** Things that tests can replace. */
 export interface TauDependencies {
@@ -49,16 +48,17 @@ export interface TauDependencies {
   /** The time between two polls of the inbox, in milliseconds. */
   readonly inboxMs?: number;
   /**
-   * Makes the Bluetooth central for the stickies. The default is noble on
-   * macOS. Without it (for example in tests), tau does not use stickies.
+   * Makes the client of `sticky server` for the environment. The default
+   * uses its UNIX socket. Without it (for example in tests), tau does not
+   * use stickies.
    */
-  readonly stickyCentral?: () => StickyCentral | undefined;
+  readonly stickyServer?: (env: NodeJS.ProcessEnv) => StickyServer | undefined;
 }
 
 const DEFAULT_DEPENDENCIES: TauDependencies = {
   agentDir: getAgentDir,
   now: () => new Date().toISOString(),
-  stickyCentral: () => loadNobleCentral(),
+  stickyServer: socketStickyServer,
 };
 
 /**
@@ -324,10 +324,10 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       toggleKey: config.toggleCompletedKey,
       pills: config.idPills,
     });
-    if (config.sticky && deps.stickyCentral !== undefined) {
+    const stickyServer = deps.stickyServer;
+    if (config.sticky && stickyServer !== undefined) {
       const self = identity;
       sticky = startSticky(pi, {
-        tauDirectory: tauDir(deps.agentDir()),
         taskListFile: self.file,
         agentName: self.actor.name,
         ...(self.role === "subagent" ? { parentAgentName: self.parent } : {}),
@@ -338,7 +338,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
         modelLabel,
         isAskTool: (name) => name === ASK_TOOL || name === config.askTool || name === COMMON_ASK_TOOL,
         env,
-        central: deps.stickyCentral,
+        server: () => stickyServer(env),
       });
       if (sticky !== undefined && self.role === "subagent") {
         const reporter = sticky;
