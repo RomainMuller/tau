@@ -295,6 +295,8 @@ function checkEvent(value: unknown, where: string): TaskEvent {
     }
     case "claimed":
       return { ...base, kind };
+    case "released":
+      return { ...base, kind, reason: string(event.reason, `${where}.reason`) };
     case "completed":
       return { ...base, kind, result: string(event.result, `${where}.result`) };
     case "failed":

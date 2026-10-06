@@ -66,6 +66,11 @@ export interface SupervisorOptions {
   readonly now: () => string;
   /** The panes that this process made. tau can close them when they are empty. */
   readonly createdPanes?: Set<string>;
+  /**
+   * The sub-agents that a delegation of this process starts now. The
+   * liveness check does not check them (see `delegate.ts`).
+   */
+  readonly startingAgents?: ReadonlySet<string>;
   /** Called after the task list changed. */
   readonly onChange?: () => void;
   readonly intervalMs?: number;
@@ -198,6 +203,7 @@ export class Supervisor {
     const list = await this.#options.store.read().catch(() => undefined);
     if (list === undefined) return;
     const child = liveChildAgents(list, this.#options.actor.name).find((record) => {
+      if (this.#options.startingAgents?.has(record.name) === true) return false;
       const live = findLive(agents, record, nowMs);
       return live !== undefined && live.name === undefined;
     });
@@ -214,6 +220,9 @@ export class Supervisor {
     const ctx = { actor, now: this.#options.now() };
     let changed = false;
     for (const child of liveChildAgents(current, actor.name)) {
+      // This process starts the child now: the delegation decides what
+      // happens to it (see `delegate.ts`), also after the start grace time.
+      if (this.#options.startingAgents?.has(child.name) === true) continue;
       const live = findLive(agents, child, nowMs);
       if (live === undefined) {
         const age = nowMs - Date.parse(child.startedAt);

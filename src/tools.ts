@@ -9,6 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type, type TSchema } from "typebox";
 
 import { checkModel, checkThinking, delegate, delegationText, THINKING_LEVELS, type DelegationContext } from "./delegate.ts";
+import { AGENT_START_TIMEOUT_MS, MAX_AGENT_START_TIMEOUT_MS } from "./herdr-client.ts";
 import { agentSummary, descriptionIsWork, formatChange, formatList, formatSection, formatTask, TASK_SECTIONS, type TaskSection } from "./format.ts";
 import { TauError } from "./tasks/errors.ts";
 import { activeTask, findTask, getTask, isClosed, isTaskId, ownerError, type AgentRecord, type TaskList } from "./tasks/model.ts";
@@ -494,6 +495,13 @@ function delegationSpecs(): ToolSpec[] {
         thinking: Type.Optional(
           StringEnum(THINKING_LEVELS, `The thinking level: ${THINKING_LEVELS.join(", ")}. The default is your thinking level.`),
         ),
+        start_timeout_seconds: Type.Optional(
+          Type.Integer({
+            minimum: 1,
+            maximum: MAX_AGENT_START_TIMEOUT_MS / 1_000,
+            description: `The time for the sub-agent to start, in seconds: pi is ready in the new pane, and it starts to work on its first prompt (the wait for the new shell gets at least 15 seconds, and the wait for the first work at least 10 seconds). The default is ${AGENT_START_TIMEOUT_MS / 1_000}. Use a higher value when a start timed out (for example, the computer is slow).`,
+          }),
+        ),
       }),
       run: async (session, params) => {
         if (session.delegation === undefined) {
@@ -505,9 +513,18 @@ function delegationSpecs(): ToolSpec[] {
           throw new TauError("invalid_argument", "Give a model: tau does not know your model.");
         }
         const thinking = typeof params.thinking === "string" ? params.thinking : current.thinking;
+        const seconds = params.start_timeout_seconds;
+        if (seconds !== undefined && (typeof seconds !== "number" || !Number.isSafeInteger(seconds) || seconds < 1 || seconds > MAX_AGENT_START_TIMEOUT_MS / 1_000)) {
+          throw new TauError("invalid_argument", `start_timeout_seconds must be an integer from 1 to ${MAX_AGENT_START_TIMEOUT_MS / 1_000}.`);
+        }
         const result = await delegate(
           { ...session.delegation, store: session.store, actor: session.actor, now: session.now },
-          { id: String(params.id), model: checkModel(model), thinking: checkThinking(thinking) },
+          {
+            id: String(params.id),
+            model: checkModel(model),
+            thinking: checkThinking(thinking),
+            ...(seconds === undefined ? {} : { startTimeoutMs: seconds * 1_000 }),
+          },
         );
         session.onChange?.();
         const list = await session.store.read();

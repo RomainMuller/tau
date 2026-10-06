@@ -560,6 +560,36 @@ describe("tau_delegate and tau_wait tools", () => {
     await assert.rejects(call("tau_delegate", { id: "T0", thinking: "huge" }, map), /not a thinking level/);
   });
 
+  it("gives start_timeout_seconds to herdr, and rejects a value that is not valid", async () => {
+    const timeouts: Array<number | undefined> = [];
+    const herdr = {
+      listAgents: async () => [],
+      splitDirection: async () => "right",
+      splitPane: async () => "w1:p5",
+      startPiAgent: async (_name: string, _pane: string, _args: string[], timeoutMs?: number) => {
+        timeouts.push(timeoutMs);
+      },
+      waitForWork: async () => undefined,
+      closePane: async () => undefined,
+    };
+    const map = register({
+      ...session,
+      delegation: { herdr: herdr as never, paneId: "w1:p1", cwd: "/", extensionPath: "/tau.ts" },
+      current: () => ({ model: "prov/model-a", thinking: "high" }),
+    });
+    for (const value of [0, 301, 1.5, "60"]) {
+      await assert.rejects(call("tau_delegate", { id: "T0", start_timeout_seconds: value }, map), /start_timeout_seconds must be an integer from 1 to 300/);
+    }
+    assert.deepEqual(timeouts, []);
+    await call("tau_delegate", { id: "T0", start_timeout_seconds: 120 }, map);
+    assert.deepEqual(timeouts, [120_000]);
+    for (const [id, seconds] of [["T1", 1], ["T2", 300]] as const) {
+      await call("tau_create", { title: id, type: "code" }, map);
+      await call("tau_delegate", { id, start_timeout_seconds: seconds }, map);
+    }
+    assert.deepEqual(timeouts, [120_000, 1_000, 300_000]);
+  });
+
   it("validates the tau_wait arguments", async () => {
     await assert.rejects(call("tau_wait", { ids: ["x"] }), /is not a task ID/);
     await assert.rejects(call("tau_wait", { ids: ["T9"] }), /Task T9 does not exist/);

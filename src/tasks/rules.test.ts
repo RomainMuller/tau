@@ -19,6 +19,7 @@ import {
   MAX_TASKS,
   MAX_TEXT_LENGTH,
   readyTasks,
+  releaseTaskOfAgent,
   updateTask,
   type Actor,
   type RuleContext,
@@ -436,6 +437,8 @@ describe("rollback", () => {
       () => claimTask(list, ctx({ name: "b" }), "T0"),
       () => completeTask(list, ctx({ name: "b" }), "T0", "ok"),
       () => updateTask(list, ctx(), "T1", { description: "" }),
+      () => delegateTask(list, ctx(), { id: "T1", agent: "tau-t1" }),
+      () => releaseTaskOfAgent(list, ctx(), "tau-t1", "T1", "The sub-agent did not start"),
     ];
     for (const step of steps) {
       step();

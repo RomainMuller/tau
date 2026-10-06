@@ -8,24 +8,65 @@
 
 import type { Exec } from "./herdr.ts";
 import { TauError } from "./tasks/errors.ts";
+import { cleanLine } from "./text.ts";
 
 /** The maximum time for a herdr command, in milliseconds. */
 const COMMAND_TIMEOUT_MS = 15_000;
-/** The time for a new agent to start to work on its first prompt. Less than COMMAND_TIMEOUT_MS. */
-const WORK_START_TIMEOUT_MS = 10_000;
-/** The maximum time for a sub-agent to start, in milliseconds. */
+/** The minimum time for a new agent to start to work on its first prompt. */
+export const WORK_START_TIMEOUT_MS = 10_000;
+/** The default maximum time for a sub-agent to start, in milliseconds. */
 export const AGENT_START_TIMEOUT_MS = 60_000;
+/** The maximum value of the start timeout: the maximum of `herdr agent start --timeout`. */
+export const MAX_AGENT_START_TIMEOUT_MS = 300_000;
 /** The maximum time for the shell of a new pane to be ready, in milliseconds. */
 const SHELL_READY_TIMEOUT_MS = 15_000;
 
-/** A herdr command failed. `herdrCode` is the error code of herdr, if it gave one. */
+/**
+ * A herdr command failed. `herdrCode` is the error code of herdr, if it gave
+ * one. `timedOut` is true when tau stopped the command because it did not
+ * reply in time.
+ */
 export class HerdrError extends TauError {
   readonly herdrCode: string | undefined;
+  readonly timedOut: boolean;
 
-  constructor(message: string, herdrCode: string | undefined) {
+  constructor(message: string, herdrCode: string | undefined, timedOut = false) {
     super("storage", message);
     this.herdrCode = herdrCode;
+    this.timedOut = timedOut;
   }
+}
+
+/** The maximum number of characters of a herdr error text in a `StartTimeoutError`. */
+const MAX_CAUSE_CHARS = 500;
+
+/**
+ * The start of a sub-agent timed out: pi was not ready in its pane
+ * (`ready`), or it did not start to work on its first prompt (`work`).
+ */
+export class StartTimeoutError extends TauError {
+  readonly timeoutMs: number;
+  readonly phase: "ready" | "work";
+
+  constructor(phase: "ready" | "work", timeoutMs: number, cause: string) {
+    const what = phase === "ready" ? "pi was not ready in the new pane" : "pi did not start to work on its first prompt";
+    const short = [...cleanLine(cause)].slice(0, MAX_CAUSE_CHARS).join("");
+    super(
+      "storage",
+      `The start timed out: ${what} in ${Math.ceil(timeoutMs / 1_000)} seconds (${short}). ` +
+        `The computer can be slow now (for example, a high CPU load). ` +
+        `Try again with a higher start_timeout_seconds (the default is ${AGENT_START_TIMEOUT_MS / 1_000}, the maximum is ${MAX_AGENT_START_TIMEOUT_MS / 1_000}).`,
+    );
+    this.timeoutMs = timeoutMs;
+    this.phase = phase;
+  }
+}
+
+/** True when a herdr error tells that a herdr command or its wait timed out. */
+function isTimeout(error: unknown): boolean {
+  if (!(error instanceof HerdrError)) return false;
+  if (error.timedOut) return true;
+  return /time[ds]?[ _-]?out/iu.test(`${error.herdrCode ?? ""} ${error.message}`);
 }
 
 export type SplitDirection = "right" | "down";
@@ -124,17 +165,28 @@ export class HerdrClient {
    * Starts a pi agent in a pane. Returns when the agent is ready for input.
    * A new pane needs some time before its shell is ready: while herdr
    * replies `agent_pane_busy`, this function waits and tries again.
+   * `timeoutMs` is the time that herdr waits for pi to be ready. When it
+   * ends, this function throws a `StartTimeoutError`.
    */
-  async startPiAgent(name: string, paneId: string, piArgs: readonly string[]): Promise<void> {
-    const args = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", String(AGENT_START_TIMEOUT_MS), "--", ...piArgs];
-    const deadline = Date.now() + SHELL_READY_TIMEOUT_MS;
+  async startPiAgent(name: string, paneId: string, piArgs: readonly string[], timeoutMs = AGENT_START_TIMEOUT_MS): Promise<void> {
+    const timeout = checkStartTimeout(timeoutMs);
+    // The start timeout is also for the time while the shell is not ready
+    // (but that time is at least SHELL_READY_TIMEOUT_MS). Each try gets the
+    // time that is left.
+    const deadline = Date.now() + Math.max(timeout, SHELL_READY_TIMEOUT_MS);
     for (;;) {
+      const left = Math.max(1, Math.min(timeout, deadline - Date.now()));
+      const args = ["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", String(left), "--", ...piArgs];
       try {
-        await this.#run(args, AGENT_START_TIMEOUT_MS + COMMAND_TIMEOUT_MS);
+        await this.#run(args, left + COMMAND_TIMEOUT_MS);
         return;
       } catch (error) {
-        if (!(error instanceof HerdrError) || error.herdrCode !== "agent_pane_busy" || Date.now() >= deadline) {
-          throw error;
+        if (isTimeout(error)) {
+          throw new StartTimeoutError("ready", timeout, (error as HerdrError).message);
+        }
+        if (!(error instanceof HerdrError) || error.herdrCode !== "agent_pane_busy") throw error;
+        if (Date.now() >= deadline) {
+          throw new StartTimeoutError("ready", timeout, `the shell of the new pane was not ready: ${error.message}`);
         }
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -144,13 +196,21 @@ export class HerdrClient {
   /**
    * Waits until herdr shows that the agent works on a prompt, waits for
    * the user, or did its turn (`working`, `blocked`, or `done`). Sends no
-   * key. Fails after `WORK_START_TIMEOUT_MS`: for example, pi could not send
-   * the first prompt to the model (no login), and it stays idle.
+   * key. Fails after `timeoutMs` (at least `WORK_START_TIMEOUT_MS`): for
+   * example, pi could not send the first prompt to the model (no login),
+   * and it stays idle. When the time ends, throws a `StartTimeoutError`.
    */
-  async waitForWork(name: string): Promise<void> {
-    await this.#run([
-      "agent", "wait", name, "--until", "working", "--until", "blocked", "--until", "done", "--timeout", String(WORK_START_TIMEOUT_MS),
-    ]);
+  async waitForWork(name: string, timeoutMs = WORK_START_TIMEOUT_MS): Promise<void> {
+    const timeout = Math.max(WORK_START_TIMEOUT_MS, Math.min(Math.ceil(timeoutMs), MAX_AGENT_START_TIMEOUT_MS));
+    try {
+      await this.#run(
+        ["agent", "wait", name, "--until", "working", "--until", "blocked", "--until", "done", "--timeout", String(timeout)],
+        timeout + COMMAND_TIMEOUT_MS,
+      );
+    } catch (error) {
+      if (isTimeout(error)) throw new StartTimeoutError("work", timeout, (error as HerdrError).message);
+      throw error;
+    }
   }
 
   /** The layout of the tab of a pane. */
@@ -262,7 +322,7 @@ export class HerdrClient {
       throw new TauError("storage", `herdr ${args[0]} ${args[1]} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (result.killed) {
-      throw new TauError("storage", `herdr ${args[0]} ${args[1]} did not reply in time.`);
+      throw new HerdrError(`herdr ${args[0]} ${args[1]} did not reply in time`, undefined, true);
     }
     if (result.code !== 0) {
       const error = field(parseJson(result.stderr) ?? parseJson(result.stdout), "error");
@@ -275,6 +335,17 @@ export class HerdrClient {
     }
     return parseJson(result.stdout);
   }
+}
+
+/** Checks a start timeout: an integer from 1 to `MAX_AGENT_START_TIMEOUT_MS` milliseconds. */
+export function checkStartTimeout(timeoutMs: number): number {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_AGENT_START_TIMEOUT_MS) {
+    throw new TauError(
+      "invalid_argument",
+      `The start timeout must be from 1 to ${MAX_AGENT_START_TIMEOUT_MS / 1_000} seconds.`,
+    );
+  }
+  return timeoutMs;
 }
 
 function toRect(value: unknown): Rect | undefined {

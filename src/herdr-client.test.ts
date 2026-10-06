@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 
-import { HerdrClient, HerdrError } from "./herdr-client.ts";
+import { checkStartTimeout, HerdrClient, HerdrError, StartTimeoutError } from "./herdr-client.ts";
 import type { Exec, ExecResult } from "./herdr.ts";
 
 type Reply = Partial<ExecResult> | Error;
@@ -63,17 +63,101 @@ describe("HerdrClient", () => {
     ]);
     // The process time limit is longer than the herdr wait.
     assert.ok((options[0]?.timeout ?? 0) > 10_000);
-    const failed = fakeExec([fail("timeout", "timed out")]);
-    await assert.rejects(new HerdrClient(failed.exec, BIN).waitForWork("tau-t1"), /herdr agent wait failed: timed out/);
+    const failed = fakeExec([fail("timeout", "timed out waiting for agent status")]);
+    await assert.rejects(new HerdrClient(failed.exec, BIN).waitForWork("tau-t1"), (error: unknown) => {
+      assert.ok(error instanceof StartTimeoutError);
+      assert.equal(error.phase, "work");
+      assert.match(error.message, /^The start timed out: pi did not start to work on its first prompt in 10 seconds \(herdr agent wait failed: timed out waiting for agent status\)\./);
+      assert.match(error.message, /Try again with a higher start_timeout_seconds/);
+      return true;
+    });
+    const other = fakeExec([fail("agent_not_found", "no agent")]);
+    await assert.rejects(new HerdrClient(other.exec, BIN).waitForWork("tau-t1"), (error: unknown) => !(error instanceof StartTimeoutError));
+  });
+
+  it("waits for work for the given time, at least 10 seconds, and at most 300 seconds", async () => {
+    const { exec, calls, options } = fakeExec([ok({}), ok({}), ok({})]);
+    const client = new HerdrClient(exec, BIN);
+    await client.waitForWork("tau-t1", 45_000);
+    await client.waitForWork("tau-t1", 1);
+    await client.waitForWork("tau-t1", 900_000);
+    assert.deepEqual(calls.map((call) => call.at(-1)), ["45000", "10000", "300000"]);
+    assert.ok((options[0]?.timeout ?? 0) > 45_000);
+  });
+
+  it("cuts a long herdr error text in a start timeout, and removes control characters", () => {
+    const error = new StartTimeoutError("ready", 60_000, `timed out \u001b[31m${"x".repeat(5_000)}`);
+    assert.ok(error.message.length < 1_000, String(error.message.length));
+    assert.doesNotMatch(error.message, /\u001b/);
   });
 
   it("starts pi, and tries again while the new pane is busy", async () => {
     const { exec, calls } = fakeExec([fail("agent_pane_busy", "not a shell"), ok({ agent: {} })]);
     await new HerdrClient(exec, BIN).startPiAgent("tau-t1", "w1:p9", ["--model", "p/m"]);
     assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1]?.slice(1), [
+    assert.deepEqual(calls[0]?.slice(1), [
       "agent", "start", "tau-t1", "--kind", "pi", "--pane", "w1:p9", "--timeout", "60000", "--", "--model", "p/m",
     ]);
+    // The second try gets the time that is left of the start timeout.
+    const left = Number(calls[1]?.[calls[1].indexOf("--timeout") + 1]);
+    assert.ok(left > 55_000 && left <= 60_000, String(left));
+  });
+
+  it("starts pi with a given start timeout, and a longer process time limit", async () => {
+    const { exec, calls, options } = fakeExec([ok({ agent: {} })]);
+    await new HerdrClient(exec, BIN).startPiAgent("tau-t1", "w1:p9", [], 180_000);
+    assert.deepEqual(calls[0]?.slice(1, 9), ["agent", "start", "tau-t1", "--kind", "pi", "--pane", "w1:p9", "--timeout"]);
+    assert.equal(calls[0]?.[9], "180000");
+    assert.ok((options[0]?.timeout ?? 0) > 180_000);
+  });
+
+  it("reports a start timeout of herdr, or of the process, with a hint to use a higher timeout", async () => {
+    for (const reply of [fail("timeout", "timed out waiting for agent startup"), { killed: true, code: 143 }]) {
+      const { exec, calls } = fakeExec([reply]);
+      await assert.rejects(new HerdrClient(exec, BIN).startPiAgent("tau-t1", "w1:p9", [], 90_000), (error: unknown) => {
+        assert.ok(error instanceof StartTimeoutError);
+        assert.equal(error.timeoutMs, 90_000);
+        assert.equal(error.phase, "ready");
+        assert.match(error.message, /^The start timed out: pi was not ready in the new pane in 90 seconds \(herdr agent start /);
+        assert.match(error.message, /Try again with a higher start_timeout_seconds \(the default is 60, the maximum is 300\)\.$/);
+        return true;
+      });
+      assert.equal(calls.length, 1);
+    }
+  });
+
+  it("uses the start timeout also while the shell is not ready, and then reports a start timeout", async () => {
+    let now = 1_000_000;
+    const clock = mock.method(Date, "now", () => now);
+    try {
+      const busy = fail("agent_pane_busy", "the pane shell is not ready");
+      const { exec, calls } = fakeExec([busy, busy, busy]);
+      const wrapped: typeof exec = async (command, args, option) => {
+        const reply = await exec(command, args, option);
+        now += 40_000;
+        return reply;
+      };
+      await assert.rejects(new HerdrClient(wrapped, BIN).startPiAgent("tau-t1", "w1:p9", [], 100_000), (error: unknown) => {
+        assert.ok(error instanceof StartTimeoutError);
+        assert.match(error.message, /the shell of the new pane was not ready/);
+        assert.match(error.message, /Try again with a higher start_timeout_seconds/);
+        return true;
+      });
+      // Each try gets the time that is left.
+      assert.deepEqual(calls.map((call) => call[call.indexOf("--timeout") + 1]), ["100000", "60000", "20000"]);
+    } finally {
+      clock.mock.restore();
+    }
+  });
+
+  it("rejects a start timeout that is not valid, before it runs herdr", async () => {
+    for (const value of [0, -5, 1.5, 300_001, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(() => checkStartTimeout(value), /from 1 to 300 seconds/);
+      const { exec, calls } = fakeExec([]);
+      await assert.rejects(new HerdrClient(exec, BIN).startPiAgent("tau-t1", "w1:p9", [], value), /from 1 to 300 seconds/);
+      assert.equal(calls.length, 0);
+    }
+    assert.equal(checkStartTimeout(300_000), 300_000);
   });
 
   it("does not try again for other errors", async () => {

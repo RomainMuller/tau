@@ -323,7 +323,8 @@ cancel │                                   │         │ owner gone  │ cla
    `result`.
 6. An agent cannot give a task back. If it cannot do the task, it fails the
    task. The `result` tells why, and `retryable: true` tells that a different
-   agent can try again.
+   agent can try again. (Only `tau` gives a task back, when a delegation
+   does not start the sub-agent. See [How it works](#how-it-works).)
 7. A parent task can close only when each sub-task is `completed`, `failed`, or
    `canceled`.
 8. An agent that can change a `waiting` task can **cancel** it. A reason is
@@ -408,7 +409,9 @@ uses its name and its pane.) When a sub-agent is not in the list, `tau` fails
 its task (rule 11), and closes its pane. `tau` does the same for the
 sub-agents of that sub-agent, at all depths, because nobody watches them
 now. A sub-agent that is still starting has 2
-minutes before `tau` checks it. When you move the pane of a sub-agent, `tau`
+minutes before `tau` checks it. While the `tau_delegate` call that starts a
+sub-agent runs, `tau` does not check that sub-agent: the delegation
+decides what happens to it. When you move the pane of a sub-agent, `tau`
 records its new pane (herdr gives a moved pane a new ID). This is also
 correct when the pane moves before the pi of the sub-agent starts: then the
 sub-agent records its new pane when it starts.
@@ -535,6 +538,14 @@ sub-agents do the work.
    [Pane layout](#pane-layout)), and starts pi in the new pane, with the
    first prompt as a pi argument:
    `herdr agent start tau-t2-1 --kind pi --pane <new-pane> --timeout 60000 -- --model … --thinking … --extension <tau> -- "<first prompt>"`
+   - The start timeout is 60 seconds by default. The agent can set a
+     different value (from 1 to 300 seconds) with the `start_timeout_seconds`
+     argument of `tau_delegate`, for example when the computer is slow. It
+     is for two steps: pi is ready in the new pane (`--timeout`, also the
+     time while the shell of the new pane is not ready, at least 15
+     seconds), and pi starts to work on its first prompt (step 4). When the time ends, the
+     error of `tau_delegate` tells that the start timed out, and tells the
+     agent to try again with a higher `start_timeout_seconds`.
 4. The first prompt tells the sub-agent its task ID, and what to do when
    the work is done. It has no text that agents wrote (for example the
    title): the sub-agent reads its task with `tau_get`.
@@ -543,8 +554,9 @@ sub-agents do the work.
      type the prompt into the pane, so no key press can be lost. If `tau`
      does not start correctly in the sub-agent, the prompt does not go to
      the model.
-   - Then `tau` waits (at most 10 seconds) until herdr shows that the
-     sub-agent works on the prompt.
+   - Then `tau` waits until herdr shows that the sub-agent works on the
+     prompt: for the time that is left of the start timeout, but at least
+     10 seconds.
    - If `herdr agent start` fails, or herdr does not show this, `tau` reads
      the pi session file of the sub-agent (at most 4 MiB). The start is
      correct when herdr shows the new sub-agent with this session file (the
@@ -565,12 +577,23 @@ sub-agents do the work.
 7. When the sub-agent closed its task and is idle, `tau` closes its pane. The
    task `result` keeps the output.
 
-If a step after step 2 fails (for example, pi does not start, or the
-sub-agent does not start to work), the task
-becomes `failed` with `retryable: true`, and `tau` closes the new pane when
-this is safe (see [Liveness](#liveness)). Exceptions: a task that the
-sub-agent completed already stays completed (the start is correct), and a
-task with open sub-tasks stays `in_progress` until they close (rule 7).
+If a step after step 2 fails (for example, pi does not start in time, or
+the sub-agent does not start to work), the delegation failed, not the
+work: `tau_delegate` fails, and the task is `waiting` again, with no owner
+(the history has a `released` event with the reason). The agent can
+delegate it again. `tau` closes the new pane when this is safe (see
+[Liveness](#liveness)). When herdr does not reply, `tau` tries to close the
+pane 3 times (1 second between tries, and no new try after 5 seconds). If `tau` cannot close the pane (or
+must not, because a different agent is in it), the error tells the
+agent to delegate the task again only after that pane is closed: pi can
+still run in it. A task that was `failed` (retryable) before the
+delegation is also `waiting` after it. If the sub-agent claimed other tasks (for example
+sub-tasks) before the failure, they become `failed` with
+`retryable: true`. Exceptions: a task that the sub-agent completed already
+stays completed (the start is correct), a task with a sub-task in progress
+stays `in_progress` until its sub-tasks close (rule 7; then `tau` fails
+it), and a task that a different agent aborted keeps the result of the
+abort.
 
 Sub-agents are always pi agents. The new pane is in the tab of the lead (see
 [Pane layout](#pane-layout)).
@@ -651,7 +674,7 @@ A sub-agent that cannot start `tau` correctly must not work: for example,
 these checks fail, it has no valid configuration from its lead, it cannot
 use herdr, or a different extension has a `tau_*` tool name. Then `tau`
 shows an error, blocks all tools, and stops that pi. If pi stops before the
-start completes, the delegation fails at once (the task fails, retryable,
+start completes, the delegation fails at once (the task is `waiting` again,
 and `tau` closes the pane). Else the pane is empty: the parent fails the
 task (`owner agent exited`) when the start grace time ends, and closes the
 pane.
@@ -1087,7 +1110,7 @@ All tools exist only when herdr is available.
 | `tau_complete`  | Close the active task as `completed`, with a result.          |
 | `tau_fail`      | Close the active task as `failed`, with a result and `retryable`. |
 | `tau_cancel`    | Cancel a `waiting` task, with a reason.                       |
-| `tau_delegate`  | Start a sub-agent for a task, with a model and thinking.      |
+| `tau_delegate`  | Start a sub-agent for a task, with a model and thinking (optional `start_timeout_seconds`, default 60). |
 | `tau_abort`     | Stop a sub-agent and its sub-agents, and fail their tasks, with a reason. (A task with open sub-tasks fails when they close.) |
 | `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). It returns at once when a task fails, when the owner of a task stopped after an error, or when a message arrives. |
 | `tau_send`      | Send a message to an agent, with a priority.                  |

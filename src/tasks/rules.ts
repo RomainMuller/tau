@@ -480,6 +480,50 @@ export function failTasksOfAgent(
   return { failed, blocked };
 }
 
+/**
+ * Gives back the task `id` of a sub-agent that did not start: the
+ * delegation failed, not the work. First the other `in_progress` tasks of
+ * `agent` fail (retryable), as `failTasksOfAgent` does (for example
+ * sub-tasks that it claimed). Then task `id` becomes `waiting` again, with
+ * no owner, when `agent` owns it and none of its sub-tasks is in progress.
+ * Else it stays in progress (rule 7), and is in `blocked`.
+ *
+ * Call it only from a trusted controller (as `failTasksOfAgent`).
+ */
+export function releaseTaskOfAgent(
+  list: TaskList,
+  ctx: RuleContext,
+  agent: string,
+  id: string,
+  reason: string,
+): { released: Task | undefined; failed: Task[]; blocked: Task[] } {
+  const text = checkText("reason", reason);
+  const task = findTask(list, id);
+  const owned = task?.status === "in_progress" && task.owner === agent ? task : undefined;
+  // Fail the other tasks first, the deepest first: they can be sub-tasks
+  // of the released task, and a parent closes only after its sub-tasks.
+  const others = list.tasks
+    .filter((item) => item !== owned && item.status === "in_progress" && item.owner === agent)
+    .sort((a, b) => b.id.split(".").length - a.id.split(".").length);
+  const failed: Task[] = [];
+  const blocked: Task[] = [];
+  for (const item of others) {
+    if (childrenOf(list, item.id).some((child) => !isClosed(child))) {
+      blocked.push(item);
+      continue;
+    }
+    recordEvent(list, item, { kind: "failed", at: ctx.now, actor: ctx.actor.name, result: text, retryable: true });
+    failed.push(item);
+  }
+  if (owned === undefined) return { released: undefined, failed, blocked };
+  if (descendantsOf(list, owned.id).some((child) => child.status === "in_progress")) {
+    blocked.push(owned);
+    return { released: undefined, failed, blocked };
+  }
+  recordEvent(list, owned, { kind: "released", at: ctx.now, actor: ctx.actor.name, reason: text });
+  return { released: owned, failed, blocked };
+}
+
 /** The result of an aborted task: `aborted by @<agent>: <reason>`. */
 export function abortResult(agent: string, reason: string): string {
   return `aborted by @${agent}: ${reason}`;

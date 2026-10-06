@@ -10,8 +10,9 @@
  *    all extensions loaded). herdr knows the new agent by its name.
  *
  * If a step after step 1 fails, the agent record ends, and tau closes the
- * new pane when this is safe (else the supervisor tries later). The task
- * fails (retryable). Exceptions:
+ * new pane when this is safe (else the supervisor tries later). The
+ * delegation failed, not the work: the task is `waiting` again, with no
+ * owner (see `releaseTaskOfAgent`). Exceptions:
  *
  * - A task with open sub-tasks stays in progress until they close.
  * - A task that the new sub-agent completed already stays completed: the
@@ -23,13 +24,13 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import type { HerdrClient } from "./herdr-client.ts";
+import { AGENT_START_TIMEOUT_MS, checkStartTimeout, WORK_START_TIMEOUT_MS, type HerdrClient } from "./herdr-client.ts";
 import { ENV_AGENT_NAME, ENV_CONFIG, ENV_LEAD_PANE, ENV_PARENT_AGENT, ENV_TASK_ID, ENV_TASKLIST } from "./identity.ts";
 import { layoutOwnership, placeNewPane, rebalance, serialized, type Placement } from "./layout.ts";
 import { agentNameFor } from "./names.ts";
 import { TauError } from "./tasks/errors.ts";
 import { findTask, type Task, type TaskList } from "./tasks/model.ts";
-import { checkAgentNotEnded, delegateTask, endAgent, failTasksOfAgent, markAgentRunning, setAgentPane, type Actor } from "./tasks/rules.ts";
+import { checkAgentNotEnded, delegateTask, endAgent, markAgentRunning, releaseTaskOfAgent, setAgentPane, type Actor } from "./tasks/rules.ts";
 import type { TaskListStore } from "./tasks/store.ts";
 import { isAgentSession, isSubAgentIn, START_GRACE_MS } from "./supervisor.ts";
 import { cleanLine } from "./text.ts";
@@ -53,6 +54,14 @@ export interface DelegationContext {
   readonly maxAgents?: number;
   /** tau adds each pane that it makes. The supervisor can close them. */
   readonly createdPanes?: Set<string>;
+  /**
+   * tau adds the new sub-agent while the delegation runs, and removes it
+   * after. The supervisor does not check these sub-agents: else it could
+   * fail the task of a slow start (see `SupervisorOptions.startingAgents`).
+   */
+  readonly startingAgents?: Set<string>;
+  /** The time between two tries to close the pane of a failed start, in milliseconds (for tests). */
+  readonly closeRetryMs?: number;
   /** Asks the supervisor to close a pane later, when a close now fails. */
   readonly closeLater?: (pane: string, agent: string, session?: string) => void;
   /** The effective configuration as JSON, for the new sub-agent (`TAU_CONFIG`). */
@@ -70,7 +79,17 @@ export interface DelegateRequest {
   /** A pi model, for example `provider/model-id`. */
   readonly model: string;
   readonly thinking: ThinkingLevel;
+  /**
+   * The time for pi to be ready in the new pane and to start to work on
+   * its first prompt, in milliseconds. The default is
+   * `AGENT_START_TIMEOUT_MS`. The wait for the first work always gets at
+   * least `WORK_START_TIMEOUT_MS`.
+   */
+  readonly startTimeoutMs?: number;
 }
+
+/** The maximum number of characters of the reason of a failed start, in the task history. */
+const MAX_REASON_CHARS = 2_000;
 
 export interface Delegation {
   readonly agent: string;
@@ -98,6 +117,7 @@ export function checkThinking(level: string): ThinkingLevel {
 export async function delegate(ctx: DelegationContext, request: DelegateRequest): Promise<Delegation> {
   const model = checkModel(request.model);
   const thinking = checkThinking(request.thinking);
+  const startTimeoutMs = checkStartTimeout(request.startTimeoutMs ?? AGENT_START_TIMEOUT_MS);
 
   // Names that herdr uses now cannot be used for the new agent.
   const liveNames = new Set((await ctx.herdr.listAgents()).map((agent) => agent.name).filter((name) => name !== undefined));
@@ -115,6 +135,22 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
     return { agent, task: task.id, title: task.title };
   });
 
+  ctx.startingAgents?.add(reserved.agent);
+  try {
+    return await startReserved(ctx, reserved, model, thinking, startTimeoutMs);
+  } finally {
+    ctx.startingAgents?.delete(reserved.agent);
+  }
+}
+
+/** Starts the sub-agent of a reserved task (steps 2 and 3), and cleans up when this fails. */
+async function startReserved(
+  ctx: DelegationContext,
+  reserved: { readonly agent: string; readonly task: string },
+  model: string,
+  thinking: ThinkingLevel,
+  startTimeoutMs: number,
+): Promise<Delegation> {
   let pane: string | undefined;
   try {
     const env = {
@@ -153,11 +189,18 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
     // checks the identity of the sub-agent). So no key press can be lost.
     const piArgs = ["--model", model, "--thinking", thinking, "--extension", ctx.extensionPath];
     try {
-      await ctx.herdr.startPiAgent(reserved.agent, pane, [...piArgs, "--", firstPrompt(reserved.agent, ctx.actor.name, reserved.task)]);
+      // The start timeout is for the two steps: pi is ready, and it works.
+      const deadline = Date.now() + startTimeoutMs;
+      await ctx.herdr.startPiAgent(
+        reserved.agent,
+        pane,
+        [...piArgs, "--", firstPrompt(reserved.agent, ctx.actor.name, reserved.task)],
+        startTimeoutMs,
+      );
       // pi can fail to send the first prompt to the model (for example, no
       // login): then it stays idle, and nobody fails the task. So the start
       // is correct only when herdr shows that the sub-agent works.
-      await ctx.herdr.waitForWork(reserved.agent);
+      await ctx.herdr.waitForWork(reserved.agent, Math.max(WORK_START_TIMEOUT_MS, deadline - Date.now()));
     } catch (error) {
       // The sub-agent works while herdr waits for it: a fast one can
       // complete its task before herdr replies (also with an error), or do
@@ -205,7 +248,7 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
       checkAgentNotEnded(after, reserved.agent);
     }
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
+    const reason = [...cleanLine(error instanceof Error ? error.message : String(error))].slice(0, MAX_REASON_CHARS).join("");
     let session: string | undefined;
     const cleaned = await ctx.store
       .mutate((list) => {
@@ -215,7 +258,8 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
         // have their result already, or stay in progress until their
         // sub-tasks close. Do not replace that.
         if (record?.state === "ended") return findTask(list, reserved.task);
-        failTasksOfAgent(list, { actor: ctx.actor, now: ctx.now() }, reserved.agent, `The sub-agent did not start: ${reason}`);
+        // The delegation failed, not the work: give the task back.
+        releaseTaskOfAgent(list, { actor: ctx.actor, now: ctx.now() }, reserved.agent, reserved.task, `The sub-agent did not start: ${reason}`);
         endAgent(list, reserved.agent, ctx.now());
         return findTask(list, reserved.task);
       })
@@ -225,19 +269,23 @@ export async function delegate(ctx: DelegationContext, request: DelegateRequest)
       );
     let paneOpen = false;
     if (pane !== undefined) {
-      paneOpen = !(await closeNewPane(ctx, pane, reserved.agent, session));
+      paneOpen = !(await closeNewPaneSoon(ctx, pane, reserved.agent, session));
       if (paneOpen) ctx.closeLater?.(pane, reserved.agent, session);
     }
     const parts = [`tau could not start a sub-agent for ${reserved.task}: ${reason}`];
     const task = cleaned.task;
     parts.push(
       !cleaned.ok
-        ? `tau could not record the failure either. The liveness check fails the task when the sub-agent does not run (at most ${Math.round(START_GRACE_MS / 60_000)} minutes); then the lead can retry it.`
-        : task?.status === "failed"
-          ? `The task failed (retryable: ${task.retryable === true ? "yes" : "no"}). Read its result with tau_get.`
-          : task?.status === "in_progress"
-            ? "The task stays in progress until its sub-tasks close. Then tau fails it."
-            : `The task is ${task?.status ?? "unknown"}.`,
+        ? `tau could not record the failure either. The liveness check fails the task when the sub-agent does not run (at most ${Math.ceil(START_GRACE_MS / 60_000)} minutes); then the lead can retry it.`
+        : task?.status === "waiting"
+          ? paneOpen
+            ? "The task is waiting again, with no owner. But pi can still run in the old pane: delegate the task again only after that pane is closed."
+            : "The task is waiting again, with no owner. You can delegate it again."
+          : task?.status === "failed"
+            ? `The task failed (retryable: ${task.retryable === true ? "yes" : "no"}). Read its result with tau_get.`
+            : task?.status === "in_progress"
+              ? "The task stays in progress until its sub-tasks close. Then tau fails it."
+              : `The task is ${task?.status ?? "unknown"}.`,
     );
     if (paneOpen) {
       parts.push(
@@ -257,34 +305,67 @@ async function placementFor(ctx: DelegationContext, lead: string): Promise<Place
   return isTauPane === undefined ? undefined : placeNewPane(ctx.herdr, lead, ctx.paneId, isTauPane);
 }
 
+/** The number of tries to close the new pane of a start that failed, when herdr does not reply. */
+const CLOSE_TRIES = 3;
+/** The time between two of these tries, in milliseconds. */
+const CLOSE_RETRY_MS = 1_000;
+/**
+ * tau does not start a new try after this time, in milliseconds: a herdr
+ * command can take 15 seconds. Then the supervisor tries later.
+ */
+const CLOSE_BUDGET_MS = 5_000;
+
+/**
+ * Closes the new pane of a start that failed (see `closeNewPane`). When
+ * herdr does not reply (for example, a high CPU load), tries again, at most
+ * `CLOSE_TRIES` times. Does not try again when the close is not safe.
+ * Returns true when the pane is closed or does not exist.
+ */
+async function closeNewPaneSoon(ctx: DelegationContext, pane: string, agent: string, session: string | undefined): Promise<boolean> {
+  const started = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    const outcome = await closeNewPane(ctx, pane, agent, session);
+    if (outcome === "closed") return true;
+    if (outcome === "unsafe" || attempt >= CLOSE_TRIES || Date.now() - started >= CLOSE_BUDGET_MS) return false;
+    await new Promise((resolve) => setTimeout(resolve, ctx.closeRetryMs ?? CLOSE_RETRY_MS));
+  }
+}
+
 /**
  * Closes the new pane of a start that failed, when this is safe: herdr
  * shows the pane, and no agent is in it, or the new sub-agent is (see
- * `isSubAgentIn`). Returns true when the pane is closed or does not
- * exist. Returns false when tau cannot close it safely now (for example,
- * herdr does not reply): then the supervisor must try later.
+ * `isSubAgentIn`). Returns `closed` when the pane is closed or does not
+ * exist, `unsafe` when tau must not close it now, and `error` when herdr
+ * did not reply. Then the supervisor must try later.
  */
-async function closeNewPane(ctx: DelegationContext, pane: string, agent: string, session: string | undefined): Promise<boolean> {
+async function closeNewPane(
+  ctx: DelegationContext,
+  pane: string,
+  agent: string,
+  session: string | undefined,
+): Promise<"closed" | "unsafe" | "error"> {
   const agents = await ctx.herdr.listAgents().catch(() => undefined);
+  if (agents === undefined) return "error";
   const panes = await ctx.herdr.listPanes().catch(() => undefined);
-  if (agents === undefined || panes === undefined) return false;
+  if (panes === undefined) return "error";
   if (!panes.has(pane)) {
     // An abort can have closed the pane already. But when herdr shows the
     // new sub-agent (same name and session) in a different pane, it moved:
     // the supervisor must close its current pane.
     const moved = session !== undefined && agents.some((item) => item.name === agent && isAgentSession(item, session));
-    return !moved;
+    return moved ? "unsafe" : "closed";
   }
   const occupant = agents.find((item) => item.paneId === pane);
   // This process made the pane.
   const safe = occupant === undefined || isSubAgentIn(occupant, agent, session, true);
-  if (!safe) return false;
+  if (!safe) return "unsafe";
   const closed = await ctx.herdr.closePane(pane).then(
     () => true,
     () => false,
   );
-  if (closed) await rebalance(ctx.herdr, ctx.store, ctx.leadPane);
-  return closed;
+  if (!closed) return "error";
+  await rebalance(ctx.herdr, ctx.store, ctx.leadPane);
+  return "closed";
 }
 
 /**

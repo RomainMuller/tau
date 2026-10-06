@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative as relativePath } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 
 import { checkModel, checkThinking, delegate, firstPrompt, ranFirstPrompt, type DelegationContext } from "./delegate.ts";
-import type { HerdrAgent, HerdrClient, PaneMetadata, SplitDirection } from "./herdr-client.ts";
+import { StartTimeoutError, type HerdrAgent, type HerdrClient, type PaneMetadata, type SplitDirection } from "./herdr-client.ts";
 import { checkSubAgent, resolveIdentity } from "./identity.ts";
 import { agentNameFor, isAgentName, titleSlug } from "./names.ts";
 import { FakeTab } from "./testing/fake-tab.ts";
@@ -15,7 +15,7 @@ import { taskListFile } from "./tasks/paths.ts";
 import * as rules from "./tasks/rules.ts";
 import { claimTask, completeTask, createTask, delegateTask, liveDescendantAgents } from "./tasks/rules.ts";
 import { TaskListStore } from "./tasks/store.ts";
-import { OWNER_EXITED, Supervisor } from "./supervisor.ts";
+import { OWNER_EXITED, START_GRACE_MS, Supervisor } from "./supervisor.ts";
 import { registerTaskTools, waitForTasks, type TaskSession } from "./tools.ts";
 import { DEFAULT_TASK_TYPE_DEFINITIONS } from "./tasks/types.ts";
 
@@ -48,13 +48,19 @@ class FakeHerdr {
   }
   /** Set to make waitForWork fail (the sub-agent did not start to work). */
   failWait: Error | undefined;
-  async waitForWork(name: string): Promise<void> {
+  /** The timeout of each `waitForWork` call. */
+  waitTimeouts: Array<number | undefined> = [];
+  async waitForWork(name: string, timeoutMs?: number): Promise<void> {
+    this.waitTimeouts.push(timeoutMs);
     this.calls.push(`wait ${name}`);
     if (this.failWait) throw this.failWait;
   }
   /** The complete text of each first prompt (the pi argument after "--"). */
   prompts: string[] = [];
-  async startPiAgent(name: string, pane: string, args: readonly string[]): Promise<void> {
+  /** The start timeout of each `startPiAgent` call. */
+  startTimeouts: Array<number | undefined> = [];
+  async startPiAgent(name: string, pane: string, args: readonly string[], timeoutMs?: number): Promise<void> {
+    this.startTimeouts.push(timeoutMs);
     const end = args.indexOf("--");
     this.calls.push(`start ${name} ${pane} ${(end === -1 ? args : args.slice(0, end)).join(" ")}`);
     if (end !== -1) this.prompts.push(...args.slice(end + 1));
@@ -101,6 +107,7 @@ function context(name = "lead"): DelegationContext {
     extensionPath: "/ext/tau/src/index.ts",
     now: () => NOW,
     createdPanes,
+    closeRetryMs: 1,
   };
 }
 
@@ -336,22 +343,207 @@ describe("delegate", () => {
     assert.equal(result.agent, "tau-t0-2");
   });
 
-  it("fails the task (retryable) and closes the pane when pi does not start", async () => {
+  it("gives the task back (waiting, no owner) and closes the pane when pi does not start", async () => {
     herdr.failStart = new TauError("storage", "herdr agent start failed: timeout");
-    await assert.rejects(delegate(context(), { id: "T0", model: "prov/m", thinking: "low" }), /could not start a sub-agent for T0.*timeout.*retry/);
+    await assert.rejects(
+      delegate(context(), { id: "T0", model: "prov/m", thinking: "low" }),
+      /could not start a sub-agent for T0.*timeout.*The task is waiting again, with no owner\. You can delegate it again\./,
+    );
     const list = await read();
     const task = findTask(list, "T0")!;
-    assert.equal(task.status, "failed");
-    assert.equal(task.retryable, true);
-    assert.match(task.result ?? "", /The sub-agent did not start/);
+    assert.equal(task.status, "waiting");
+    assert.equal(task.owner, undefined);
+    assert.equal(task.result, undefined);
+    assert.equal(task.retryable, undefined);
+    const last = task.history.at(-1);
+    assert.equal(last?.kind, "released");
+    assert.match(last?.kind === "released" ? last.reason : "", /The sub-agent did not start/);
     assert.equal(list.agents[0]?.state, "ended");
     assert.deepEqual(herdr.closed, ["w1:p10"]);
   });
 
-  it("fails the task when the pane cannot be split", async () => {
+  it("gives a task back that can be delegated again, and fails the sub-tasks that the sub-agent claimed", async () => {
+    herdr.startPiAgent = async (name) => {
+      // The sub-agent made and claimed a sub-task before the start failed.
+      await store.mutate((list) => {
+        createTask(list, { actor: { name, scope: "T0" }, now: NOW }, { title: "Sub", type: "code", parent: "T0" });
+        claimTask(list, { actor: { name, scope: "T0" }, now: NOW }, "T0.1");
+      });
+      throw new TauError("storage", "herdr agent start failed: boom");
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /The task is waiting again/);
+    let list = await read();
+    assert.equal(findTask(list, "T0.1")?.status, "failed");
+    assert.equal(findTask(list, "T0.1")?.retryable, true);
+    assert.equal(findTask(list, "T0")?.status, "waiting");
+    herdr = new FakeHerdr();
+    const retry = await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    assert.equal(retry.agent, "tau-t0-2");
+    list = await read();
+    assert.equal(findTask(list, "T0")?.status, "in_progress");
+    assert.equal(findTask(list, "T0")?.owner, "tau-t0-2");
+  });
+
+  it("keeps the task in progress when a sub-task of a different agent is in progress", async () => {
+    herdr.startPiAgent = async (name) => {
+      await store.mutate((list) => {
+        createTask(list, { actor: { name, scope: "T0" }, now: NOW }, { title: "Sub", type: "code", parent: "T0" });
+        delegateTask(list, { actor: { name, scope: "T0" }, now: NOW }, { id: "T0.1", agent: "tau-t0-1" });
+      });
+      throw new TauError("storage", "herdr agent start failed: boom");
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /stays in progress until its sub-tasks close/);
+    const list = await read();
+    assert.equal(findTask(list, "T0")?.status, "in_progress");
+    assert.equal(findTask(list, "T0.1")?.status, "in_progress");
+  });
+
+  it("gives the start timeout to herdr, and the remaining time (at least 10 seconds) to the work wait", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low", startTimeoutMs: 180_000 });
+    assert.deepEqual(herdr.startTimeouts, [180_000]);
+    const wait = herdr.waitTimeouts[0] ?? 0;
+    assert.ok(wait > 170_000 && wait <= 180_000, String(wait));
+
+    herdr = new FakeHerdr();
+    await store.mutate((list) => createTask(list, LEAD, { title: "Next", type: "code" }));
+    await delegate(context(), { id: "T1", model: "p/m", thinking: "low", startTimeoutMs: 1 });
+    assert.deepEqual(herdr.waitTimeouts, [10_000]);
+  });
+
+  it("uses the default start timeout of 60 seconds", async () => {
+    await delegate(context(), { id: "T0", model: "p/m", thinking: "low" });
+    assert.deepEqual(herdr.startTimeouts, [60_000]);
+  });
+
+  it("gives the task back after a start timeout, and tells the agent to use a higher start timeout", async () => {
+    for (const phase of ["ready", "work"] as const) {
+      herdr = new FakeHerdr();
+      const timeout = new StartTimeoutError(phase, 60_000, "herdr agent wait failed: timed out waiting for agent status");
+      if (phase === "ready") herdr.failStart = timeout;
+      else herdr.failWait = timeout;
+      const id = phase === "ready" ? "T0" : "T1";
+      if (phase === "work") await store.mutate((list) => createTask(list, LEAD, { title: "Next", type: "code" }));
+      await assert.rejects(
+        delegate(context(), { id, model: "p/m", thinking: "low" }),
+        /The start timed out: .* in 60 seconds .*Try again with a higher start_timeout_seconds \(the default is 60, the maximum is 300\)\. The task is waiting again/,
+      );
+      assert.equal(findTask(await read(), id)?.status, "waiting");
+    }
+  });
+
+  it("cuts a long error text, so that the task can be given back", async () => {
+    herdr.failStart = new TauError("storage", `herdr agent start failed: ${"x".repeat(30_000)}`);
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /The task is waiting again/);
+    const task = findTask(await read(), "T0")!;
+    assert.equal(task.status, "waiting");
+    const last = task.history.at(-1);
+    assert.ok(last?.kind === "released" && last.reason.length < 2_100);
+  });
+
+  it("gives the task back also when its history is at the event limit", async () => {
+    await store.mutate((list) => {
+      const task = findTask(list, "T0")!;
+      for (let i = task.history.length; i < rules.MAX_EVENTS - 1; i++) rules.updateTask(list, LEAD, "T0", { title: `T${i}` });
+    });
+    herdr.failStart = new TauError("storage", "herdr agent start failed: boom");
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /The task is waiting again/);
+    assert.equal(findTask(await read(), "T0")?.status, "waiting");
+  });
+
+  it("tries again to close the pane when herdr does not reply, and then lets the agent delegate again", async () => {
+    herdr.failStart = new TauError("storage", "herdr agent start failed: boom");
+    const close = herdr.closePane.bind(herdr);
+    let tries = 0;
+    herdr.closePane = async (pane) => {
+      tries += 1;
+      if (tries < 3) throw new Error("herdr is busy");
+      await close(pane);
+    };
+    await assert.rejects(
+      delegate(context(), { id: "T0", model: "p/m", thinking: "low" }),
+      /The task is waiting again, with no owner\. You can delegate it again\.$/,
+    );
+    assert.equal(tries, 3);
+    assert.deepEqual(herdr.closed, ["w1:p10"]);
+  });
+
+  it("does not start a new try to close the pane after 5 seconds", async () => {
+    herdr.failStart = new TauError("storage", "herdr agent start failed: boom");
+    let tries = 0;
+    herdr.closePane = async () => {
+      tries += 1;
+      throw new Error("herdr is busy");
+    };
+    let now = Date.now();
+    const clock = mock.method(Date, "now", () => now);
+    const list = herdr.listAgents.bind(herdr);
+    herdr.listAgents = async () => {
+      now += 6_000;
+      return list();
+    };
+    try {
+      await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /But pi can still run in the old pane/);
+    } finally {
+      clock.mock.restore();
+    }
+    assert.equal(tries, 1);
+  });
+
+  it("does not try again to close the pane when a different agent is in it", async () => {
+    herdr.startPiAgent = async (_name, pane) => {
+      herdr.agents.push({ name: "someone", paneId: pane, status: "idle", session: "/s/other.jsonl" });
+      throw new TauError("storage", "herdr agent start failed: boom");
+    };
+    let tries = 0;
+    herdr.closePane = async () => {
+      tries += 1;
+    };
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /But pi can still run in the old pane/);
+    assert.equal(tries, 0);
+  });
+
+  it("tells the agent not to delegate again while the old pane is open", async () => {
+    herdr.failStart = new TauError("storage", "herdr agent start failed: boom");
+    herdr.closePane = async () => {
+      throw new Error("herdr is busy");
+    };
+    await assert.rejects(
+      delegate(context(), { id: "T0", model: "p/m", thinking: "low" }),
+      /The task is waiting again, with no owner\. But pi can still run in the old pane: delegate the task again only after that pane is closed\./,
+    );
+  });
+
+  it("marks the new sub-agent as starting while the delegation runs", async () => {
+    const startingAgents = new Set<string>();
+    const seen: string[][] = [];
+    const original = herdr.startPiAgent.bind(herdr);
+    herdr.startPiAgent = async (name, pane, args, timeoutMs) => {
+      seen.push([...startingAgents]);
+      await original(name, pane, args, timeoutMs);
+    };
+    await delegate({ ...context(), startingAgents }, { id: "T0", model: "p/m", thinking: "low" });
+    assert.deepEqual(seen, [["tau-t0"]]);
+    assert.deepEqual([...startingAgents], []);
+    herdr.failStart = new TauError("storage", "boom");
+    await store.mutate((list) => createTask(list, LEAD, { title: "Next", type: "code" }));
+    await assert.rejects(delegate({ ...context(), startingAgents }, { id: "T1", model: "p/m", thinking: "low" }));
+    assert.deepEqual([...startingAgents], []);
+  });
+
+  it("rejects a start timeout that is not valid, and changes nothing", async () => {
+    for (const startTimeoutMs of [0, -1, 1.5, 300_001, Number.NaN]) {
+      await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low", startTimeoutMs }), /start timeout must be from 1 to 300 seconds/);
+    }
+    const list = await read();
+    assert.equal(findTask(list, "T0")?.status, "waiting");
+    assert.deepEqual(list.agents, []);
+    assert.deepEqual(herdr.calls, []);
+  });
+
+  it("gives the task back when the pane cannot be split", async () => {
     herdr.failSplit = new TauError("storage", "no space");
     await assert.rejects(delegate(context(), { id: "T0", model: "prov/m", thinking: "low" }));
-    assert.equal(findTask(await read(), "T0")?.status, "failed");
+    assert.equal(findTask(await read(), "T0")?.status, "waiting");
     assert.deepEqual(herdr.closed, []);
   });
 
@@ -511,6 +703,19 @@ describe("Supervisor", () => {
     await store.mutate((list) => delegateTask(list, { actor: { name: "lead" }, now: new Date().toISOString() }, { id: "T0", agent: "tau-t0" }));
     await supervisor().check();
     assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+  });
+
+  it("does not check a sub-agent that a delegation of this process starts now, also after the start grace time", async () => {
+    const started = new Date(Date.now() - START_GRACE_MS - 1_000).toISOString();
+    await store.mutate((list) => delegateTask(list, { actor: { name: "lead" }, now: started }, { id: "T0", agent: "tau-t0" }));
+    const startingAgents = new Set(["tau-t0"]);
+    const watcher = () =>
+      new Supervisor({ store, herdr: herdr as unknown as HerdrClient, actor: { name: "lead" }, now: () => NOW, createdPanes, startingAgents });
+    await watcher().check();
+    assert.equal(findTask(await read(), "T0")?.status, "in_progress");
+    startingAgents.clear();
+    await watcher().check();
+    assert.equal(findTask(await read(), "T0")?.status, "failed");
   });
 
   it("watches only its own sub-agents", async () => {
@@ -797,7 +1002,7 @@ describe("delegation, more cases", () => {
     assert.deepEqual(herdr.closed, ["w1:p10"]);
   });
 
-  it("closes the pane of a nameless failed start later, when the first close fails", async () => {
+  it("closes the pane of a nameless failed start later, when the closes of the delegation fail", async () => {
     const original = herdr.startPiAgent.bind(herdr);
     herdr.startPiAgent = async (name, pane, args) => {
       await original(name, pane, args);
@@ -805,7 +1010,8 @@ describe("delegation, more cases", () => {
       throw new TauError("storage", "herdr agent start failed: timed out waiting for agent startup");
     };
     const close = herdr.closePane.bind(herdr);
-    let failures = 1;
+    // The delegation tries 3 times.
+    let failures = 3;
     herdr.closePane = async (pane) => {
       if (failures-- > 0) throw new Error("herdr is busy");
       await close(pane);
@@ -1271,7 +1477,7 @@ describe("tau_abort", () => {
       herdr.agents.push({ name, paneId: pane, status: "idle", session: "/s/2026_mine.jsonl" });
       throw new Error("no pi");
     };
-    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /The task failed \(retryable: yes\)/);
+    await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /The task is waiting again/);
     assert.deepEqual(herdr.closed, ["w1:p10"]);
   });
 
@@ -1431,7 +1637,7 @@ describe("tau_abort", () => {
       throw new TauError("storage", "herdr agent start failed: timed out waiting for agent startup");
     };
     await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /timed out/);
-    assert.equal(findTask(await read(), "T0")?.status, "failed");
+    assert.equal(findTask(await read(), "T0")?.status, "waiting");
     assert.deepEqual(herdr.closed, ["w1:p10"]);
   });
 
@@ -1489,7 +1695,7 @@ describe("tau_abort", () => {
       };
       herdr.failWait = new TauError("storage", "herdr agent wait failed: timed out");
       await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /timed out/);
-      assert.equal(findTask(await read(), "T0")?.status, "failed");
+      assert.equal(findTask(await read(), "T0")?.status, "waiting");
     } finally {
       await rm(sessions, { recursive: true, force: true });
     }
@@ -1527,8 +1733,7 @@ describe("tau_abort", () => {
   it("fails the start when the sub-agent does not start to work on its first prompt", async () => {
     herdr.failWait = new TauError("storage", "herdr agent wait failed: timed out");
     await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /timed out/);
-    assert.equal(findTask(await read(), "T0")?.status, "failed");
-    assert.equal(findTask(await read(), "T0")?.retryable, true);
+    assert.equal(findTask(await read(), "T0")?.status, "waiting");
     assert.deepEqual(herdr.closed, ["w1:p10"]);
   });
 
@@ -1539,8 +1744,7 @@ describe("tau_abort", () => {
       throw new TauError("storage", "herdr agent start did not reply in time.");
     };
     await assert.rejects(delegate(context(), { id: "T0", model: "p/m", thinking: "low" }), /did not reply in time/);
-    assert.equal(findTask(await read(), "T0")?.status, "failed");
-    assert.equal(findTask(await read(), "T0")?.retryable, true);
+    assert.equal(findTask(await read(), "T0")?.status, "waiting");
   });
 
   it("reports a correct start when a fast sub-agent completed its task before the check", async () => {

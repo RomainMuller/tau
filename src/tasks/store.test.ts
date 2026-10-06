@@ -9,7 +9,7 @@ import { decodeTaskList, encodeTaskList } from "./codec.ts";
 import { TauError } from "./errors.ts";
 import { seedTaskList } from "./model.ts";
 import { taskListFile, tauDir } from "./paths.ts";
-import { createTask } from "./rules.ts";
+import { createTask, delegateTask, releaseTaskOfAgent } from "./rules.ts";
 import { MAX_FILE_BYTES, TaskListStore } from "./store.ts";
 import { DatabaseSync } from "node:sqlite";
 
@@ -398,6 +398,25 @@ describe("codec", () => {
     const list = seedTaskList("s1", NOW);
     createTask(list, LEAD, { title: "T1", type: "code", description: "d", dependencies: ["T0"] });
     assert.deepEqual(decodeTaskList(encodeTaskList(list), "f"), list);
+  });
+
+  it("reads a released task", () => {
+    const list = seedTaskList("s1", NOW);
+    delegateTask(list, LEAD, { id: "T0", agent: "tau-t0" });
+    releaseTaskOfAgent(list, LEAD, "tau-t0", "T0", "The sub-agent did not start: x");
+    const decoded = decodeTaskList(encodeTaskList(list), "f");
+    assert.deepEqual(decoded, list);
+    assert.equal(decoded.tasks[0]?.status, "waiting");
+    assert.equal(decoded.tasks[0]?.owner, undefined);
+  });
+
+  it("rejects a released event without a reason", () => {
+    const list = seedTaskList("s1", NOW);
+    delegateTask(list, LEAD, { id: "T0", agent: "tau-t0" });
+    releaseTaskOfAgent(list, LEAD, "tau-t0", "T0", "x");
+    const value = JSON.parse(encodeTaskList(list));
+    value.tasks[0].history.at(-1).reason = 3;
+    assert.throws(() => decodeTaskList(JSON.stringify(value), "f"), /reason/);
   });
 
   const bad: Array<[string, (list: Record<string, any>) => void, RegExp]> = [
