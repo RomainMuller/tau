@@ -7,7 +7,7 @@
  * list only when the SQLite data changed.
  */
 
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import { type Component, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 
 import type { TaskList } from "./tasks/model.ts";
 import type { TaskListStore } from "./tasks/store.ts";
@@ -37,6 +37,12 @@ export class TreeWidget {
   #timer: ReturnType<typeof setInterval> | undefined;
   #refreshing: Promise<void> | undefined;
   #stopped = false;
+  /**
+   * A short text on its own line under the header, for example a problem
+   * of the Sticky support. Its own line: a long header (the badge of a
+   * sub-agent) in a narrow pane must not hide it.
+   */
+  #notice: string | undefined;
 
   constructor(store: TaskListStore, options: TreeWidgetOptions) {
     this.#store = store;
@@ -56,7 +62,7 @@ export class TreeWidget {
 
   /** The lines of the widget for a width. */
   lines(width: number): string[] {
-    return renderTree(this.#list, {
+    const lines = renderTree(this.#list, {
       showClosed: this.#showClosed,
       maxLines: this.#options.maxLines,
       pills: this.#options.pills,
@@ -66,6 +72,10 @@ export class TreeWidget {
       unread: this.#unread,
       ...(this.#options.root === undefined ? {} : { root: this.#options.root }),
     });
+    if (this.#notice !== undefined) {
+      lines.splice(1, 0, truncateToWidth(this.#notice, Math.max(1, width), "…"));
+    }
+    return lines;
   }
 
   /** The component factory for `ctx.ui.setWidget`. */
@@ -79,6 +89,13 @@ export class TreeWidget {
       },
     };
   };
+
+  /** Shows a short text under the header. `undefined` removes it. */
+  setNotice(notice: string | undefined): void {
+    if (notice === this.#notice) return;
+    this.#notice = notice;
+    this.#tui?.requestRender();
+  }
 
   /** Shows or hides the closed tasks. */
   toggleClosed(): void {

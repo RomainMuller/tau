@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { TUI } from "@earendil-works/pi-tui";
+import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
 
 import { registerCommands, TextView, TOGGLE_CLOSED_KEY, viewHeight } from "./commands.ts";
 import { seedTaskList } from "./tasks/model.ts";
@@ -58,6 +58,34 @@ describe("TreeWidget", () => {
       "└─ ○ T1 Other",
       " └─ ○ T1.1 Sub",
     ]);
+  });
+
+  it("shows a notice on its own line under the header, and removes it", async () => {
+    const widget = new TreeWidget(store, { badge: "🟢 Herdr", pills: false, color: false });
+    widget.factory(tui);
+    assert.deepEqual(widget.lines(80), ["🟢 Herdr"]);
+    widget.setNotice("⚠ Sticky: no server");
+    assert.deepEqual(widget.lines(80), ["🟢 Herdr", "⚠ Sticky: no server"]);
+    assert.equal(renders, 1);
+    widget.setNotice("⚠ Sticky: no server");
+    assert.equal(renders, 1, "the same notice does not draw again");
+    await widget.refresh();
+    const lines = widget.lines(80).map((line) => line.replace(/ +/g, " "));
+    assert.match(lines[0] ?? "", /^🟢 Herdr ─ /);
+    assert.equal(lines[1], "⚠ Sticky: no server");
+    assert.match(lines[2] ?? "", /T0/);
+    const before = renders;
+    widget.setNotice(undefined);
+    assert.equal(renders, before + 1, "the removal draws again");
+    assert.ok(!widget.lines(80).some((line) => line.includes("Sticky")));
+  });
+
+  it("shows the notice of a sub-agent in a narrow pane", () => {
+    const widget = new TreeWidget(store, { badge: "🟢 Herdr @tau-t2-3 (T2.3)", pills: false, color: false });
+    widget.setNotice("⚠ Sticky: no server");
+    // The long header is cut, but the notice is on its own line.
+    assert.equal(widget.lines(25)[1], "⚠ Sticky: no server");
+    for (const line of widget.lines(10)) assert.ok(visibleWidth(line) <= 10, line);
   });
 
   it("draws again only when the task list changed", async () => {

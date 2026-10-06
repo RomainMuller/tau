@@ -12,6 +12,7 @@ import {
   MAX_DEVICES,
   parseWriteResponse,
   ServerAbsentError,
+  ServerResponseError,
   SocketStickyServer,
   socketStickyServer,
   stickySocketPath,
@@ -50,7 +51,10 @@ describe("parseWriteResponse", () => {
   });
 
   it("rejects with the message of an error response", () => {
-    assert.throws(() => parseWriteResponse({ error: { message: "found no sticky in 10 s" } }), /found no sticky in 10 s/);
+    assert.throws(
+      () => parseWriteResponse({ error: { message: "found no sticky in 10 s" } }),
+      (error: unknown) => error instanceof ServerResponseError && /found no sticky in 10 s/.test(error.message),
+    );
   });
 
   it("rejects a response that it does not know", () => {

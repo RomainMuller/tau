@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
-import tau, { createTau, errorKind, type TauDependencies } from "./index.ts";
+import tau, { createTau, errorKind, STICKY_NO_SERVER_NOTICE, type TauDependencies } from "./index.ts";
 import { ServerAbsentError, type StickyServer } from "./sticky/server.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { taskListFile } from "./tasks/paths.ts";
@@ -267,6 +267,37 @@ describe("tau extension", () => {
       await emit(pi, "session_shutdown", ctx);
       assert.equal(calls.at(-1), "close");
       assert.ok(calls.includes("write"), "the link tries to send the record");
+    });
+
+    it("shows a notice in the widget while no sticky server runs", async () => {
+      enableHerdr();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      // The metadata has the working directory: the fake context needs one.
+      const ctx = { ...fakeCtx().ctx, cwd: "/work" };
+      let absent = true;
+      const server: StickyServer = {
+        write: async () => {
+          if (absent) throw new ServerAbsentError("no socket");
+          return [{ identifier: "A", error: null }];
+        },
+        close: () => undefined,
+      };
+      const handle = createTau(pi.api, { ...deps, stickyServer: () => server });
+      const header = () => handle.widget!.lines(200).join("\n");
+      const until = async (done: () => boolean) => {
+        const deadline = Date.now() + 2_000;
+        while (!done() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+      };
+
+      await emit(pi, "session_start", ctx);
+      await until(() => header().includes(STICKY_NO_SERVER_NOTICE));
+      assert.ok(header().includes(STICKY_NO_SERVER_NOTICE), header());
+      absent = false;
+      // A change of state sends the record again: then the server is found.
+      await all(pi, "agent_start")({ type: "agent_start" }, ctx);
+      await until(() => !header().includes(STICKY_NO_SERVER_NOTICE));
+      assert.ok(!header().includes(STICKY_NO_SERVER_NOTICE), header());
+      await emit(pi, "session_shutdown", ctx);
     });
 
     it("does not start when the configuration has sticky: false", async () => {

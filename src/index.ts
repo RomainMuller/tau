@@ -67,6 +67,9 @@ const DEFAULT_DEPENDENCIES: TauDependencies = {
  */
 const COMMON_ASK_TOOL = "ask_user_question";
 
+/** The text of the widget line under the header while no `sticky server` runs. */
+export const STICKY_NO_SERVER_NOTICE = "⚠ Sticky: no server";
+
 /** The path of this extension. A sub-agent loads the same file. */
 const EXTENSION_PATH = fileURLToPath(import.meta.url);
 
@@ -339,6 +342,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
         isAskTool: (name) => name === ASK_TOOL || name === config.askTool || name === COMMON_ASK_TOOL,
         env,
         server: () => stickyServer(env),
+        // The sticky does not show the agents while no server runs, and
+        // tau does not start it: tell the user in the widget.
+        onServer: (found) => tree.setNotice(found ? undefined : STICKY_NO_SERVER_NOTICE),
       });
       if (sticky !== undefined && self.role === "subagent") {
         const reporter = sticky;

@@ -5,7 +5,7 @@ import { describe, it } from "node:test";
 
 import { type AgentRecord, StickyLink } from "./link.ts";
 import { AGENT_METADATA_UUID, AGENT_STATE_UUID, encodeMetadata, encodeState } from "./protocol.ts";
-import { type DeviceWrite, ServerAbsentError, type StickyServer } from "./server.ts";
+import { type DeviceWrite, ServerAbsentError, ServerResponseError, type StickyServer } from "./server.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -234,6 +234,104 @@ describe("StickyLink", () => {
     await link.flush(1_000);
     assert.deepEqual(server.writes, [...meta(record("working")), state(record("working"))]);
     assert.deepEqual(logs, ["no server: no socket", "server found."]);
+    await link.close(100);
+  });
+
+  it("tells onServer only the changes of the server presence", async () => {
+    const server = new FakeServer();
+    server.absent = true;
+    const found: boolean[] = [];
+    const link = new StickyLink({ server, refreshMs: 60_000, retryMs: 1, onServer: (value) => void found.push(value) });
+    link.publish(record("idle"));
+    link.start();
+    await link.flush(1_000);
+    link.refresh();
+    await link.flush(1_000);
+    assert.equal(server.calls, 2);
+    assert.deepEqual(found, [false], "one call for two requests with no server");
+    server.absent = false;
+    link.refresh();
+    await link.flush(1_000);
+    link.refresh();
+    await link.flush(1_000);
+    assert.deepEqual(found, [false, true]);
+    server.absent = true;
+    link.refresh();
+    await link.flush(1_000);
+    assert.deepEqual(found, [false, true, false]);
+    await link.close(100);
+  });
+
+  it("tells onServer that the server runs when it answers with an error response", async () => {
+    // For example, a new server with no sticky near: it answers after 10 s.
+    const server = new FakeServer();
+    server.absent = true;
+    const found: boolean[] = [];
+    const link = new StickyLink({ server, refreshMs: 60_000, retryMs: 1, onServer: (value) => void found.push(value) });
+    link.publish(record("idle"));
+    link.start();
+    await link.flush(1_000);
+    server.absent = false;
+    server.results.push(new ServerResponseError("found no sticky in 10 s"));
+    link.refresh();
+    await link.flush(1_000);
+    assert.deepEqual(found, [false, true]);
+    await link.close(100);
+  });
+
+  it("does not tell onServer about a different error", async () => {
+    // For example, a sandbox that prevents the connection (EPERM): not "no server".
+    const server = new FakeServer();
+    const found: boolean[] = [];
+    const link = new StickyLink({ server, refreshMs: 60_000, retryMs: 1, onServer: (value) => void found.push(value) });
+    server.results.push(Object.assign(new Error("connect EPERM"), { code: "EPERM" }));
+    link.publish(record("idle"));
+    link.start();
+    await link.flush(1_000);
+    assert.deepEqual(found, []);
+    server.absent = true;
+    link.refresh();
+    await link.flush(1_000);
+    server.absent = false;
+    server.results.push(new Error("connect EPERM"));
+    link.refresh();
+    await link.flush(1_000);
+    assert.deepEqual(found, [false], "a different error does not prove that the server runs");
+    await link.close(100);
+  });
+
+  it("does not tell onServer about a server that is found at the first request", async () => {
+    const server = new FakeServer();
+    const found: boolean[] = [];
+    const link = new StickyLink({ server, refreshMs: 60_000, retryMs: 1, onServer: (value) => void found.push(value) });
+    link.publish(record("idle"));
+    link.start();
+    await link.flush(1_000);
+    assert.deepEqual(found, []);
+    await link.close(100);
+  });
+
+  it("logs an error of onServer, and continues", async () => {
+    const server = new FakeServer();
+    server.absent = true;
+    const logs: string[] = [];
+    const link = new StickyLink({
+      server,
+      refreshMs: 60_000,
+      retryMs: 1,
+      log: (line) => void logs.push(line),
+      onServer: () => {
+        throw new Error("boom");
+      },
+    });
+    link.publish(record("idle"));
+    link.start();
+    await link.flush(1_000);
+    server.absent = false;
+    link.refresh();
+    await link.flush(1_000);
+    assert.deepEqual(server.writes, [...meta(record("idle")), state(record("idle"))]);
+    assert.deepEqual(logs, ["no server: no socket", "onServer: boom", "server found.", "onServer: boom"]);
     await link.close(100);
   });
 

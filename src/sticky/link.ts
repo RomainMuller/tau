@@ -25,7 +25,7 @@ import {
   encodeState,
   type MetadataKey,
 } from "./protocol.ts";
-import { ServerAbsentError, type StickyServer } from "./server.ts";
+import { ServerAbsentError, ServerResponseError, type StickyServer } from "./server.ts";
 
 /** What tau sends for one agent. A metadata value `""` removes the key. */
 export interface AgentRecord {
@@ -38,6 +38,12 @@ export interface AgentRecord {
 export interface StickyLinkOptions {
   readonly server: StickyServer;
   readonly log?: (message: string) => void;
+  /**
+   * Gets `false` when a request finds no server, and `true` when a request
+   * finds the server again. It gets only the changes (not each request).
+   * Errors of this function do not go to the link.
+   */
+  readonly onServer?: (found: boolean) => void;
   /** The time between two full sends. */
   readonly refreshMs?: number;
   /** The time before tau writes again after a "Busy" error of a sticky. */
@@ -56,6 +62,7 @@ const BUSY = "(ATT error 0x80)";
 export class StickyLink {
   readonly #server: StickyServer;
   readonly #log: (message: string) => void;
+  readonly #onServer: (found: boolean) => void;
   readonly #refreshMs: number;
   readonly #retryMs: number;
 
@@ -72,6 +79,7 @@ export class StickyLink {
   constructor(options: StickyLinkOptions) {
     this.#server = options.server;
     this.#log = options.log ?? (() => undefined);
+    this.#onServer = options.onServer ?? (() => undefined);
     this.#refreshMs = options.refreshMs ?? DEFAULT_REFRESH_MS;
     this.#retryMs = options.retryMs ?? DEFAULT_RETRY_MS;
   }
@@ -169,9 +177,14 @@ export class StickyLink {
         if (this.#stopped) {
           // A late answer after the close: nothing to log.
         } else if (error instanceof ServerAbsentError) {
-          if (!this.#absent) this.#log(`no server: ${message(error)}`);
-          this.#absent = true;
+          if (!this.#absent) {
+            this.#absent = true;
+            this.#log(`no server: ${message(error)}`);
+            this.#tellServer(false);
+          }
         } else {
+          // An `error` response comes from the server: thus it runs.
+          if (error instanceof ServerResponseError) this.#found();
           this.#log(`write: ${message(error)}`);
         }
         // Not sent: the next change or the next refresh sends all again.
@@ -193,12 +206,27 @@ export class StickyLink {
     }
   }
 
+  /** A response came from the server. */
+  #found(): void {
+    if (!this.#absent) return;
+    this.#absent = false;
+    this.#log("server found.");
+    this.#tellServer(true);
+  }
+
+  #tellServer(found: boolean): void {
+    try {
+      this.#onServer(found);
+    } catch (error) {
+      this.#log(`onServer: ${message(error)}`);
+    }
+  }
+
   /** Sends one write. Returns false when a sticky was busy. Throws when the request failed. */
   async #write(what: string, characteristic: string, value: Buffer): Promise<boolean> {
     const devices = await this.#server.write(characteristic, value);
     if (this.#stopped) return true;
-    if (this.#absent) this.#log("server found.");
-    this.#absent = false;
+    this.#found();
     let ok = true;
     let logged = 0;
     for (const device of devices) {

@@ -45,6 +45,17 @@ export class ServerAbsentError extends Error {
   }
 }
 
+/**
+ * The server answered with an `error` response (for example, when no sticky
+ * is near). The server runs: this is not `ServerAbsentError`.
+ */
+export class ServerResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ServerResponseError";
+  }
+}
+
 /** The result of a write on one sticky. `error` is `null` when the sticky accepted the value. */
 export interface DeviceWrite {
   readonly identifier: string;
@@ -56,8 +67,9 @@ export interface StickyServer {
   /**
    * Writes `value` to a characteristic of the sticky service, on each ready
    * sticky (a Write Request). Resolves with one item for each sticky.
-   * Rejects with `ServerAbsentError` when no server runs, and with an
-   * `Error` for an `error` response or a different problem.
+   * Rejects with `ServerAbsentError` when no server runs, with
+   * `ServerResponseError` for an `error` response, and with an `Error`
+   * for a different problem.
    */
   write(characteristicUuid: string, value: Buffer): Promise<DeviceWrite[]>;
   /** Stops the requests that run now (they reject). */
@@ -213,7 +225,7 @@ export function parseWriteResponse(response: unknown): DeviceWrite[] {
       });
     }
     const error = response["error"];
-    if (isObject(error) && typeof error["message"] === "string") throw new Error(error["message"]);
+    if (isObject(error) && typeof error["message"] === "string") throw new ServerResponseError(error["message"]);
   }
   throw new Error("the response is not a write response");
 }

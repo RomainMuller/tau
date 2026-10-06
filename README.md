@@ -1459,6 +1459,13 @@ How it works:
   stop of the server (1 hour without requests) while pi runs.
 - The sticky session ID of an agent is
   `tau-<12 hex digits of the task list file name>-<agent name>`.
+- While no server runs (no socket, or the connection is refused), the
+  widget shows `⚠ Sticky: no server` on a line under the badge. The line
+  goes away when the server answers a request again, also with an error.
+  The next request starts at the next change or refresh (each 30
+  seconds), and the server can take 10 seconds to answer. A different problem
+  (for example, the sandbox of pi prevents the connection) does not show
+  this line: set `TAU_STICKY_LOG` to find it. `tau` does not start the server: start it as in step 2.
 - When no sticky is near, the server answers with an error after 10
   seconds. `tau` shows nothing and continues.
 - At the session stop, `tau` waits 3 seconds at most for the writes. If a

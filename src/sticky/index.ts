@@ -44,13 +44,16 @@ export interface StartStickyOptions {
   readonly env: NodeJS.ProcessEnv;
   /** Makes the client of `sticky server` (see `server.ts`). */
   readonly server: () => StickyServer | undefined;
+  /** Gets `false` when no `sticky server` runs, and `true` when it runs again (see `StickyLink`). */
+  readonly onServer?: (found: boolean) => void;
 }
 
 /**
  * Starts the Sticky support. Returns `undefined` (and does nothing) when
  * there is no socket path for `sticky server` (not macOS, and no
- * `STICKY_SOCKET`). When no server runs, or no sticky is near, it does
- * nothing visible.
+ * `STICKY_SOCKET`). When no server runs, or no sticky is near, it sends
+ * nothing to the stickies. When no server runs, it calls `onServer(false)`
+ * (if the caller gives it).
  */
 export function startSticky(pi: ExtensionAPI, options: StartStickyOptions): StickyReporter | undefined {
   const server = options.server();
@@ -61,7 +64,11 @@ export function startSticky(pi: ExtensionAPI, options: StartStickyOptions): Stic
       ? undefined
       : (message: string) =>
           void appendFile(logFile, `${new Date().toISOString()} ${options.agentName}: ${message}\n`).catch(() => undefined);
-  const link = new StickyLink({ server, ...(log === undefined ? {} : { log }) });
+  const link = new StickyLink({
+    server,
+    ...(log === undefined ? {} : { log }),
+    ...(options.onServer === undefined ? {} : { onServer: options.onServer }),
+  });
   const reporter = registerStickyReporter(pi, {
     link,
     sessionId: stickySessionId(options.taskListFile, options.agentName),
