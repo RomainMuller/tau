@@ -4,7 +4,7 @@ import { beforeEach, describe, it } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 import { seedTaskList, type TaskList } from "./tasks/model.ts";
-import { cancelTask, claimTask, completeTask, createTask, failTask, type Actor, type RuleContext } from "./tasks/rules.ts";
+import { acknowledgeTask, cancelTask, claimTask, completeTask, createTask, failTask, type Actor, type RuleContext } from "./tasks/rules.ts";
 import { renderTree, type TreeOptions } from "./tree.ts";
 
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -63,6 +63,18 @@ describe("renderTree", () => {
       "├─ ○ T3 Update login page ⧗ T2",
       "└─ ✖ T4 Security review of token storage @tau-t4 · agent exited",
     ]);
+  });
+
+  it("hides an acknowledged failed task in the default view, and shows it with closed tasks", () => {
+    acknowledgeTask(list, ctx(), "T4", "not now");
+    // The header does not count it either.
+    assert.equal(renderTree(list, PLAIN)[0], "🟢 Herdr ─ 2 waiting · 2 running · 2 done · 1 canceled");
+    const rows = renderTree(list, PLAIN).slice(1).map((line) => line.replace(/ +/g, " "));
+    assert.ok(!rows.some((row) => row.includes("T4")), rows.join("\n"));
+    const all = renderTree(list, { ...PLAIN, showClosed: true, maxLines: 20 });
+    assert.ok(all.slice(1).some((row) => row.includes("T4")));
+    // When its row shows, it counts.
+    assert.match(all[0] ?? "", /1 failed/);
   });
 
   it("shows all tasks and all dependencies when closed tasks show", () => {

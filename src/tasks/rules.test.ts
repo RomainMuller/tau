@@ -3,8 +3,11 @@ import { beforeEach, describe, it } from "node:test";
 
 import { TauError, type TauErrorCode } from "./errors.ts";
 import { activeTask, getTask, rollback, seedTaskList, type TaskList } from "./model.ts";
+import { formatTask } from "../format.ts";
 import {
+  acknowledgeTask,
   addNote,
+  canRetry,
   cancelTask,
   claimTask,
   completeTask,
@@ -305,6 +308,85 @@ describe("completeTask and failTask", () => {
   });
 });
 
+describe("acknowledgeTask", () => {
+  beforeEach(() => {
+    claimTask(list, ctx(), "T0");
+    failTask(list, ctx(), "T0", "no", true);
+  });
+
+  it("marks a failed task, keeps it failed, and a claim removes the mark", () => {
+    const task = acknowledgeTask(list, ctx(), "T0", "not now");
+    assert.equal(task.status, "failed");
+    assert.equal(task.acknowledged, true);
+    assert.equal(task.retryable, true);
+    assert.equal(task.history.at(-1)?.kind, "acknowledged");
+    claimTask(list, ctx(), "T0");
+    assert.equal(getTask(list, "T0").acknowledged, undefined);
+  });
+
+  it("rejects a task that is not failed, a second acknowledgment, an empty reason, and a task out of scope", () => {
+    createTask(list, ctx(), { title: "T1", type: "code" });
+    throwsTau(() => acknowledgeTask(list, ctx(), "T1", "x"), "invalid_state", /only a failed task/);
+    throwsTau(() => acknowledgeTask(list, ctx(), "T0", ""), "invalid_argument");
+    acknowledgeTask(list, ctx(), "T0", "x");
+    throwsTau(() => acknowledgeTask(list, ctx(), "T0", "x"), "invalid_state", /already acknowledged/);
+    claimTask(list, ctx(), "T1");
+    failTask(list, ctx(), "T1", "no", false);
+    throwsTau(() => acknowledgeTask(list, ctx({ name: "tau-t5", scope: "T5" }), "T1", "x"), "permission_denied");
+  });
+
+  it("does not let a sub-agent acknowledge the task that it received, but its failed sub-tasks", () => {
+    createTask(list, ctx(), { title: "T1", type: "code" });
+    delegateTask(list, ctx(), { id: "T1", agent: "tau-t1" });
+    const sub = { name: "tau-t1", scope: "T1" };
+    createTask(list, ctx(sub), { title: "Part", type: "code", parent: "T1" });
+    claimTask(list, ctx(sub), "T1.1");
+    failTask(list, ctx(sub), "T1.1", "no", true);
+    acknowledgeTask(list, ctx(sub), "T1.1", "not needed");
+    failTask(list, ctx(sub), "T1", "no", true);
+    throwsTau(() => acknowledgeTask(list, ctx(sub), "T1", "x"), "permission_denied", /Your parent decides/);
+    acknowledgeTask(list, ctx(), "T1", "the lead decides");
+  });
+
+  it("acknowledges a failed task at the event limit", () => {
+    createTask(list, ctx(), { title: "T1", type: "code" });
+    for (let i = getTask(list, "T1").history.length; i < MAX_EVENTS - 1; i++) updateTask(list, ctx(), "T1", { title: `T1 ${i}` });
+    claimTask(list, ctx(), "T1");
+    failTask(list, ctx(), "T1", "no", true);
+    throwsTau(() => claimTask(list, ctx(), "T1"), "invalid_state", /maximum/);
+    // No retry hint for a claim that cannot work.
+    assert.equal(canRetry(list, getTask(list, "T1")), false);
+    assert.match(formatTask(list, getTask(list, "T1")), /Retryable: yes \(but the task has the maximum number of changes/);
+    assert.equal(acknowledgeTask(list, ctx(), "T1", "too many changes").acknowledged, true);
+  });
+});
+
+describe("updateTask of a failed task", () => {
+  beforeEach(() => {
+    createTask(list, ctx(), { title: "T1", type: "code" });
+    claimTask(list, ctx(), "T0");
+    failTask(list, ctx(), "T0", "no", true);
+  });
+
+  it("changes a retryable failed task before a retry, and keeps it failed", () => {
+    const task = updateTask(list, ctx(), "T0", { title: "Better", type: "research", description: "Try X", dependencies: ["T1"] });
+    assert.equal(task.status, "failed");
+    assert.equal(task.retryable, true);
+    assert.equal(task.title, "Better");
+    assert.equal(task.type, "research");
+    assert.equal(task.description, "Try X");
+    assert.deepEqual(task.dependencies, ["T1"]);
+    // The new dependency applies to the retry.
+    throwsTau(() => claimTask(list, ctx(), "T0"), "dependencies_not_complete", /T1/);
+  });
+
+  it("rejects changes of a failed task that is not retryable", () => {
+    claimTask(list, ctx(), "T1");
+    failTask(list, ctx(), "T1", "no", false);
+    throwsTau(() => updateTask(list, ctx(), "T1", { title: "x" }), "invalid_state", /failed and not retryable/);
+  });
+});
+
 describe("cancelTask", () => {
   it("cancels a waiting task and its waiting sub-tasks", () => {
     createTask(list, ctx(), { title: "T1", type: "code" });
@@ -439,6 +521,9 @@ describe("rollback", () => {
       () => updateTask(list, ctx(), "T1", { description: "" }),
       () => delegateTask(list, ctx(), { id: "T1", agent: "tau-t1" }),
       () => releaseTaskOfAgent(list, ctx(), "tau-t1", "T1", "The sub-agent did not start"),
+      () => claimTask(list, ctx({ name: "c" }), "T1"),
+      () => failTask(list, ctx({ name: "c" }), "T1", "no", true),
+      () => acknowledgeTask(list, ctx(), "T1", "later"),
     ];
     for (const step of steps) {
       step();

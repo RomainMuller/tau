@@ -15,6 +15,8 @@ import { TauError } from "./tasks/errors.ts";
 import { activeTask, findTask, getTask, isClosed, isTaskId, ownerError, type AgentRecord, type TaskList } from "./tasks/model.ts";
 import {
   abortTask,
+  acknowledgeTask,
+  canRetry,
   addNote,
   cancelTask,
   claimTask,
@@ -128,14 +130,15 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       name: "tau_list",
       label: "tau list",
       description:
-        "Show the task list, one compact line for each task. By default, completed and canceled tasks are hidden. Use tau_get for all fields of one task.",
+        "Show the task list, one compact line for each task. By default, completed, canceled, and acknowledged failed tasks are hidden. Use tau_get for all fields of one task.",
       promptSnippet: "Show the task list",
       promptGuidelines: [
         "All work must be for a tau task that you own. Before other tools, claim a task with tau_claim, or create one with tau_create and claim it.",
         "Do only the work that your active task needs. When it is done, close it with tau_complete or tau_fail and a result.",
+        "To retry a failed task (retryable), use tau_delegate or tau_claim with the same task ID. Do not create a new task for a retry. You can first change the failed task with tau_update (for example, better instructions in its description). When you do not retry a failed task, acknowledge it with tau_ack.",
       ],
       parameters: Type.Object({
-        all: Type.Optional(Type.Boolean({ description: "Show completed and canceled tasks too." })),
+        all: Type.Optional(Type.Boolean({ description: "Show completed, canceled, and acknowledged tasks too." })),
       }),
       run: async (session, params) => {
         const list = await readList(session);
@@ -181,7 +184,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       name: "tau_create",
       label: "tau create",
       description:
-        "Create a task. Give a short title and a type. Set parent to make a sub-task. Set dependencies when the task needs the result of other tasks first.",
+        "Create a task. Give a short title and a type. Set parent to make a sub-task. Set dependencies when the task needs the result of other tasks first. Do not create a task to retry a failed task that is retryable: retry the failed task itself (tau_delegate or tau_claim with its ID).",
       promptSnippet: "Create a task or sub-task",
       parameters: Type.Object({
         title: Type.String({ description: "A short title (one line) that tells what the task does." }),
@@ -208,7 +211,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       name: "tau_update",
       label: "tau update",
       description:
-        "Change the title, type, description, or dependencies of a task. Only the owner can change a task in progress. The type and the dependencies can change only while the task is waiting. An empty description removes it.",
+        "Change the title, type, description, or dependencies of a task. Only the owner can change a task in progress. The type and the dependencies can change only while the task is waiting, or failed and retryable. Change a retryable failed task before you retry it, for example to give better instructions. An empty description removes it.",
       promptSnippet: "Change a task",
       parameters: Type.Object({
         id: ID("The task ID."),
@@ -234,7 +237,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       name: "tau_claim",
       label: "tau claim",
       description:
-        "Claim a task. It becomes your active task, and you can do its work. You can claim a task when its dependencies are complete, and when you have no active task or the task is a sub-task of your active task.",
+        "Claim a task. It becomes your active task, and you can do its work. You can claim a task that is waiting, or failed and retryable (a retry), when its dependencies are complete, and when you have no active task or the task is a sub-task of your active task.",
       promptSnippet: "Claim a task to work on it",
       parameters: Type.Object({ id: ID("The task ID.") }),
       run: async (session, params) =>
@@ -299,6 +302,22 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
         change(session, (list, ctx) => {
           const canceled = cancelTask(list, ctx, String(params.id), String(params.reason));
           return `Canceled ${canceled.map((task) => task.id).join(", ")}.`;
+        }),
+    },
+    {
+      name: "tau_ack",
+      label: "tau ack",
+      description:
+        "Acknowledge a failed task: you saw the failure, and you do not retry the task now. The task stays failed, and the default views do not show it anymore. A later retry (tau_delegate or tau_claim) is still possible for a retryable task. A sub-agent cannot acknowledge the task that it received: its parent decides.",
+      promptSnippet: "Acknowledge a failed task that you do not retry",
+      parameters: Type.Object({
+        id: ID("The failed task."),
+        reason: Type.String({ description: "Why you do not retry the task." }),
+      }),
+      run: async (session, params) =>
+        change(session, (list, ctx) => {
+          const task = acknowledgeTask(list, ctx, String(params.id), String(params.reason));
+          return `Acknowledged ${task.id}. It stays failed, and the default views do not show it.`;
         }),
     },
     {
@@ -434,7 +453,7 @@ export function abortText(id: string, abort: Abort, unclosed: readonly UnclosedP
     );
   }
   lines.push(
-    "The lead decides if a failed task is tried again. To retry a task, use tau_delegate. You can also use tau_claim, if the claim rules permit it. Use tau_list to see the tasks that are ready.",
+    "The lead decides if a failed task is tried again. To retry it, use tau_delegate (or tau_claim) with the same task ID: do not create a new task for a retry. To not retry it, acknowledge it with tau_ack.",
   );
   return lines.join("\n");
 }
@@ -483,7 +502,7 @@ function delegationSpecs(): ToolSpec[] {
       description: [
         "Start a pi sub-agent in a new herdr pane, and give it a task. The sub-agent owns the task from the start, and closes it when the work is done. Delegation is the normal way to do work: give each task that can run alone to a sub-agent.",
         "Before you call this tool, select the model and the thinking level for the task type. Use the model routing rules from AGENTS.md or from skills. If no rule applies, omit model and thinking: the sub-agent then uses your model and thinking level.",
-        "The task must be ready (dependencies complete) and nobody must own it. At most a small number of sub-agents run at the same time; when the limit is reached, use tau_wait.",
+        "The task must be ready (dependencies complete) and nobody must own it: it is waiting, or failed and retryable. To retry a failed task, delegate the same task ID again; do not create a new task. At most a small number of sub-agents run at the same time; when the limit is reached, use tau_wait.",
       ].join("\n"),
       promptSnippet: "Start a sub-agent for a task",
       promptGuidelines: [
@@ -602,7 +621,14 @@ export async function waitForTasks(
               : "";
         return `${task.id}  ${task.status}${extra}  ${cleanTitle(task.title)}`;
       });
-      return [header, ...lines, "Use tau_get to read the results."].join("\n");
+      const retry = failed.filter((task) => canRetry(list, task) && task.acknowledged !== true);
+      const hint =
+        retry.length === 0
+          ? []
+          : [
+              `For ${retry.map((task) => task.id).join(", ")}: read the result with tau_get. To retry a retryable task, use tau_delegate with the same task ID (do not create a new task). To not retry it, use tau_ack.`,
+            ];
+      return [header, ...lines, "Use tau_get to read the results.", ...hint].join("\n");
     }
     await sleep(poll, options.signal);
   }

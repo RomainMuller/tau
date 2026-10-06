@@ -9,7 +9,7 @@ import { decodeTaskList, encodeTaskList } from "./codec.ts";
 import { TauError } from "./errors.ts";
 import { seedTaskList } from "./model.ts";
 import { taskListFile, tauDir } from "./paths.ts";
-import { createTask, delegateTask, releaseTaskOfAgent } from "./rules.ts";
+import { acknowledgeTask, claimTask, createTask, delegateTask, failTask, releaseTaskOfAgent } from "./rules.ts";
 import { MAX_FILE_BYTES, TaskListStore } from "./store.ts";
 import { DatabaseSync } from "node:sqlite";
 
@@ -408,6 +408,23 @@ describe("codec", () => {
     assert.deepEqual(decoded, list);
     assert.equal(decoded.tasks[0]?.status, "waiting");
     assert.equal(decoded.tasks[0]?.owner, undefined);
+  });
+
+  it("reads an acknowledged task, and rejects an acknowledged field that is not a boolean", () => {
+    const list = seedTaskList("s1", NOW);
+    claimTask(list, LEAD, "T0");
+    failTask(list, LEAD, "T0", "no", true);
+    acknowledgeTask(list, LEAD, "T0", "later");
+    assert.deepEqual(decodeTaskList(encodeTaskList(list), "f"), list);
+    const value = JSON.parse(encodeTaskList(list));
+    value.tasks[0].acknowledged = "yes";
+    assert.throws(() => decodeTaskList(JSON.stringify(value), "f"), /acknowledged/);
+    const reason = JSON.parse(encodeTaskList(list));
+    reason.tasks[0].history.at(-1).reason = 7;
+    assert.throws(() => decodeTaskList(JSON.stringify(reason), "f"), /reason/);
+    const missing = JSON.parse(encodeTaskList(list));
+    delete missing.tasks[0].acknowledged;
+    assert.throws(() => decodeTaskList(JSON.stringify(missing), "f"), /result of their history/);
   });
 
   it("rejects a released event without a reason", () => {

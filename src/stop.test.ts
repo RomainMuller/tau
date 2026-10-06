@@ -3,6 +3,7 @@ import { beforeEach, describe, it } from "node:test";
 
 import { findTask, seedTaskList, type TaskList } from "./tasks/model.ts";
 import {
+  acknowledgeTask,
   cancelTask,
   claimTask,
   completeTask,
@@ -48,9 +49,33 @@ describe("openWork", () => {
     assert.equal(openWork(list, LEAD), undefined);
   });
 
-  it("counts failed tasks as closed: the lead decides if it retries them", () => {
+  it("counts a retryable failed task as open until an agent acknowledges it", () => {
     claimTask(list, ctx(), "T0");
     failTask(list, ctx(), "T0", "no", true);
+    const work = openWork(list, LEAD)!;
+    assert.deepEqual(work.open.map((task) => task.id), ["T0"]);
+    assert.deepEqual(work.retryable.map((task) => task.id), ["T0"]);
+    const text = continuationText(list, work, LEAD, ASK_TOOL);
+    assert.match(
+      text,
+      /Failed \(retryable\): T0\. For each one, decide: retry it with tau_delegate \(or tau_claim\) with the same task ID, or acknowledge it with tau_ack\. Do not create a new task for a retry\./,
+    );
+    acknowledgeTask(list, ctx(), "T0", "not needed now");
+    assert.equal(openWork(list, LEAD), undefined);
+  });
+
+  it("counts a failed task that is not retryable as closed", () => {
+    claimTask(list, ctx(), "T0");
+    failTask(list, ctx(), "T0", "no", false);
+    assert.equal(openWork(list, LEAD), undefined);
+  });
+
+  it("does not ask for a decision about a failed sub-task of a closed task", () => {
+    claimTask(list, ctx(), "T0");
+    createTask(list, ctx(), { title: "Sub", type: "code", parent: "T0" });
+    claimTask(list, ctx(), "T0.1");
+    failTask(list, ctx(), "T0.1", "no", true);
+    completeTask(list, ctx(), "T0", "done anyway");
     assert.equal(openWork(list, LEAD), undefined);
   });
 
@@ -220,6 +245,30 @@ describe("StopGuard", () => {
     assert.equal((await g.settle("completed")).kind, "continue");
   });
 
+  it("continues for a retryable failed task until an agent acknowledges it", async () => {
+    claimTask(list, ctx(), "T0");
+    failTask(list, ctx(), "T0", "no", true);
+    const decision = await guard().settle("completed");
+    assert.equal(decision.kind, "continue");
+    assert.match((decision as { text: string }).text, /Failed \(retryable\): T0\./);
+    acknowledgeTask(list, ctx(), "T0", "later");
+    assert.deepEqual(await guard().settle("completed"), { kind: "stop" });
+  });
+
+  it("continues a sub-agent for a retryable failed sub-task of its task, until it acknowledges it", async () => {
+    planned();
+    createTask(list, ctx(SUB), { title: "Part", type: "code", parent: "T1" });
+    claimTask(list, ctx(SUB), "T1.1");
+    failTask(list, ctx(SUB), "T1.1", "no", true);
+    const decision = await guard(SUB).settle("completed");
+    assert.equal(decision.kind, "continue");
+    assert.match((decision as { text: string }).text, /Failed \(retryable\): T1\.1\./);
+    acknowledgeTask(list, ctx(SUB), "T1.1", "not needed");
+    const after = openWork(list, SUB)!;
+    assert.deepEqual(after.retryable, []);
+    assert.deepEqual(after.open.map((task) => task.id), ["T1"]);
+  });
+
   it("starts the count again when the task list changes", async () => {
     const g = guard(LEAD, 2);
     assert.equal((await g.settle("completed")).kind, "continue");
@@ -311,6 +360,8 @@ describe("promptSection", () => {
   it("tells the rule for the lead and for a sub-agent, and how to ask the user", () => {
     assert.match(promptSection(LEAD, ASK_TOOL), /lead agent\. You cannot stop while a task .* is waiting or in progress/);
     assert.match(promptSection(SUB, ASK_TOOL), /sub-agent for task T1\. You cannot stop while your task T1 is in progress/);
+    assert.match(promptSection(LEAD, ASK_TOOL), /A failed task \(retryable\) also needs a decision before you stop: retry it with tau_delegate \(or tau_claim\) with the same task ID, or acknowledge it with tau_ack\./);
+    assert.match(promptSection(SUB, ASK_TOOL), /A failed sub-task \(retryable\) of T1 also needs a decision.*If T1 itself fails, your parent decides\./);
     for (const text of [promptSection(LEAD, ASK_TOOL), promptSection(SUB, ASK_TOOL)]) {
       assert.match(text, /call an available "ask question" tool\. Do not end your turn to ask a question\./);
       assert.match(text, /tau_ask_user alone/);

@@ -23,7 +23,7 @@
 import { isAgentName } from "./names.ts";
 import { activeTask, isClosed, isDescendant, isInSubtree, LEAD_AGENT, ownerError, type Task, type TaskList } from "./tasks/model.ts";
 import { cleanLine } from "./text.ts";
-import { readyTasks, type Actor } from "./tasks/rules.ts";
+import { canRetry, readyTasks, type Actor } from "./tasks/rules.ts";
 
 /** The default number of continuations with no task change before tau stops the rule. */
 export const DEFAULT_MAX_IDLE_CONTINUATIONS = 3;
@@ -49,9 +49,14 @@ export function promptSection(actor: Actor, askTool: string | undefined): string
     actor.scope === undefined
       ? "You are the lead agent. You cannot stop while a task in the tau task list is waiting or in progress."
       : `You are a sub-agent for task ${actor.scope}. You cannot stop while your task ${actor.scope} is in progress.`;
+  const failed =
+    actor.scope === undefined
+      ? "A failed task (retryable) also needs a decision before you stop: retry it with tau_delegate (or tau_claim) with the same task ID, or acknowledge it with tau_ack. Do not create a new task for a retry."
+      : `A failed sub-task (retryable) of ${actor.scope} also needs a decision before you stop: retry it with tau_delegate (or tau_claim) with the same task ID, or acknowledge it with tau_ack. Do not create a new task for a retry. If ${actor.scope} itself fails, your parent decides.`;
   return [
     rule,
     "If you stop too early, tau tells you to continue.",
+    failed,
     ...(askTool === undefined || askTool === ASK_TOOL
       ? ['To get an answer from the user, call an available "ask question" tool. Do not end your turn to ask a question.']
       : [`To get an answer from the user, call the ${askTool} tool. Do not end your turn to ask a question.`]),
@@ -71,11 +76,14 @@ export interface OpenWork {
   readonly running: readonly Task[];
   /** Waiting tasks that cannot start now. */
   readonly blocked: readonly Task[];
+  /** Failed tasks that can be retried, and that no agent acknowledged. */
+  readonly retryable: readonly Task[];
 }
 
 /**
  * The open work of `actor`. For the lead (no scope), all `waiting` and
- * `in_progress` tasks. For a sub-agent, the open tasks in its scope, but only
+ * `in_progress` tasks, and the retryable failed tasks that no agent
+ * acknowledged. For a sub-agent, the open tasks in its scope, but only
  * while its scope task is `in_progress` and the sub-agent owns it. Returns `undefined` when the agent
  * can stop.
  */
@@ -87,11 +95,13 @@ export function openWork(list: TaskList, actor: Actor): OpenWork | undefined {
     // the start of this sub-agent failed): then this sub-agent has no work.
     if (own === undefined || own.status !== "in_progress" || own.owner !== actor.name) return undefined;
   }
-  const open = list.tasks.filter(
-    (task) => !isClosed(task) && (scope === undefined || isInSubtree(task.id, scope)),
-  );
+  const inScope = (task: Task) => scope === undefined || isInSubtree(task.id, scope);
+  // A retryable failed task needs a decision: retry it, or acknowledge it
+  // (tau_ack). So it is open work until an agent acknowledges it.
+  // A sub-task of a closed task cannot be claimed again: no decision is necessary.
+  const retryable = list.tasks.filter((task) => canRetry(list, task) && task.acknowledged !== true && inScope(task));
+  const open = [...list.tasks.filter((task) => !isClosed(task) && inScope(task)), ...retryable];
   if (open.length === 0) return undefined;
-  // A failed task is not open work: the lead decides if it retries it.
   const ready = readyTasks(list, scope).filter((task) => task.status === "waiting");
   const readyIds = new Set(ready.map((task) => task.id));
   return {
@@ -100,6 +110,7 @@ export function openWork(list: TaskList, actor: Actor): OpenWork | undefined {
     active: activeTask(list, actor.name),
     running: open.filter((task) => task.status === "in_progress" && task.owner !== actor.name),
     blocked: open.filter((task) => task.status === "waiting" && !readyIds.has(task.id)),
+    retryable,
   };
 }
 
@@ -169,6 +180,11 @@ export function continuationText(list: TaskList, work: OpenWork, actor: Actor, a
     if (unique.length > 0) {
       lines.push(`  Use tau_wait with ids ${JSON.stringify(unique.slice(0, MAX_IDS))}. Do not poll.`);
     }
+  }
+  if (work.retryable.length > 0) {
+    lines.push(
+      `  Failed (retryable): ${ids(work.retryable)}. For each one, decide: retry it with tau_delegate (or tau_claim) with the same task ID, or acknowledge it with tau_ack. Do not create a new task for a retry.`,
+    );
   }
   if (work.blocked.some((task) => openDependencyTasks(list, task).some((dep) => dep.status === "failed" || dep.status === "canceled"))) {
     lines.push("  Some tasks wait for a failed or canceled task: retry that task, change the dependencies, or cancel the waiting task.");

@@ -240,6 +240,7 @@ function checkTask(value: unknown, where: string): Task {
   if (task.owner !== undefined) result.owner = string(task.owner, `${where}.owner`);
   if (task.result !== undefined) result.result = string(task.result, `${where}.result`);
   if (task.retryable !== undefined) result.retryable = boolean(task.retryable, `${where}.retryable`);
+  if (task.acknowledged !== undefined) result.acknowledged = boolean(task.acknowledged, `${where}.acknowledged`);
   return result;
 }
 
@@ -307,6 +308,8 @@ function checkEvent(value: unknown, where: string): TaskEvent {
         retryable: boolean(event.retryable, `${where}.retryable`),
       };
     case "canceled":
+      return { ...base, kind, reason: string(event.reason, `${where}.reason`) };
+    case "acknowledged":
       return { ...base, kind, reason: string(event.reason, `${where}.reason`) };
     case "noted":
       return { ...base, kind, text: string(event.text, `${where}.text`) };

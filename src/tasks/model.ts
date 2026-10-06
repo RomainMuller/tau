@@ -35,18 +35,21 @@ export const MAX_TASKS = 500;
 export const MAX_NOTES = 100;
 /**
  * The maximum number of events in the history of one task, except events
- * that end a claim (`completed`, `failed`, `canceled`, `released`). tau
- * always accepts these, so that a task at the limit does not block its
- * parent and its dependents, and a failed delegation can give the task back.
+ * that end a claim (`completed`, `failed`, `canceled`, `released`) and
+ * acknowledgments. tau always accepts these, so that a task at the limit
+ * does not block its parent and its dependents, a failed delegation can
+ * give the task back, and an agent can always acknowledge a failure.
  */
 export const MAX_EVENTS = 1_000;
 
 /**
  * The maximum length of a history in a file. Each close or release follows
- * a claim, or is the only cancel of a waiting task, so a history has at
- * most `MAX_EVENTS` other events and `MAX_EVENTS + 1` closes and releases.
+ * a claim, or is the only cancel of a waiting task. Each acknowledgment
+ * follows a failure (a second one needs a new claim and failure). So a
+ * history has at most `MAX_EVENTS` other events, `MAX_EVENTS + 1` closes
+ * and releases, and `MAX_EVENTS` acknowledgments.
  */
-export const MAX_HISTORY = 2 * MAX_EVENTS + 1;
+export const MAX_HISTORY = 3 * MAX_EVENTS + 1;
 
 /** The name of the actor for changes that tau does, not an agent. */
 export const SYSTEM_ACTOR = "tau";
@@ -92,6 +95,11 @@ export type TaskEvent =
   | (EventBase & { readonly kind: "completed"; readonly result: string })
   | (EventBase & { readonly kind: "failed"; readonly result: string; readonly retryable: boolean })
   | (EventBase & { readonly kind: "canceled"; readonly reason: string })
+  /**
+   * An agent saw a failed task, and decided not to retry it now. The task
+   * stays `failed`. The default views do not show it. A claim removes this.
+   */
+  | (EventBase & { readonly kind: "acknowledged"; readonly reason: string })
   | (EventBase & { readonly kind: "noted"; readonly text: string });
 
 /** An event before `recordEvent` gives it its `seq`. */
@@ -107,6 +115,8 @@ export interface Task {
   owner?: string;
   result?: string;
   retryable?: boolean;
+  /** True when an agent acknowledged the failure (see the `acknowledged` event). */
+  acknowledged?: boolean;
   notes: Note[];
   history: TaskEvent[];
 }
@@ -300,6 +310,11 @@ export function descendantsOf(list: TaskList, id: string): Task[] {
   return list.tasks.filter((task) => isDescendant(task.id, id));
 }
 
+/** True when a task failed and an agent acknowledged it. The default views do not show it. */
+export function isAcknowledged(task: Task): boolean {
+  return task.status === "failed" && task.acknowledged === true;
+}
+
 export function isClosed(task: Task): boolean {
   return CLOSED_STATUSES.has(task.status);
 }
@@ -348,6 +363,10 @@ export function applyEvent(task: Task, event: TaskEvent): void {
       task.owner = event.actor;
       delete task.result;
       delete task.retryable;
+      delete task.acknowledged;
+      break;
+    case "acknowledged":
+      task.acknowledged = true;
       break;
     case "released":
       task.status = "waiting";
@@ -377,15 +396,20 @@ export function applyEvent(task: Task, event: TaskEvent): void {
   task.history.push(event);
 }
 
-/** The events that end a claim. `MAX_EVENTS` does not count them. */
-const ENDS_CLAIM: ReadonlySet<string> = new Set(["completed", "failed", "canceled", "released"]);
+/** The events that `MAX_EVENTS` does not count: the events that end a claim, and acknowledgments. */
+const ENDS_CLAIM: ReadonlySet<string> = new Set(["completed", "failed", "canceled", "released", "acknowledged"]);
 
 /**
  * Gives `event` the next revision of `list`, then applies it to `task`. Use
  * this function for all changes, so that the revision stays correct.
  */
+/** True when the task can get one more event that `MAX_EVENTS` counts (for example a claim). */
+export function hasEventRoom(task: Task): boolean {
+  return task.history.filter((item) => !ENDS_CLAIM.has(item.kind)).length < MAX_EVENTS;
+}
+
 export function recordEvent(list: TaskList, task: Task, event: NewTaskEvent): void {
-  if (!ENDS_CLAIM.has(event.kind) && task.history.filter((item) => !ENDS_CLAIM.has(item.kind)).length >= MAX_EVENTS) {
+  if (!ENDS_CLAIM.has(event.kind) && !hasEventRoom(task)) {
     throw new TauError(
       "invalid_state",
       `Task ${task.id} has ${MAX_EVENTS} changes. This is the maximum. You can still close it. Create a new task for more work.`,

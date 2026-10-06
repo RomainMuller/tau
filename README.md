@@ -119,11 +119,12 @@ root task, the lead closes `T0` first.
 | `title`        | yes      | Short and descriptive.                              |
 | `type`         | yes      | One of the [task types](#task-types).               |
 | `description`  | no       | Markdown. Can be long.                              |
-| `dependencies` | yes      | List of task `id`s (can be empty). Only while `waiting`. |
+| `dependencies` | yes      | List of task `id`s (can be empty). Only while `waiting`, or `failed` with `retryable: true`. |
 | `status`       | yes      | See [Task lifecycle](#task-lifecycle).              |
 | `owner`        | no       | The agent that claimed the task.                    |
 | `result`       | no       | Markdown. Set when the task closes.                 |
 | `retryable`    | no       | Set when the task fails. See [Rules](#rules).       |
+| `acknowledged` | no       | Set on a `failed` task that an agent will not retry now (`tau_ack`). A claim removes it. |
 | `notes`        | yes      | Shared findings (can be empty). See [Notes](#notes). |
 | `history`      | yes      | Each change, with time and agent. See [Fork](#fork).|
 
@@ -185,9 +186,10 @@ By default, task IDs show as [colored pills](#colored-id-pills). The previews
 in this section show the status marks instead (the `idPills: false` option),
 because a text preview cannot show colors.
 
-**Default view.** `completed` and `canceled` tasks are hidden. The sub-tasks
-of a `completed` task are hidden too, also the `failed` ones. A `canceled` task
-shows only when one of its sub-tasks shows. `⧗` shows only on `waiting` tasks, and only the
+**Default view.** `completed`, `canceled`, and acknowledged `failed` tasks
+(see [Failed tasks](#failed-tasks)) are hidden. The sub-tasks
+of a `completed` task are hidden too, also the `failed` ones. A `canceled` or
+acknowledged task shows only when one of its sub-tasks shows. `⧗` shows only on `waiting` tasks, and only the
 dependencies that are not complete.
 
 ```text
@@ -330,20 +332,47 @@ cancel │                                   │         │ owner gone  │ cla
 8. An agent that can change a `waiting` task can **cancel** it. A reason is
    necessary. `tau` also cancels the `waiting` sub-tasks of the task. If a
    sub-task is `in_progress`, the cancel fails.
-9. Dependencies can change only while the task is `waiting`. A task cannot
+9. Dependencies can change only while the task is `waiting`, or `failed`
+   with `retryable: true`. A task cannot
    depend on itself, on its parent tasks, or on a task that waits for it (a
    cycle). A task waits for its dependencies, and for its sub-tasks (it can
    close only after them).
 10. After a claim, only the owner can change the `title`, the
     `description`, and the `status`. Nobody can change the `type` after the
-    claim, because the type selects the rules of the work gate.
+    claim, because the type selects the rules of the work gate. A `failed`
+    task with `retryable: true` can change again (also its `type`), as a
+    `waiting` task: for example, to give better instructions before a retry.
 11. When the owner agent stops existing, `tau` sets the task to `failed` with
     the result `owner agent exited` and `retryable: true`. See
     [Liveness](#liveness). If the task has sub-tasks that are not closed, the
     task stays `in_progress` until they close (rule 7): the lead can claim,
     finish, or cancel them. Then `tau` fails the task.
 12. A `failed` task with `retryable: true` can be claimed or delegated again
-    (rule 2). Usually the lead decides this: it coordinates the work.
+    (rule 2). Usually the lead decides this: it coordinates the work. See
+    [Failed tasks](#failed-tasks).
+
+### Failed tasks
+
+A retry uses the **same** task: `tau_delegate` (or `tau_claim`) with the ID
+of the failed task. Do not create a new task for a retry: the tools,
+`tau_wait`, and the continuation messages tell the agents this.
+
+- Before the retry, an agent can change the task with `tau_update` (rule 10).
+- The claim removes the `result` of the failed attempt. `tau_get` then shows
+  it as `Result of the last failed attempt`, so that the new owner knows
+  why the task failed.
+- When the agent does not retry the task now, it **acknowledges** it with
+  `tau_ack` and a reason. The task stays `failed` (its `retryable` value
+  does not change), but the default views do not show it, and do not count
+  it ([tree](#the-task-tree-widget), `tau_list`). `tau_get` shows the
+  reason (also the `history` section). A later retry of a retryable task is
+  still possible: the claim removes the acknowledgment.
+- A sub-agent cannot acknowledge the task that it received: its parent
+  decides about that failure. It can acknowledge failed sub-tasks of its
+  task.
+- Until an agent acknowledges it, a retryable `failed` task is open work for
+  the ["do not stop" rule](#the-do-not-stop-rule). A failed sub-task of a
+  closed task is not open work: nobody can claim it.
 
 An agent can **change** a task when it is the lead, or when the task is in
 the task that the agent received from its parent (the task or one of its
@@ -767,9 +796,11 @@ An agent cannot stop while its task list has open work. (Exceptions: you
 stop it, or its run ends with an error. See below.)
 
 - **Lead:** it cannot stop while a task in the list is `waiting` or
-  `in_progress`.
+  `in_progress`, or `failed` with `retryable: true` and not acknowledged
+  (see [Failed tasks](#failed-tasks)).
 - **Sub-agent:** it cannot stop while its task is `in_progress` and it owns
-  the task. (After a failed start, a retry can give the task to a different
+  the task. While it works, the retryable failed sub-tasks of its task that
+  it did not acknowledge are open work too. (After a failed start, a retry can give the task to a different
   sub-agent.)
 
 When the agent tries to stop too early, `tau` sends a continuation message
@@ -784,6 +815,8 @@ When the agent tries to stop too early, `tau` sends a continuation message
 ```
 
 When a task is ready, the message tells the agent to claim or delegate it.
+For a retryable failed task, it tells the agent to retry it with the same
+task ID, or to acknowledge it with `tau_ack`.
 The message has only task IDs, statuses, and agent names. It does not have task
 titles: the model gets the message as a user message, and text that agents
 wrote must not look like an instruction of the user. If `tau` cannot read the
@@ -794,8 +827,7 @@ notifies you. The rule is off until your next prompt. You can change this
 limit in the [configuration](#configuration).
 
 The rule does not apply when you stop the agent (for example with `Esc`), or
-when the run ends with an error. A failed task is not open work: the lead
-decides if it retries the task.
+when the run ends with an error.
 
 ### Errors of a sub-agent
 
@@ -872,10 +904,12 @@ task stops after an error.
   T2.1  completed  Create login_tokens table
   T4  failed (retryable)  Security review of token storage
   Use tau_get to read the results.
+  For T4: read the result with tau_get. To retry a retryable task, use tau_delegate with the same task ID (do not create a new task). To not retry it, use tau_ack.
 ```
 
 When one task in the list fails, `tau_wait` returns at once, so that the agent
-can retry the task or abort the other tasks. It also returns at once when
+can retry the task (with the same task ID), acknowledge it, or abort the
+other tasks. It also returns at once when
 the owner of a task stopped after an error (see
 [Errors of a sub-agent](#errors-of-a-sub-agent)). The result shows the tasks that
 are still open:
@@ -887,6 +921,7 @@ are still open:
   T3  in_progress (@tau-t3)  Update login page
   T4  failed (retryable)  Security review of token storage
   Use tau_get to read the results.
+  For T4: read the result with tau_get. To retry a retryable task, use tau_delegate with the same task ID (do not create a new task). To not retry it, use tau_ack.
 ```
 
 With `timeout_seconds`, `tau_wait` also returns when the time ends. Then
@@ -1110,6 +1145,7 @@ All tools exist only when herdr is available.
 | `tau_complete`  | Close the active task as `completed`, with a result.          |
 | `tau_fail`      | Close the active task as `failed`, with a result and `retryable`. |
 | `tau_cancel`    | Cancel a `waiting` task, with a reason.                       |
+| `tau_ack`       | Acknowledge a `failed` task that the agent does not retry now, with a reason. See [Failed tasks](#failed-tasks). |
 | `tau_delegate`  | Start a sub-agent for a task, with a model and thinking (optional `start_timeout_seconds`, default 60). |
 | `tau_abort`     | Stop a sub-agent and its sub-agents, and fail their tasks, with a reason. (A task with open sub-tasks fails when they close.) |
 | `tau_wait`      | Wait until each task in a list is closed (`ids`, optional `timeout_seconds`). It returns at once when a task fails, when the owner of a task stopped after an error, or when a message arrives. |
@@ -1119,8 +1155,8 @@ All tools exist only when herdr is available.
 
 ### `tau_list`
 
-By default, `tau_list` shows only tasks that are not `completed` or
-`canceled`. Use `all: true` to see all tasks. The tasks show in the order
+By default, `tau_list` shows only tasks that are not `completed`,
+`canceled`, or acknowledged (`failed`). Use `all: true` to see all tasks. The tasks show in the order
 that they were made. Each line has only the `id`, status, title, owner, open
 dependencies, `retryable` or `not retryable` for a failed task,
 `(stopped after an error)` for an owner that stopped after an error, and the
@@ -1135,7 +1171,7 @@ for the full task.
   T4    failed       Security review of token storage                  retryable  1 note
   T2.1  in_progress  Create login_tokens table                         @tau-t2-1
   T2.2  waiting      Write endpoint tests                              deps: T2.1
-  (3 completed or canceled tasks hidden. Use all: true.)
+  (3 completed, canceled, or acknowledged tasks hidden. Use all: true.)
   Your active task: T2.
 ```
 
@@ -1571,7 +1607,7 @@ uses the default configuration.
 
 ```jsonc
 {
-  // Key that shows or hides completed and canceled tasks.
+  // Key that shows or hides completed, canceled, and acknowledged tasks.
   "toggleCompletedKey": "ctrl+shift+t",
 
   // Show task IDs as colored powerline pills. Needs a Nerd Font.

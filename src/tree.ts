@@ -8,7 +8,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import { activeTask, childrenOf, findTask, ownerError, parentId, type Task, type TaskList, type TaskStatus } from "./tasks/model.ts";
+import { activeTask, childrenOf, findTask, isAcknowledged, ownerError, parentId, type Task, type TaskList, type TaskStatus } from "./tasks/model.ts";
 import { cleanLine } from "./text.ts";
 
 export interface TreeOptions {
@@ -76,11 +76,11 @@ interface Row {
 }
 
 export function renderTree(list: TaskList | undefined, options: TreeOptions): string[] {
-  const header = headerLine(list, options);
   if (list === undefined) {
-    return [fit(header, options.width)];
+    return [fit(headerLine(list, options, new Set()), options.width)];
   }
   const rows = visibleRows(list, options.showClosed, options.root);
+  const header = headerLine(list, options, new Set(rows.map((row) => row.task.id)));
   const shown = rows.slice(0, options.maxLines);
   const more = rows.length - shown.length;
 
@@ -111,13 +111,14 @@ export function renderTree(list: TaskList | undefined, options: TreeOptions): st
 }
 
 /** The header: the badge and the number of tasks for each status. Counts of 0 do not show. */
-function headerLine(list: TaskList | undefined, options: TreeOptions): string {
+function headerLine(list: TaskList | undefined, options: TreeOptions, visible: ReadonlySet<string>): string {
   const tasks = list === undefined ? [] : scopedTasks(list, options.root);
   if (list === undefined || tasks.length === 0) {
     return options.badge;
   }
   const counts = COUNT_LABELS.map(([status, label]) => {
-    const count = tasks.filter((task) => task.status === status).length;
+    // An acknowledged failed task counts only when its row shows.
+    const count = tasks.filter((task) => task.status === status && (!isAcknowledged(task) || visible.has(task.id))).length;
     return count === 0 ? undefined : `${count} ${label}`;
   }).filter((item) => item !== undefined);
   // An agent with unread messages and no active task: its count cannot show
@@ -153,7 +154,9 @@ function visibleRows(list: TaskList, showClosed: boolean, root?: string): Row[] 
     let result: boolean;
     if (showClosed) result = true;
     else if (task.status === "completed") result = false;
-    else result = task.status !== "canceled" || childrenOf(list, task.id).some(isVisible);
+    // An acknowledged failed task shows as a canceled task does.
+    else if (task.status === "canceled" || isAcknowledged(task)) result = childrenOf(list, task.id).some(isVisible);
+    else result = true;
     visible.set(task.id, result);
     return result;
   };

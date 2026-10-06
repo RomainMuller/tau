@@ -24,7 +24,7 @@ import { cleanLine } from "./text.ts";
 import { DEFAULT_MAX_TREE_LINES } from "./tree.ts";
 
 export interface TauConfig {
-  /** The key that shows or hides completed and canceled tasks. */
+  /** The key that shows or hides completed, canceled, and acknowledged tasks. */
   readonly toggleCompletedKey: string;
   /** Show task IDs as colored powerline pills. Needs a Nerd Font. */
   readonly idPills: boolean;

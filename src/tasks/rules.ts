@@ -17,6 +17,7 @@ import {
   descendantsOf,
   findTask,
   getTask,
+  hasEventRoom,
   isClosed,
   isDescendant,
   isInSubtree,
@@ -122,10 +123,16 @@ export function updateTask(list: TaskList, ctx: RuleContext, id: string, changes
   checkNotEnded(list, ctx);
   const task = getTask(list, checkId(id));
   checkScope(ctx, task.id);
+  // A retryable failed task can be claimed again (rule 2), so the agent can
+  // change it before the retry: for example, to give better instructions.
+  const open = task.status === "waiting" || isRetryable(task);
   if (task.status === "in_progress") {
     checkOwner(ctx, task, "change");
-  } else if (task.status !== "waiting") {
-    throw new TauError("invalid_state", `Task ${task.id} is ${task.status}. You cannot change a closed task.`);
+  } else if (!open) {
+    throw new TauError(
+      "invalid_state",
+      `Task ${task.id} is ${task.status}${task.status === "failed" ? " and not retryable" : ""}. You cannot change a closed task.`,
+    );
   }
 
   const checked: {
@@ -138,12 +145,12 @@ export function updateTask(list: TaskList, ctx: RuleContext, id: string, changes
     checked.title = checkTitle(changes.title);
   }
   if (changes.type !== undefined && changes.type !== task.type) {
-    if (task.status !== "waiting") {
+    if (!open) {
       // The type selects the rules of the work gate (for example read-only),
       // so the owner cannot change it after the claim.
       throw new TauError(
         "invalid_state",
-        `Task ${task.id} is ${task.status}. You can change the type only while a task is waiting. Create a new task for a different type of work.`,
+        `Task ${task.id} is ${task.status}. You can change the type only while a task is waiting (or failed and retryable). Create a new task for a different type of work.`,
       );
     }
     checked.type = checkType(ctx, changes.type);
@@ -152,10 +159,10 @@ export function updateTask(list: TaskList, ctx: RuleContext, id: string, changes
     checked.description = checkText("description", changes.description, { allowEmpty: true });
   }
   if (changes.dependencies !== undefined && !sameItems(changes.dependencies, task.dependencies)) {
-    if (task.status !== "waiting") {
+    if (!open) {
       throw new TauError(
         "invalid_state",
-        `Task ${task.id} is ${task.status}. You can change dependencies only while a task is waiting.`,
+        `Task ${task.id} is ${task.status}. You can change dependencies only while a task is waiting (or failed and retryable).`,
       );
     }
     checked.dependencies = checkDependencies(list, task.id, changes.dependencies);
@@ -431,6 +438,53 @@ export function cancelTask(list: TaskList, ctx: RuleContext, id: string, reason:
     });
   }
   return canceled;
+}
+
+/**
+ * Acknowledges a failed task: the agent saw the failure, and does not retry
+ * the task now. The task stays `failed` (a retryable task can still be
+ * claimed; the claim removes the acknowledgment). The default views do not
+ * show it. The agent must be able to change the task (its scope), and a
+ * sub-agent cannot acknowledge the task that it received.
+ */
+export function acknowledgeTask(list: TaskList, ctx: RuleContext, id: string, reason: string): Task {
+  checkNotEnded(list, ctx);
+  const task = getTask(list, checkId(id));
+  checkScope(ctx, task.id);
+  const text = checkText("reason", reason);
+  // The parent of a sub-agent decides about the task that it gave: the
+  // sub-agent must not hide its own failure from its parent.
+  if (ctx.actor.scope === task.id) {
+    throw new TauError(
+      "permission_denied",
+      `Task ${task.id} is the task that you received. Your parent decides if it retries it. You can acknowledge only its failed sub-tasks.`,
+    );
+  }
+  if (task.status !== "failed") {
+    throw new TauError("invalid_state", `Task ${task.id} is ${task.status}. You can acknowledge only a failed task.`);
+  }
+  if (task.acknowledged === true) {
+    throw new TauError("invalid_state", `Task ${task.id} is already acknowledged.`);
+  }
+  recordEvent(list, task, { kind: "acknowledged", at: ctx.now, actor: ctx.actor.name, reason: text });
+  return task;
+}
+
+/** True when a task failed and can be claimed again. */
+export function isRetryable(task: Task): boolean {
+  return task.status === "failed" && task.retryable === true;
+}
+
+/**
+ * True when a retry of the task is possible: it is retryable, it can get a
+ * claim (`MAX_EVENTS`), and no ancestor is closed (a sub-task of a closed
+ * task cannot be claimed). The dependencies can still be open.
+ */
+export function canRetry(list: TaskList, task: Task): boolean {
+  return isRetryable(task) && hasEventRoom(task) && ancestorIds(task.id).every((id) => {
+    const ancestor = findTask(list, id);
+    return ancestor !== undefined && !isClosed(ancestor);
+  });
 }
 
 /** Adds a note to a task. All agents can add notes to all tasks. */

@@ -282,7 +282,7 @@ async function startReserved(
             ? "The task is waiting again, with no owner. But pi can still run in the old pane: delegate the task again only after that pane is closed."
             : "The task is waiting again, with no owner. You can delegate it again."
           : task?.status === "failed"
-            ? `The task failed (retryable: ${task.retryable === true ? "yes" : "no"}). Read its result with tau_get.`
+            ? `The task failed (retryable: ${task.retryable === true ? "yes" : "no"}). Read its result with tau_get.${task.retryable === true ? ` To retry it, use tau_delegate with id "${task.id}" again (do not create a new task).` : ""}`
             : task?.status === "in_progress"
               ? "The task stays in progress until its sub-tasks close. Then tau fails it."
               : `The task is ${task?.status ?? "unknown"}.`,
