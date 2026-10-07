@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+import { homedir, tmpdir } from "node:os";
+import { join, win32 } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { checkGate } from "./gate.ts";
+import { checkGate, resolveLikePi } from "./gate.ts";
 import { descriptionIsWork, formatSection, formatTask } from "./format.ts";
 import { findTask, seedTaskList, type TaskList } from "./tasks/model.ts";
 import { abortTask, claimTask, completeTask, createTask, delegateTask, failTask, updateTask } from "./tasks/rules.ts";
@@ -18,7 +19,7 @@ import { registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts
 interface RegisteredTool {
   name: string;
   description: string;
-  parameters: { properties: Record<string, { type?: string; enum?: string[]; anyOf?: unknown }> };
+  parameters: { properties: Record<string, { type?: string; enum?: string[]; anyOf?: unknown; description?: string }> };
   execute: (id: string, params: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
 }
 
@@ -365,6 +366,10 @@ describe("task tools, more cases", () => {
     }
   });
 
+  it("shows the writable extensions of a read-only type", () => {
+    assert.match(tools.get("tau_create")!.parameters.properties["type"]!.description ?? "", /plan: .*\(read-only, except \.md files\)/);
+  });
+
   it("lists the configured task types in the type enums", () => {
     const custom = register({
       ...makeSession("lead"),
@@ -481,10 +486,187 @@ describe("work gate", () => {
   });
 
   it("allows other tools when the agent has an active task", async () => {
-    await call("tau_claim", { id: "T0" });
+    await call("tau_create", { title: "Work", type: "code" });
+    await call("tau_claim", { id: "T1" });
     for (const toolName of ["bash", "read", "edit", "write", "some_mcp_tool"]) {
       assert.equal(checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types }), undefined);
     }
+  });
+
+  describe("plan task (read-only, except Markdown files)", () => {
+    let dir: string;
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), "tau-gate-"));
+      await call("tau_claim", { id: "T0" });
+    });
+    afterEach(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    const gate = async (toolName: string, toolInput: unknown) =>
+      checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types, toolInput, cwd: dir });
+
+    it("keeps T0 as a plan task", async () => {
+      assert.equal(findTask(await list(), "T0")?.type, "plan");
+      assert.equal(types.plan?.readOnly, true);
+    });
+
+    it("allows write and edit of Markdown files in any directory", async () => {
+      for (const toolName of ["write", "edit"]) {
+        assert.equal(await gate(toolName, { path: "PLAN.md" }), undefined);
+        assert.equal(await gate(toolName, { path: "docs/x.MD" }), undefined);
+        assert.equal(await gate(toolName, { path: join(dir, "a", "b.md") }), undefined);
+      }
+    });
+
+    it("blocks other files, and a missing or wrong path", async () => {
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: "src/a.ts" })) ?? "", /which is read-only\.\nThis type permits changes only to files with the extensions: \.md\./);
+        assert.match((await gate(toolName, {})) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: 5 })) ?? "", /read-only/);
+        assert.match((await gate(toolName, undefined)) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: "" })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: "md" })) ?? "", /read-only/);
+      }
+    });
+
+    it("blocks a Markdown symbolic link that points to a different file type", async () => {
+      await writeFile(join(dir, "a.ts"), "x");
+      await symlink(join(dir, "a.ts"), join(dir, "link.md"));
+      await writeFile(join(dir, "b.md"), "x");
+      await symlink(join(dir, "b.md"), join(dir, "ok.md"));
+      assert.match((await gate("write", { path: "link.md" })) ?? "", /read-only/);
+      assert.equal(await gate("write", { path: "ok.md" }), undefined);
+    });
+
+    it("blocks a dangling Markdown symbolic link, and an edit through a link to another file type", async () => {
+      await symlink(join(dir, "missing.ts"), join(dir, "x.md"));
+      await writeFile(join(dir, "a.ts"), "x");
+      await symlink(join(dir, "a.ts"), join(dir, "link.md"));
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: "x.md" })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: "link.md" })) ?? "", /read-only/);
+      }
+    });
+
+    it("blocks a file with more than one hard link", async () => {
+      await writeFile(join(dir, "a.ts"), "x");
+      await link(join(dir, "a.ts"), join(dir, "hard.md"));
+      await writeFile(join(dir, "single.md"), "x");
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: "hard.md" })) ?? "", /read-only/);
+        assert.equal(await gate(toolName, { path: "single.md" }), undefined);
+      }
+    });
+
+    it("blocks a Markdown symbolic link to a file with more than one hard link", async () => {
+      await writeFile(join(dir, "actual.ts"), "x");
+      await link(join(dir, "actual.ts"), join(dir, "actual.md"));
+      await symlink(join(dir, "actual.md"), join(dir, "link.md"));
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: "link.md" })) ?? "", /read-only/);
+      }
+    });
+
+    it("strips a leading @ like pi does", async () => {
+      for (const toolName of ["write", "edit"]) {
+        assert.equal(await gate(toolName, { path: "@PLAN.md" }), undefined);
+        assert.equal(await gate(toolName, { path: "@" + join(dir, "PLAN.md") }), undefined);
+        assert.match((await gate(toolName, { path: "@a.ts" })) ?? "", /read-only/);
+      }
+    });
+
+    it("always strips @, also when a file with the @ name exists", async () => {
+      // pi writes "link.md" (a link to a .ts file), not "@link.md". The file
+      // "@link.md" is in the cwd of the process and in the cwd of the tool.
+      const other = await mkdtemp(join(tmpdir(), "tau-gate-cwd-"));
+      const before = process.cwd();
+      try {
+        await writeFile(join(other, "@link.md"), "x");
+        await writeFile(join(dir, "@link.md"), "x");
+        await writeFile(join(dir, "a.ts"), "x");
+        await symlink(join(dir, "a.ts"), join(dir, "link.md"));
+        process.chdir(other);
+        for (const toolName of ["write", "edit"]) {
+          assert.match((await gate(toolName, { path: "@link.md" })) ?? "", /read-only/);
+        }
+      } finally {
+        process.chdir(before);
+        await rm(other, { recursive: true, force: true });
+      }
+    });
+
+    it("resolves a relative path against the given cwd, not process.cwd()", async () => {
+      assert.notEqual(process.cwd(), dir);
+      await writeFile(join(dir, "a.ts"), "x");
+      await symlink(join(dir, "a.ts"), join(dir, "only-here.md"));
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: "only-here.md" })) ?? "", /read-only/);
+      }
+    });
+
+    it("resolves file:// URLs before it checks the extension", async () => {
+      const ts = pathToFileURL(join(dir, "gate.ts")).href;
+      await writeFile(join(dir, "a.ts"), "x");
+      await symlink(join(dir, "a.ts"), join(dir, "alias.md"));
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: `${ts}?x.md` })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: `${ts}#x.md` })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: pathToFileURL(join(dir, "alias.md")).href })) ?? "", /read-only/);
+        assert.equal(await gate(toolName, { path: pathToFileURL(join(dir, "n.md")).href }), undefined);
+        assert.match((await gate(toolName, { path: "file://%zz/x.md" })) ?? "", /read-only/);
+      }
+    });
+
+    it("replaces Unicode spaces like pi does", async () => {
+      // pi writes "my link.md" (a link to a .ts file) for "my\u00a0link.md".
+      await writeFile(join(dir, "a.ts"), "x");
+      await symlink(join(dir, "a.ts"), join(dir, "my link.md"));
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: "my\u00a0link.md" })) ?? "", /read-only/);
+        assert.equal(await gate(toolName, { path: "new\u2003file.md" }), undefined);
+      }
+    });
+
+    it("expands ~ like pi does", async () => {
+      // Node uses HOME on POSIX and USERPROFILE on Windows.
+      const home = process.env.HOME;
+      const profile = process.env.USERPROFILE;
+      process.env.HOME = dir;
+      process.env.USERPROFILE = dir;
+      try {
+        assert.equal(homedir(), dir);
+        await writeFile(join(dir, "a.ts"), "x");
+        await symlink(join(dir, "a.ts"), join(dir, "home-link.md"));
+        for (const toolName of ["write", "edit"]) {
+          assert.equal(await gate(toolName, { path: "~/x.md" }), undefined);
+          assert.match((await gate(toolName, { path: "~/x.ts" })) ?? "", /read-only/);
+          assert.match((await gate(toolName, { path: "~/home-link.md" })) ?? "", /read-only/);
+        }
+        assert.equal(resolveLikePi("~\\a.md", "D:\\work", "win32"), win32.join(dir, "a.md"));
+      } finally {
+        if (home === undefined) delete process.env.HOME;
+        else process.env.HOME = home;
+        if (profile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = profile;
+      }
+    });
+
+    it("resolves Windows shell paths like pi does", () => {
+      assert.equal(resolveLikePi("/c/tmp/a.md", "D:\\work", "win32"), "C:\\tmp\\a.md");
+      assert.equal(resolveLikePi("/mnt/c/tmp/a.md", "D:\\work", "win32"), "C:\\tmp\\a.md");
+      assert.equal(resolveLikePi("/cygdrive/c/tmp/a.md", "D:\\work", "win32"), "C:\\tmp\\a.md");
+      assert.equal(resolveLikePi("@notes\\a.md", "D:\\work", "win32"), "D:\\work\\notes\\a.md");
+      assert.equal(resolveLikePi("/c/tmp/a.md", "/work", "linux"), "/c/tmp/a.md");
+      // pi also normalizes the cwd.
+      assert.equal(resolveLikePi("a.md", "/c/work", "win32"), "C:\\work\\a.md");
+      // An absolute path with no drive does not use the drive of the cwd.
+      assert.equal(resolveLikePi("\\link.md", "D:\\work", "win32"), win32.resolve("\\link.md"));
+      assert.notEqual(resolveLikePi("\\link.md", "D:\\work", "win32"), "D:\\link.md");
+    });
+
+    it("lists the permitted extensions in the block message", async () => {
+      assert.match((await gate("write", { path: "a.ts" })) ?? "", /extensions: \.md\./);
+    });
   });
 
   it("does not count the active task of a different agent", async () => {

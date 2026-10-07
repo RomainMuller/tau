@@ -107,7 +107,9 @@ T0    in_progress  Prepare task list    @lead
 ```
 
 This task tells the agent to read the user prompt, plan the work, and create the
-tasks it needs. The lead owns `T0` from the start: it does not claim it. While
+tasks it needs (at minimum). If the work justifies it, the agent can also write
+the plan in `PLAN.md`: this works with the default `plan` type, which is
+read-only, except for Markdown files. The lead owns `T0` from the start: it does not claim it. While
 `T0` is open, the lead can claim only sub-tasks of `T0`. To work on a different
 root task, the lead closes `T0` first.
 
@@ -150,7 +152,7 @@ have `plan`.
 
 | Type       | Read-only | Use it for                                                  |
 |------------|-----------|-------------------------------------------------------------|
-| `plan`     | no        | Make or change the task list. See [Plan tasks](#plan-tasks).|
+| `plan`     | yes, except `.md` files | Make or change the task list. See [Plan tasks](#plan-tasks).|
 | `research` | yes       | Read code, docs, or the web. No file changes.               |
 | `code`     | no        | Change code or files.                                       |
 | `test`     | no        | Write or run tests.                                         |
@@ -158,16 +160,27 @@ have `plan`.
 | `docs`     | no        | Write documentation.                                        |
 
 For a read-only type, the [work gate](#work-gate) blocks `edit` and `write`.
+A type can set `writableExtensions` (for example `[".md"]`): the gate then
+permits `edit` and `write` on files with these extensions, in any directory.
+The `plan` type does this for `.md` files.
+
+A custom `taskTypes` list replaces the default list. A custom `plan` type
+without `"readOnly": true` is writable, and the gate does not block it. To keep
+the default rule, set `"readOnly": true, "writableExtensions": [".md"]` on your
+`plan` type.
 
 #### Plan tasks
 
-A `plan` task can make more than the task list. For example, it can write a
-Markdown plan and get your approval for it. In this case, the agent creates a
-sub-task for each deliverable (a part of the tree, without the header):
+A `plan` task is read-only, but it can write Markdown files (`.md`, in any
+directory), for example `PLAN.md`. This works with the default `plan` type. A
+custom `plan` type can permit it too (see [Task types](#task-types)). At minimum, it makes the task list. If the work justifies it, it can
+also write a plan in `PLAN.md` and get your approval for it. In this case, the
+agent creates a sub-task for each deliverable (a part of the tree, without the
+header):
 
 ```text
 ○ T0    Prepare task list
-├─ ○ T0.1  Write plan in docs/plan.md
+├─ ○ T0.1  Write the plan in PLAN.md
 └─ ○ T0.2  Get user approval for the plan        ⧗ T0.1
 ```
 
@@ -502,13 +515,20 @@ an error and registers no tools and no gate: pi runs in its standard mode.
 
 When the type of the active task has `readOnly: true`, the work gate also
 blocks `edit` and `write`. `bash` stays available, because `tau` cannot check
-if a command changes files.
+if a command changes files. Exception: when the type has `writableExtensions`
+(the `plan` type has `[".md"]`), the gate permits `edit` and `write` on a file
+with one of these extensions (not case-sensitive). If the file is a symbolic
+link, the file that it points to must have one of these extensions too. If the
+`path` argument is missing, the gate blocks the call.
 
 ```text
 ✖ edit
   tau blocked edit: your active task T1 has the type "research", which is read-only.
   Record what you found in the task result. Create a "code" task for changes.
 ```
+
+For a type with `writableExtensions`, the message also says:
+`This type permits changes only to files with the extensions: .md.`
 
 A task type that the configuration does not define is read-only.
 
@@ -1590,7 +1610,7 @@ file is not valid JSON, `tau` uses the default configuration.
 | `maxIdleContinuations` | An integer from 0 to 100. With 0, the "do not stop" rule gives up at the first early stop. |
 | `askTool`              | The name of the "ask question" tool of a different extension: a letter, then `a-z`, `A-Z`, `0-9`, `_`, and `-` (at most 64 characters). Not a `tau_*` tool, and not a built-in tool (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`). Not set by default. See [Set the ask tool](#set-the-ask-tool-asktool). |
 | `sticky`               | `true` or `false`. Send the agent states to the Sticky devices, through `sticky server` (macOS). The default is `true`. See [Sticky devices](#sticky-devices). |
-| `taskTypes`            | 1 to 50 types. A name starts with `a-z`, then has `a-z`, `0-9`, and `-` (at most 32 characters). Each type has a `description` (1 to 300 characters) and an optional `readOnly`. The list must have `plan`, the type of the first task `T0`. If one type is not valid, `tau` uses the default list. |
+| `taskTypes`            | 1 to 50 types. A name starts with `a-z`, then has `a-z`, `0-9`, and `-` (at most 32 characters). Each type has a `description` (1 to 300 characters) and the optional `readOnly` and `writableExtensions` (1 to 20 extensions, each like `".md"`: a dot, then 1 to 16 letters or digits; they apply when `readOnly` is `true`). The list must have `plan`, the type of the first task `T0`. The list replaces the default list: a `plan` with no `readOnly` is writable. To keep the default rule, use `"readOnly": true, "writableExtensions": [".md"]`. If one type is not valid, `tau` uses the default list. |
 
 Rules for `toggleCompletedKey`:
 
@@ -1631,9 +1651,11 @@ uses the default configuration.
   // Send the agent states to the Sticky devices, through `sticky server` (macOS).
   "sticky": true,
 
-  // Task types. This list replaces the default list.
+  // Task types. This list replaces the default list. A "plan" type with no
+  // "readOnly": true is writable. To keep the default rule for "plan", set
+  // "readOnly": true and "writableExtensions": [".md"], as below.
   "taskTypes": {
-    "plan":     { "description": "Make or change the task list." },
+    "plan":     { "description": "Make or change the task list. Can write Markdown files (for example PLAN.md).", "readOnly": true, "writableExtensions": [".md"] },
     "research": { "description": "Read code, docs, or the web. No file changes.", "readOnly": true },
     "code":     { "description": "Change code or files." },
     "test":     { "description": "Write or run tests." },

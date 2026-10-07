@@ -234,6 +234,9 @@ function parseConfigText(text: string): { config: TauConfig; problems: string[] 
   return { config: config as unknown as TauConfig, problems };
 }
 
+const MAX_WRITABLE_EXTENSIONS = 20;
+const WRITABLE_EXTENSION = /^\.[a-z0-9]{1,16}$/i;
+
 /**
  * Checks the task types. Returns `undefined` when the value is not valid:
  * then tau uses the default list. Adds details to `problems`.
@@ -254,18 +257,38 @@ function taskTypes(value: unknown, problems: string[]): Record<string, TaskTypeD
       own.push(`The task type ${name} must be an object with a description.`);
       continue;
     }
-    const unknown = Object.keys(definition).filter((key) => key !== "description" && key !== "readOnly");
+    const unknown = Object.keys(definition).filter((key) => key !== "description" && key !== "readOnly" && key !== "writableExtensions");
     if (unknown.length > 0) own.push(`The task type ${name} has fields that tau does not know: ${unknown.map(quote).join(", ")}.`);
     if (definition.readOnly !== undefined && typeof definition.readOnly !== "boolean") {
       own.push(`readOnly of the task type ${name} must be true or false.`);
       continue;
+    }
+    let writableExtensions: string[] | undefined;
+    if (definition.writableExtensions !== undefined) {
+      const extensions = definition.writableExtensions;
+      if (
+        !Array.isArray(extensions) ||
+        extensions.length < 1 ||
+        extensions.length > MAX_WRITABLE_EXTENSIONS ||
+        !extensions.every((extension) => typeof extension === "string" && WRITABLE_EXTENSION.test(extension))
+      ) {
+        own.push(
+          `writableExtensions of the task type ${name} must be a list of 1 to ${MAX_WRITABLE_EXTENSIONS} extensions, for example [".md"].`,
+        );
+        continue;
+      }
+      writableExtensions = [...new Set((extensions as string[]).map((extension) => extension.toLowerCase()))];
     }
     const description = cleanLine(definition.description).trim();
     if (description === "" || [...description].length > MAX_DESCRIPTION_LENGTH) {
       own.push(`The description of the task type ${name} must have 1 to ${MAX_DESCRIPTION_LENGTH} characters.`);
       continue;
     }
-    result[name] = { description, readOnly: definition.readOnly === true };
+    result[name] = {
+      description,
+      readOnly: definition.readOnly === true,
+      ...(writableExtensions === undefined ? {} : { writableExtensions }),
+    };
   }
   // The first task of each list (T0) has the type "plan".
   if (entries.length > 0 && result.plan === undefined && !own.some((line) => line.includes(" plan "))) {

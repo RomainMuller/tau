@@ -119,7 +119,7 @@ const StringEnum = (values: readonly string[], description: string) =>
 
 function typeDescription(types: Readonly<Record<string, TaskTypeDefinition>>): string {
   const lines = Object.entries(types).map(
-    ([name, type]) => `${name}: ${type.description}${type.readOnly ? " (read-only)" : ""}`,
+    ([name, type]) => `${name}: ${type.description}${type.readOnly ? ` (read-only${type.writableExtensions?.length ? `, except ${type.writableExtensions.join(" ")} files` : ""})` : ""}`,
   );
   return `The task type. One of:\n${lines.join("\n")}`;
 }

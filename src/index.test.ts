@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -658,6 +658,20 @@ describe("tau extension", () => {
     assert.ok(gate, "a tool_call handler is registered");
     // The lead owns T0 from the start: its work needs no claim.
     assert.equal(await gate({ type: "tool_call", toolName: "bash", toolCallId: "0", input: {} }, ctx), undefined);
+    // T0 is a plan task: the gate gets the tool input and the cwd of pi.
+    const cwd = await mkdtemp(join(tmpdir(), "tau-gate-cwd-"));
+    try {
+      await writeFile(join(cwd, "a.ts"), "x");
+      await symlink(join(cwd, "a.ts"), join(cwd, "link.md"));
+      const planCtx = { ...ctx, cwd };
+      const write = (path: string) => gate({ type: "tool_call", toolName: "write", toolCallId: "p", input: { path } }, planCtx);
+      assert.equal(await write("PLAN.md"), undefined);
+      assert.match(((await write("a.ts")) as { reason: string }).reason, /extensions: \.md\./);
+      // "link.md" exists only in the cwd of pi: the gate resolves it there.
+      assert.match(((await write("link.md")) as { reason: string }).reason, /read-only/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
     await pi.tools.get("tau_create")!.execute("0", { title: "Next", type: "code" });
     await pi.tools.get("tau_complete")!.execute("0", { result: "planned" });
     const blocked = (await gate({ type: "tool_call", toolName: "bash", toolCallId: "1", input: {} }, ctx)) as {

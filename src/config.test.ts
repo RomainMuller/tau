@@ -70,7 +70,7 @@ describe("parseConfig", () => {
       // "askTool" is commented out in the README example.
       "askTool": "ask_user_question",
       "taskTypes": {
-        "plan":  { "description": "Make or change the task list." },
+        "plan":  { "description": "Make or change the task list.", "readOnly": true, "writableExtensions": [".md", ".MD", ".txt"] },
         "spike": { "description": "Try an idea.", "readOnly": true }
       }
     }`);
@@ -84,7 +84,7 @@ describe("parseConfig", () => {
       sticky: false,
       askTool: "ask_user_question",
       taskTypes: {
-        plan: { description: "Make or change the task list.", readOnly: false },
+        plan: { description: "Make or change the task list.", readOnly: true, writableExtensions: [".md", ".txt"] },
         spike: { description: "Try an idea.", readOnly: true },
       },
     });
@@ -125,6 +125,12 @@ describe("parseConfig", () => {
       [{ plan: { description: "x" }, code: {} }, /code must be an object with a description/],
       [{ plan: { description: "x" }, code: { description: "x", readOnly: "no" } }, /readOnly of the task type code must be true or false/],
       [{ plan: { description: "x" }, code: { description: "   " } }, /description of the task type code must have 1 to 300 characters/],
+      [{ plan: { description: "x" }, code: { description: "x", writableExtensions: [] } }, /writableExtensions of the task type code must be a list of 1 to 20/],
+      [{ plan: { description: "x" }, code: { description: "x", writableExtensions: "md" } }, /writableExtensions of the task type code/],
+      [{ plan: { description: "x" }, code: { description: "x", writableExtensions: ["md"] } }, /writableExtensions of the task type code/],
+      [{ plan: { description: "x" }, code: { description: "x", writableExtensions: [".a/b"] } }, /writableExtensions of the task type code/],
+      [{ plan: { description: "x" }, code: { description: "x", writableExtensions: [1] } }, /writableExtensions of the task type code/],
+      [{ plan: { description: "x" }, code: { description: "x", writableExtensions: Array.from({ length: 21 }, (_, i) => `.e${i}`) } }, /writableExtensions of the task type code/],
       [{ plan: { description: "x" }, code: { description: "x", color: "red" } }, /code has fields that tau does not know: "color"/],
       [{ code: { description: "x" } }, /must have the task type "plan"/],
       [Object.fromEntries(Array.from({ length: 51 }, (_, index) => [`t${index}`, { description: "x" }])), /51 task types\. The maximum is 50/],
@@ -148,6 +154,16 @@ describe("parseConfig", () => {
       assert.equal(config.maxTreeLines, 3, name);
       assert.deepEqual(problems, [`"${name}" is not a configuration field. tau does not use it.`], name);
     }
+  });
+
+  it("accepts 20 extensions and 16-character extensions, and rejects more", () => {
+    const parse = (writableExtensions: string[]) =>
+      parseConfig(JSON.stringify({ taskTypes: { plan: { description: "x", readOnly: true, writableExtensions } } }));
+    const many = (n: number) => Array.from({ length: n }, (_, i) => `.e${i}`);
+    assert.deepEqual(parse(many(20)).problems, []);
+    assert.match(parse(many(21)).problems.join("\n"), /writableExtensions/);
+    assert.deepEqual(parse(["." + "a".repeat(16)]).problems, []);
+    assert.match(parse(["." + "a".repeat(17)]).problems.join("\n"), /writableExtensions/);
   });
 
   it("shows at most 20 problem lines", () => {

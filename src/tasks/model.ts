@@ -502,9 +502,11 @@ export function seedTaskList(sessionId: string, now: string, owner?: string): Ta
         title: "Prepare task list",
         type: "plan",
         description: [
-          "Read the user prompt. Plan the work, and make the tasks that it needs.",
+          "Read the user prompt. Plan the work. At minimum, make the tasks that the work needs.",
           "Give each task a short title and the correct type. Add dependencies",
           "between tasks when one task needs the result of a different task.",
+          "If the work justifies it, also write the plan in a file. With the default",
+          'task types, use PLAN.md: the type "plan" permits changes to Markdown files.',
         ].join("\n"),
         dependencies: [],
   });

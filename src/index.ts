@@ -441,7 +441,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
  * cannot read the task list, it blocks the call too, and tells why.
  */
 function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     // The ask tool only reads an answer of the user: also when tau cannot
     // read the task list, the agent can ask the user what to do.
     if (TASK_TOOL_NAMES.has(event.toolName) || event.toolName === session.askTool) {
@@ -460,6 +460,8 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
               agent: session.actor.name,
               taskTypes: session.taskTypes,
               askTool: session.askTool,
+              toolInput: event.input,
+              cwd: ctx.cwd,
             });
     } catch (error) {
       reason = `tau blocked the tool: it cannot read the task list (${error instanceof Error ? error.message : String(error)}).`;
