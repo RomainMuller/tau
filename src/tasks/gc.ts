@@ -18,9 +18,9 @@
  *
  * tau removes a task list only when all these conditions are true:
  *
- * 1. Its files did not change for `graceMs` (the default is one day). pi
- *    makes the session file only after the first answer of the model, and a
- *    different lead can use the list now.
+ * 1. Its database and WAL files did not change for `graceMs` (the default
+ *    is one day). pi makes the session file only after the first answer of
+ *    the model, and a different lead can use the list now.
  * 2. tau can read the list, and the list is for the session of its file name.
  * 3. The transcript does not exist. When tau cannot know (for example, a
  *    session directory cannot be read), it keeps the list.
@@ -116,12 +116,17 @@ export async function collectOrphanedTaskLists(options: CollectOptions): Promise
 
 /**
  * The time of the last change of the files of a task list (the database, and
- * its WAL and SHM files), in milliseconds. `undefined` when a file is not a
- * regular file.
+ * its WAL file), in milliseconds. `undefined` when a file is not a regular
+ * file.
+ *
+ * tau does not use the SHM file: it is an index in shared memory, and a
+ * reader can change it (for example, the reaper of a different lead, see
+ * `reaper.ts`). In WAL mode, a change of the task list changes the database
+ * or the WAL file.
  */
 async function lastChange(file: string): Promise<number | undefined> {
   let last = 0;
-  for (const path of [file, `${file}-wal`, `${file}-shm`]) {
+  for (const path of [file, `${file}-wal`]) {
     let info;
     try {
       info = await lstat(path);

@@ -114,6 +114,14 @@ describe("collectOrphanedTaskLists", () => {
     assert.deepEqual((await collect({ now: Date.now() + DEFAULT_GC_GRACE_MS / 2 })).removed, []);
   });
 
+  it("does not use the SHM file for the age (a reader can change it)", async () => {
+    const file = await makeList("shm", null);
+    const old = new Date(Date.now() - 10 * DAY);
+    await utimes(file, old, old);
+    await writeFile(`${file}-shm`, "");
+    assert.deepEqual((await collect({ now: Date.now() + DEFAULT_GC_GRACE_MS / 2 })).removed, ["shm"]);
+  });
+
   it("never removes the list of the current session", async () => {
     await makeList("current", null);
     assert.deepEqual((await collect()).removed, []);

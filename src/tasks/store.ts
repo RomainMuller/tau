@@ -21,9 +21,31 @@ import { chmod, lstat, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { decodeTaskList, encodeTaskList } from "./codec.ts";
+import { checkProcess, decodeTaskList, encodeTaskList } from "./codec.ts";
 import { TauError } from "./errors.ts";
-import type { TaskList } from "./model.ts";
+import type { ProcessRecord, TaskList } from "./model.ts";
+
+/**
+ * The result of an `update` change that does not write: the store rolls
+ * back the transaction, and the file does not change.
+ */
+export interface NoWrite<T> {
+  readonly write: false;
+  readonly result: T;
+}
+
+/** A change for `update` that does not write. See `NoWrite`. */
+export function noWrite<T>(result: T): NoWrite<T> {
+  return { write: false, result };
+}
+
+export interface UpdateOptions {
+  /**
+   * When false, `update` does not make the database file: it fails when
+   * the file does not exist. The default is true.
+   */
+  readonly create?: boolean;
+}
 
 export interface StoreOptions {
   /** The maximum time to wait while a different process has the lock, in milliseconds. */
@@ -185,21 +207,43 @@ export class TaskListStore {
   /**
    * Changes the task list in one transaction. `change` receives the current
    * list (a new object, so it can change it). If `change` throws, nothing
-   * changes.
+   * changes. When `change` returns `noWrite(result)`, nothing changes too,
+   * and the result is the list that `change` received.
    *
    * When there is no task list, `change` receives `undefined` and must return
-   * the new list.
+   * the new list (or `noWrite`).
    */
   async update<T>(
     change: (list: TaskList | undefined) => { list: TaskList; result: T },
-  ): Promise<{ list: TaskList; result: T }> {
+    options?: UpdateOptions,
+  ): Promise<{ list: TaskList; result: T }>;
+  async update<T>(
+    change: (list: TaskList | undefined) => { list: TaskList; result: T } | NoWrite<T>,
+    options?: UpdateOptions,
+  ): Promise<{ list: TaskList | undefined; result: T }>;
+  async update<T>(
+    change: (list: TaskList | undefined) => { list: TaskList; result: T } | NoWrite<T>,
+    options: UpdateOptions = {},
+  ): Promise<{ list: TaskList | undefined; result: T }> {
     return this.#enqueue(async () => {
-      await this.#prepare();
+      if (options.create === false) {
+        if (!(await checkDirectory(dirname(this.file))) || !(await this.#exists())) {
+          throw new TauError("storage", `The task list ${this.file} does not exist.`);
+        }
+        await secureFiles(this.file);
+      } else {
+        await this.#prepare();
+      }
       return this.#withDatabase(async (db) => {
         await this.#begin(db);
         try {
           const current = readList(db, this.file);
-          const { list, result } = change(current);
+          const outcome = change(current);
+          if ("write" in outcome && outcome.write === false) {
+            db.exec("ROLLBACK");
+            return { list: current, result: outcome.result };
+          }
+          const { list, result } = outcome as { list: TaskList; result: T };
           const text = encodeTaskList(list);
           if (Buffer.byteLength(text) > MAX_FILE_BYTES) {
             throw new TauError("storage", `The task list is too large to save (more than ${MAX_FILE_BYTES} bytes).`);
@@ -472,6 +516,66 @@ export class TaskListStore {
       }
       await sleep(Math.min(5 * 2 ** attempt, 100));
     }
+  }
+}
+
+/** What `peekLiveness` reads from a task list. */
+export interface Liveness {
+  /** The `sessionId` of the list. */
+  readonly session: string;
+  /** The process of the lead. `undefined` when the list has none, or when it is not valid. */
+  readonly lead: ProcessRecord | undefined;
+  /** The number of agent records that did not end. */
+  readonly live: number;
+}
+
+/**
+ * Reads only the session, the lead process, and the number of live agent
+ * records of a task list, with one statement on a read-only connection.
+ * SQLite reads the JSON, so tau does not decode and check the full list.
+ * The reaper uses it for the task lists of other sessions (see `reaper.ts`).
+ *
+ * Returns `undefined` when the file is not a regular file, or the database
+ * has no valid task list. Throws when SQLite cannot read the file.
+ *
+ * The connection does not change the database and its WAL file. When the
+ * WAL file does not exist, SQLite makes it: so the caller must check that
+ * the WAL and SHM files exist first.
+ */
+export async function peekLiveness(file: string): Promise<Liveness | undefined> {
+  const info = await lstat(file).catch(() => undefined);
+  if (info === undefined || info.isSymbolicLink() || !info.isFile()) return undefined;
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(file, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 0");
+    const table = db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'tasklist'").get();
+    if (table === undefined) return undefined;
+    const row = db
+      .prepare(
+        `SELECT
+           json_extract(t.json, '$.sessionId') AS session,
+           json_extract(t.json, '$.leadProcess') AS lead,
+           (SELECT count(*) FROM json_each(t.json, '$.agents')
+              WHERE json_extract(value, '$.state') <> 'ended') AS live
+         FROM tasklist AS t
+         WHERE t.id = 1 AND length(CAST(t.json AS BLOB)) <= ?`,
+      )
+      .get(MAX_FILE_BYTES) as { session: unknown; lead: unknown; live: unknown } | undefined;
+    if (row === undefined || typeof row.session !== "string") return undefined;
+    return { session: row.session, lead: leadOf(row.lead), live: Number(row.live) };
+  } finally {
+    db?.close();
+  }
+}
+
+/** The process record in the JSON text of `leadProcess`, or `undefined` when it is not valid. */
+function leadOf(value: unknown): ProcessRecord | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    return checkProcess(JSON.parse(value), "leadProcess");
+  } catch {
+    return undefined;
   }
 }
 

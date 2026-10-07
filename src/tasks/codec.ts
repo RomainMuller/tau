@@ -13,6 +13,7 @@ import {
   LEAD_AGENT,
   MAX_AGENT_ERROR_CHARS,
   MAX_AGENTS,
+  MAX_PROCESS_TEXT_CHARS,
   type AgentRecord,
   type AgentState,
   MAX_HISTORY,
@@ -22,6 +23,7 @@ import {
   replay,
   TASK_STATUSES,
   type Note,
+  type ProcessRecord,
   type Task,
   type TaskEvent,
   type TaskList,
@@ -101,6 +103,45 @@ function checkList(value: unknown): TaskList {
   // Files from before this field do not have it.
   if (list.sessionFile === null) result.sessionFile = null;
   else if (list.sessionFile !== undefined) result.sessionFile = string(list.sessionFile, "sessionFile");
+  if (list.leadProcess !== undefined) result.leadProcess = checkProcessShape(list.leadProcess, "leadProcess");
+  return result;
+}
+
+/**
+ * Checks the shape of a process record (see `ProcessRecord`). Throws a
+ * `TauError` when it is not valid.
+ */
+export function checkProcess(value: unknown, where: string): ProcessRecord {
+  try {
+    return checkProcessShape(value, where);
+  } catch (error) {
+    if (error instanceof ShapeError) throw new TauError("storage", `The process record is not valid: ${error.message}.`);
+    throw error;
+  }
+}
+
+function checkProcessShape(value: unknown, where: string): ProcessRecord {
+  const record = object(value, where);
+  const pid = record.pid;
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 2) {
+    throw new ShapeError(`${where}.pid is not an integer of 2 or more`);
+  }
+  const text = (item: unknown, name: string): string => {
+    const result = string(item, `${where}.${name}`);
+    const length = [...result].length;
+    if (length === 0 || length > MAX_PROCESS_TEXT_CHARS) {
+      throw new ShapeError(`${where}.${name} must have 1 to ${MAX_PROCESS_TEXT_CHARS} characters`);
+    }
+    return result;
+  };
+  const result: ProcessRecord = {
+    pid,
+    ...(record.start === undefined ? {} : { start: text(record.start, "start") }),
+    machine: text(record.machine, "machine"),
+    token: text(record.token, "token"),
+    attachedAt: string(record.attachedAt, `${where}.attachedAt`),
+  };
+  if (record.detachedAt !== undefined) result.detachedAt = string(record.detachedAt, `${where}.detachedAt`);
   return result;
 }
 
@@ -141,6 +182,7 @@ function checkAgent(value: unknown, where: string): AgentRecord {
     }
     result.error = error;
   }
+  if (agent.process !== undefined) result.process = checkProcessShape(agent.process, `${where}.process`);
   return result;
 }
 

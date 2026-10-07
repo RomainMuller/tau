@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
 import tau, { createTau, errorKind, STICKY_NO_SERVER_NOTICE, type TauDependencies } from "./index.ts";
+import type { ProcessProbe } from "./process-info.ts";
 import { ServerAbsentError, type StickyServer } from "./sticky/server.ts";
 import { TaskListStore } from "./tasks/store.ts";
 import { taskListFile } from "./tasks/paths.ts";
@@ -405,6 +406,80 @@ describe("tau extension", () => {
     });
   });
 
+  describe("process records", () => {
+    const NOW = "2026-01-01T00:00:00.000Z";
+    function fakeProbe(token: string): ProcessProbe {
+      const record = { pid: 4242, machine: "host", token, attachedAt: NOW };
+      return {
+        self: async () => record,
+        probe: async (records) => new Map(records.map((item) => [item, "unknown" as const])),
+        quickProbe: () => "unknown",
+      };
+    }
+    const read = async (file: string) => {
+      const store = new TaskListStore(file);
+      try {
+        return (await store.read())!;
+      } finally {
+        store.close();
+      }
+    };
+
+    it("a lead records its process at the start, and detaches it at shutdown", async () => {
+      enableHerdr();
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx();
+      const handle = createTau(pi.api, { ...deps, processProbe: fakeProbe("lead-1") });
+      await emit(pi, "session_start", ctx);
+      const file = taskListFile(join(root, "tau"), "session-1");
+      assert.deepEqual((await read(file)).leadProcess, { pid: 4242, machine: "host", token: "lead-1", attachedAt: NOW });
+      assert.equal(handle.reaper?.running, true);
+      await emit(pi, "session_shutdown", ctx);
+      assert.equal(handle.reaper?.running, false);
+      assert.equal((await read(file)).leadProcess?.detachedAt, NOW);
+    });
+
+    it("an old runtime does not detach the record of a new runtime (reload)", async () => {
+      enableHerdr();
+      const { ctx } = fakeCtx();
+      const oldPi = fakePi({ code: 0, stdout: PANE_REPLY });
+      createTau(oldPi.api, { ...deps, processProbe: fakeProbe("old") });
+      await emit(oldPi, "session_start", ctx);
+      const newPi = fakePi({ code: 0, stdout: PANE_REPLY });
+      createTau(newPi.api, { ...deps, processProbe: fakeProbe("new") });
+      await emit(newPi, "session_start", ctx);
+      await emit(oldPi, "session_shutdown", ctx);
+      const lead = (await read(taskListFile(join(root, "tau"), "session-1"))).leadProcess;
+      assert.equal(lead?.token, "new");
+      assert.equal(lead?.detachedAt, undefined);
+      await emit(newPi, "session_shutdown", ctx);
+    });
+
+    it("a sub-agent records its process in its record, and does not start the reaper", async () => {
+      enableHerdr();
+      const file = taskListFile(join(root, "tau"), "lead-p");
+      const lead = new TaskListStore(file);
+      await lead.ensure(() => seedTaskList("lead-p", NOW));
+      await lead.mutate((list) => {
+        delegateTask(list, { actor: { name: "lead" }, now: NOW }, { id: "T0", agent: "tau-t0" });
+        setAgentPane(list, "tau-t0", "w1:p1");
+      });
+      lead.close();
+      const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+      const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+      const { ctx } = fakeCtx(true, "sub-p");
+      const handle = createTau(pi.api, { ...deps, env, processProbe: fakeProbe("sub-1") });
+      await emit(pi, "session_start", ctx);
+      assert.equal(handle.identity?.role, "subagent");
+      assert.equal(handle.reaper, undefined);
+      const list = await read(file);
+      assert.equal(list.agents[0]?.process?.token, "sub-1");
+      assert.equal(list.leadProcess, undefined);
+      await emit(pi, "session_shutdown", ctx);
+      assert.equal((await read(file)).agents[0]?.process?.detachedAt, NOW);
+    });
+  });
+
   it("shows only the tree of its task in the widget of a sub-agent, and all tasks in /tau", async () => {
     enableHerdr();
     const file = taskListFile(join(root, "tau"), "lead-scope");
@@ -589,7 +664,7 @@ describe("tau extension", () => {
     assert.deepEqual(notices, []);
   });
 
-  it("does not change an existing task list on a later session start", async () => {
+  it("does not change an existing task list on a later session start, except the lead process", async () => {
     enableHerdr();
     const pi = fakePi({ code: 0, stdout: PANE_REPLY });
     const { ctx } = fakeCtx(true, "abc-123");
@@ -603,7 +678,12 @@ describe("tau extension", () => {
     createTau(again.api, later);
     await emit(again, "session_start", ctx);
 
-    assert.deepEqual(await new TaskListStore(file).read(), before);
+    const { leadProcess: oldLead, ...beforeRest } = before!;
+    const { leadProcess: newLead, ...afterRest } = (await new TaskListStore(file).read())!;
+    assert.deepEqual(afterRest, beforeRest);
+    // A new runtime records its process again, with a new token.
+    assert.notEqual(newLead?.token, oldLead?.token);
+    assert.equal(newLead?.attachedAt, "2027-01-01T00:00:00.000Z");
   });
 
   it("does not make a task list when herdr is not available", async () => {

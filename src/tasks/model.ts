@@ -156,7 +156,41 @@ export interface AgentRecord {
    * at its next turn.
    */
   error?: string;
+  /**
+   * The pi process of the sub-agent. The sub-agent writes it when it starts.
+   * Records from before this field do not have it.
+   */
+  process?: ProcessRecord;
 }
+
+/**
+ * The pi process of an agent: a different tau process uses it to know if
+ * the agent still runs (see `process-info.ts` and `reaper.ts`).
+ */
+export interface ProcessRecord {
+  /**
+   * The process ID. An integer, 2 or more: `kill` with 0, 1, or a negative
+   * number is not for one process.
+   */
+  readonly pid: number;
+  /**
+   * The start time of the process, as an opaque text (see `process-info.ts`).
+   * Not set when tau could not read it: then a probe can find `dead` only by
+   * `detachedAt`, or when the PID does not exist.
+   */
+  readonly start?: string;
+  /** The machine of the process: the host name, and on Linux the PID namespace. */
+  readonly machine: string;
+  /** A random text for each tau runtime. A /reload makes a new one. */
+  readonly token: string;
+  /** When the process attached (wrote this record). */
+  readonly attachedAt: string;
+  /** When the tau runtime stopped (`session_shutdown`). Not set while it runs. */
+  detachedAt?: string;
+}
+
+/** The maximum number of characters of `start`, `machine`, and `token` in a `ProcessRecord`. */
+export const MAX_PROCESS_TEXT_CHARS = 200;
 
 /** The maximum number of characters of `AgentRecord.error`. */
 export const MAX_AGENT_ERROR_CHARS = 200;
@@ -242,6 +276,11 @@ export interface TaskList {
    * task history: a rollback keeps them.
    */
   agents: AgentRecord[];
+  /**
+   * The process of the lead. The lead writes it when it starts. Lists from
+   * before this field do not have it.
+   */
+  leadProcess?: ProcessRecord;
 }
 
 // ---------------------------------------------------------------------------

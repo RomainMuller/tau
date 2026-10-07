@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 
 import { TauError, type TauErrorCode } from "./errors.ts";
-import { activeTask, getTask, rollback, seedTaskList, type TaskList } from "./model.ts";
+import { activeTask, getTask, rollback, seedTaskList, type ProcessRecord, type TaskList } from "./model.ts";
 import { formatTask } from "../format.ts";
 import {
   acknowledgeTask,
@@ -14,6 +14,8 @@ import {
   createTask,
   failTask,
   delegateTask,
+  detachProcess,
+  endAgentTree,
   failTasksOfAgent,
   isAgentUnder,
   liveDescendantAgents,
@@ -23,6 +25,8 @@ import {
   MAX_TEXT_LENGTH,
   readyTasks,
   releaseTaskOfAgent,
+  setAgentProcess,
+  setLeadProcess,
   updateTask,
   type Actor,
   type RuleContext,
@@ -640,5 +644,65 @@ describe("agent tree", () => {
       ["tau-b"],
     );
     assert.equal(isAgentUnder(list, list.agents[0]!, "lead"), false);
+  });
+});
+
+describe("endAgentTree", () => {
+  it("fails the tasks deepest first, tries the blocked tasks again, and ends the records", () => {
+    // lead -> tau-a (T1) -> tau-b (T1.1, a sub-task that tau-b owns under T1)
+    createTask(list, ctx(), { title: "A", type: "code" });
+    delegateTask(list, ctx(), { id: "T1", agent: "tau-a" });
+    const a: Actor = { name: "tau-a", scope: "T1" };
+    createTask(list, ctx(a), { title: "B", type: "code", parent: "T1" });
+    delegateTask(list, ctx(a), { id: "T1.1", agent: "tau-b" });
+    const b: Actor = { name: "tau-b", scope: "T1.1" };
+    createTask(list, ctx(b), { title: "C", type: "code", parent: "T1.1" });
+    claimTask(list, ctx(b), "T1.1.1");
+    // The wrong order (parent first): T1 is blocked, then tried again.
+    const agents = [list.agents.find((item) => item.name === "tau-a")!, list.agents.find((item) => item.name === "tau-b")!];
+    const result = endAgentTree(list, ctx({ name: "tau" }), agents, "owner agent exited");
+    assert.deepEqual(result.failed.map((task) => task.id).sort(), ["T1", "T1.1", "T1.1.1"]);
+    assert.deepEqual(result.blocked, []);
+    assert.deepEqual(list.agents.map((agent) => agent.state), ["ended", "ended"]);
+    for (const id of ["T1", "T1.1", "T1.1.1"]) {
+      const task = getTask(list, id);
+      assert.equal(task.result, "owner agent exited");
+      assert.equal(task.retryable, true);
+      assert.equal(task.history.at(-1)?.actor, "tau");
+    }
+  });
+
+  it("keeps a task with an open sub-task of the lead in progress", () => {
+    delegateTask(list, ctx(), { id: "T0", agent: "tau-a" });
+    const a: Actor = { name: "tau-a", scope: "T0" };
+    createTask(list, ctx(a), { title: "B", type: "code", parent: "T0" });
+    claimTask(list, ctx(), "T0.1");
+    const result = endAgentTree(list, ctx({ name: "tau" }), [list.agents[0]!], "owner agent exited");
+    assert.deepEqual(result.blocked.map((task) => task.id), ["T0"]);
+    assert.equal(getTask(list, "T0.1").status, "in_progress");
+    assert.equal(list.agents[0]?.state, "ended");
+  });
+});
+
+describe("process records", () => {
+  const record = { pid: 42, machine: "m", token: "t1", attachedAt: "a" };
+
+  it("sets the lead and agent records", () => {
+    setLeadProcess(list, record);
+    assert.deepEqual(list.leadProcess, record);
+    delegateTask(list, ctx(), { id: "T0", agent: "tau-a" });
+    setAgentProcess(list, "tau-a", record);
+    assert.deepEqual(list.agents[0]?.process, record);
+    assert.notEqual(list.agents[0]?.process, record);
+  });
+
+  it("detaches only with the same token, and one time", () => {
+    const item: ProcessRecord = { ...record };
+    assert.equal(detachProcess(undefined, "t1", "now"), false);
+    assert.equal(detachProcess(item, "t2", "now"), false);
+    assert.equal(item.detachedAt, undefined);
+    assert.equal(detachProcess(item, "t1", "now"), true);
+    assert.equal(detachProcess(item, "t1", "later"), false);
+    assert.equal(item.detachedAt, "now");
   });
 });

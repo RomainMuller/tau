@@ -58,10 +58,11 @@ export function forkRevision(branch: readonly { readonly type: string; readonly 
  */
 export function forkTaskList(old: TaskList, revision: number | undefined, sessionId: string, now: string): TaskList {
   if (revision === undefined) return seedTaskList(sessionId, now, LEAD_AGENT);
-  // The transcript of the old session is not the transcript of the fork:
-  // the lead records its own (see `openTaskList`).
-  const { sessionFile: _oldFile, ...rest } = rollback(old, revision);
-  const list: TaskList = { ...rest, sessionId };
+  // The transcript and the lead process of the old session are not those
+  // of the fork: the lead records its own (see `openTaskList`). The agent
+  // records end below: their processes are not for the fork.
+  const { sessionFile: _oldFile, leadProcess: _oldLead, ...rest } = rollback(old, revision);
+  const list: TaskList = { ...rest, sessionId, agents: rest.agents.map(({ process: _process, ...agent }) => agent) };
   const ctx = { actor: { name: SYSTEM_ACTOR }, now };
   const subAgents = new Set(list.agents.map((agent) => agent.name).filter((name) => name !== LEAD_AGENT));
   // Fail the tasks of the sub-agents. A task closes only after its sub-tasks

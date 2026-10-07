@@ -15,14 +15,24 @@ import { detectHerdr, type Exec, type HerdrStatus } from "./herdr.ts";
 import { checkSubAgent, ENV_LEAD_PANE, ENV_TASKLIST, resolveIdentity, type Identity } from "./identity.ts";
 import { isPaneId } from "./layout.ts";
 import { Supervisor } from "./supervisor.ts";
+import { systemProbe, type ProcessProbe } from "./process-info.ts";
+import { OrphanReaper, sameProcess } from "./reaper.ts";
 import { TauError } from "./tasks/errors.ts";
-import { LEAD_AGENT, seedTaskList, type TaskList } from "./tasks/model.ts";
+import { LEAD_AGENT, seedTaskList, type ProcessRecord, type TaskList } from "./tasks/model.ts";
 import { tauDir } from "./tasks/paths.ts";
 import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
-import { setAgentError, setAgentPane, setAgentSession, type Actor } from "./tasks/rules.ts";
+import {
+  detachProcess,
+  setAgentError,
+  setAgentPane,
+  setAgentProcess,
+  setAgentSession,
+  setLeadProcess,
+  type Actor,
+} from "./tasks/rules.ts";
 import { errorKind } from "./tasks/model.ts";
 export { errorKind } from "./tasks/model.ts";
-import { MAX_FILE_BYTES, TaskListStore } from "./tasks/store.ts";
+import { MAX_FILE_BYTES, noWrite, TaskListStore } from "./tasks/store.ts";
 import { conflictingTools, registerTaskTools, TASK_TOOL_NAMES, type TaskSession } from "./tools.ts";
 import { cleanLine } from "./text.ts";
 import { titleSlug } from "./names.ts";
@@ -53,6 +63,18 @@ export interface TauDependencies {
    * use stickies.
    */
   readonly stickyServer?: (env: NodeJS.ProcessEnv) => StickyServer | undefined;
+  /**
+   * The process record of this runtime, and the probe of the records of
+   * other agents (see `process-info.ts`). The default is `systemProbe()`,
+   * with a new token for each runtime.
+   */
+  readonly processProbe?: ProcessProbe;
+  /**
+   * The time between two sweeps of the orphan reaper, in milliseconds (see
+   * `reaper.ts`). The first sweep comes after one to two times this time.
+   * The default is `REAP_MS`, and 15 to 30 seconds before the first sweep.
+   */
+  readonly reapMs?: number;
 }
 
 const DEFAULT_DEPENDENCIES: TauDependencies = {
@@ -106,6 +128,8 @@ export interface TauHandle {
   readonly collection: Promise<unknown> | undefined;
   /** The Sticky support, when it runs (see `sticky/index.ts`). */
   readonly sticky: StickyReporter | undefined;
+  /** The orphan reaper (see `reaper.ts`). Only a lead starts it. */
+  readonly reaper: OrphanReaper | undefined;
 }
 
 export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
@@ -116,6 +140,11 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   let supervisor: Supervisor | undefined;
   let messageInbox: Inbox | undefined;
   let collection: Promise<unknown> | undefined;
+  let reaper: OrphanReaper | undefined;
+  /** The process record of this runtime, and the probe (see `process-info.ts`). */
+  const probe = deps.processProbe ?? systemProbe({ now: deps.now });
+  /** The process record that this runtime wrote in the task list. */
+  let selfRecord: ProcessRecord | undefined;
   /** True after tau blocked all tools (see `failClosed`). */
   let blockedAll = false;
   const env = deps.env ?? process.env;
@@ -197,7 +226,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     const paneGone = async (pane: string | undefined) =>
       pane !== undefined &&
       !(await new HerdrClient(exec, status.binary).listPanes().then((panes) => panes.has(pane), () => true));
-    const opened = await openTaskList(ctx, deps, status.pane.paneId, event, paneGone);
+    const opened = await openTaskList(ctx, deps, status.pane.paneId, event, paneGone, probe);
     const store = opened?.store;
     if (shutDown) {
       store?.close();
@@ -220,6 +249,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       return;
     }
     identity = opened!.identity;
+    selfRecord = opened!.process;
     if (problems.length > 0) {
       report(ctx, `tau configuration ${configFile}:\n${problems.map((line) => `- ${line}`).join("\n")}`, "warning");
     }
@@ -250,6 +280,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       createdPanes,
       startingAgents,
       leadPane,
+      processProbe: probe,
       ...(deps.superviseMs === undefined ? {} : { intervalMs: deps.superviseMs }),
     });
     supervisor = watcher;
@@ -325,6 +356,20 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     if (identity.role === "lead") {
       registerRevisionRecord(pi, store);
       collection = collectGarbage(ctx, deps, env);
+      reaper = new OrphanReaper({
+        tauDirectory: tauDir(deps.agentDir()),
+        ownSession: ctx.sessionManager.getSessionId(),
+        probe,
+        herdr,
+        now: deps.now,
+        ...(deps.reapMs === undefined ? {} : { intervalMs: deps.reapMs, firstDelayMs: deps.reapMs }),
+        onReap: (result) => {
+          if (!ctx.hasUI) return;
+          const agents = result.ended === 1 ? "1 sub-agent" : `${result.ended} sub-agents`;
+          const panes = result.closed === 1 ? "1 pane" : `${result.closed} panes`;
+          ctx.ui.notify(`tau: the lead of session ${result.session} stopped. tau ended ${agents} and closed ${panes}.`, "info");
+        },
+      });
     }
     registerCommands(pi, store, tree, badgeLabel(status, identity), {
       toggleKey: config.toggleCompletedKey,
@@ -371,6 +416,7 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     }
     tree.start();
     watcher.start();
+    reaper?.start();
     inbox.start();
     void watcher.check();
     const paneId = status.pane.paneId;
@@ -391,12 +437,33 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     await sticky?.close();
     widget?.stop();
     supervisor?.stop();
+    reaper?.stop();
     messageInbox?.stop();
     // A poll, a check, or a refresh can run now: wait for them before the
     // store closes. The inbox and the supervisor can start a refresh of the
     // tree when they end: so wait for the tree last.
-    await Promise.all([messageInbox?.drain(), supervisor?.drain()]);
+    await Promise.all([messageInbox?.drain(), supervisor?.drain(), reaper?.drain()]);
     await widget?.drain();
+    if (session !== undefined && identity !== undefined && selfRecord !== undefined) {
+      // Record that this runtime stopped: other tau processes then know
+      // that its sub-agents have no watcher (see `reaper.ts`). Only the
+      // record of this runtime (its token): after a /reload, the new
+      // runtime can have written its record already. When this fails, the
+      // PID check finds the dead process later.
+      const self = identity;
+      const token = selfRecord.token;
+      await session.store
+        .update(
+          (list) => {
+            if (list === undefined) return noWrite(undefined);
+            const record =
+              self.role === "lead" ? list.leadProcess : list.agents.find((agent) => agent.name === self.actor.name)?.process;
+            return detachProcess(record, token, deps.now()) ? { list, result: undefined } : noWrite(undefined);
+          },
+          { create: false },
+        )
+        .catch(() => undefined);
+    }
     session?.store.close();
     if (herdrClient !== undefined && paneOfThisAgent !== undefined && identity !== undefined) {
       // The pane can stay open after pi stops: remove the tau metadata. Wait
@@ -432,6 +499,9 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     },
     get sticky() {
       return sticky;
+    },
+    get reaper() {
+      return reaper;
     },
   };
 }
@@ -725,27 +795,32 @@ async function openTaskList(
   paneId: string,
   event: { readonly reason?: string; readonly previousSessionFile?: string | undefined } = {},
   paneGone: (pane: string | undefined) => Promise<boolean> = async () => false,
-): Promise<{ store: TaskListStore; identity: Identity } | undefined> {
+  probe: ProcessProbe = systemProbe({ now: deps.now }),
+): Promise<{ store: TaskListStore; identity: Identity; process: ProcessRecord } | undefined> {
   let store: TaskListStore | undefined;
   try {
     const sessionId = ctx.sessionManager.getSessionId();
     const identity = resolveIdentity(deps.env ?? process.env, tauDir(deps.agentDir()), sessionId);
     store = new TaskListStore(identity.file);
+    // The process record of this runtime (see `process-info.ts`).
+    const self = await probe.self();
     if (identity.role === "lead") {
       // The transcript of this session (see `tasks/gc.ts`).
       const sessionFile = ctx.sessionManager.getSessionFile() ?? null;
-      let seed = (): TaskList => ({ ...seedTaskList(sessionId, deps.now(), LEAD_AGENT), sessionFile });
+      let seed = (): TaskList => ({ ...seedTaskList(sessionId, deps.now(), LEAD_AGENT), sessionFile, leadProcess: self });
       // A fork: a copy of the task list of the old session, at the fork point.
       const source = forkSource(ctx, event);
       if (source !== undefined && (await store.read()) === undefined) {
         const forked = await forkedList(ctx, deps, sessionId, source);
-        if (forked !== undefined) seed = () => ({ ...forked, sessionFile });
+        if (forked !== undefined) seed = () => ({ ...forked, sessionFile, leadProcess: self });
       }
       const list = await store.ensure(seed);
-      // A list from before this field, or a session file that moved.
-      if (list.sessionFile !== sessionFile) {
+      // A list from before these fields, a session file that moved, or a
+      // new start of the lead: record this process.
+      if (list.sessionFile !== sessionFile || !sameProcess(list.leadProcess, self)) {
         await store.mutate((current) => {
           current.sessionFile = sessionFile;
+          setLeadProcess(current, self);
         });
       }
     } else {
@@ -767,13 +842,14 @@ async function openTaskList(
         const before = current.agents.find((agent) => agent.name === identity.actor.name)?.session;
         setAgentPane(current, identity.actor.name, paneId);
         setAgentSession(current, identity.actor.name, session);
+        setAgentProcess(current, identity.actor.name, self);
         // A new pi session of this agent (a restart): an error of an old run
         // is not true now. A /reload keeps the session: the error stays until
         // the next turn.
         if (before !== undefined && before !== session) setAgentError(current, identity.actor.name, undefined);
       });
     }
-    return { store, identity };
+    return { store, identity, process: self };
   } catch (error) {
     store?.close();
     report(ctx, error instanceof TauError ? error.message : `tau cannot open the task list: ${String(error)}`);

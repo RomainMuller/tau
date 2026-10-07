@@ -30,6 +30,7 @@ import {
   MAX_AGENT_ERROR_CHARS,
   MAX_AGENTS,
   type AgentRecord,
+  type ProcessRecord,
   type Task,
   type TaskChanges,
   type TaskList,
@@ -281,6 +282,30 @@ export function setAgentSession(list: TaskList, name: string, session: string): 
   const agent = getAgent(list, name);
   agent.session = session;
   return agent;
+}
+
+/** Records the process of the lead (see `ProcessRecord`). The lead does this when it starts. */
+export function setLeadProcess(list: TaskList, record: ProcessRecord): void {
+  list.leadProcess = { ...record };
+}
+
+/** Records the process of a sub-agent (see `ProcessRecord`). The sub-agent does this when it starts. */
+export function setAgentProcess(list: TaskList, name: string, record: ProcessRecord): AgentRecord {
+  const agent = getAgent(list, name);
+  agent.process = { ...record };
+  return agent;
+}
+
+/**
+ * Records that a tau runtime stopped: sets `detachedAt` on `record`, only
+ * when the record has the token of this runtime, and is not detached. So an
+ * old runtime (for example during a /reload) does not detach the record of
+ * the new runtime of the same process. Returns true when it changed.
+ */
+export function detachProcess(record: ProcessRecord | undefined, token: string, now: string): boolean {
+  if (record === undefined || record.token !== token || record.detachedAt !== undefined) return false;
+  record.detachedAt = now;
+  return true;
 }
 
 /**
@@ -642,28 +667,47 @@ export function abortTask(list: TaskList, ctx: RuleContext, id: string, reason: 
   }
   const result = abortResult(ctx.actor.name, text);
   const stopped = [...liveDescendantAgents(list, owner.name), owner];
+  const { failed, blocked } = endAgentTree(list, ctx, stopped, result);
+  return { owner, stopped, failed, blocked };
+}
+
+/**
+ * Stops a group of agents: fails each `in_progress` task that they own
+ * (retryable, with the result `result`), then ends their records. `agents`
+ * must be deepest first (a parent task can close only after its sub-tasks).
+ * A task that has open sub-tasks of a different agent stays in progress
+ * (rule 7, see `blocked`).
+ *
+ * Call it only from a trusted controller (as `failTasksOfAgent`).
+ */
+export function endAgentTree(
+  list: TaskList,
+  ctx: RuleContext,
+  agents: readonly AgentRecord[],
+  result: string,
+): { failed: Task[]; blocked: Task[] } {
   const failed: Task[] = [];
   const blocked: Task[] = [];
-  // Deepest agents first: a parent task can close only after its sub-tasks.
-  for (const agent of stopped) {
+  for (const agent of agents) {
     const outcome = failTasksOfAgent(list, ctx, agent.name, result);
     failed.push(...outcome.failed);
     blocked.push(...outcome.blocked);
   }
   // A task can be blocked by a task that a later agent in the list failed.
   // Try the blocked tasks again.
+  const text = checkText("reason", result);
   for (let retry = blocked.length > 0; retry; ) {
     retry = false;
     for (const item of [...blocked]) {
       if (childrenOf(list, item.id).some((child) => !isClosed(child))) continue;
-      recordEvent(list, item, { kind: "failed", at: ctx.now, actor: ctx.actor.name, result, retryable: true });
+      recordEvent(list, item, { kind: "failed", at: ctx.now, actor: ctx.actor.name, result: text, retryable: true });
       failed.push(item);
       blocked.splice(blocked.indexOf(item), 1);
       retry = true;
     }
   }
-  for (const agent of stopped) endAgent(list, agent.name, ctx.now);
-  return { owner, stopped, failed, blocked };
+  for (const agent of agents) endAgent(list, agent.name, ctx.now);
+  return { failed, blocked };
 }
 
 /** True when `ancestor` started `agent`, directly or through other agents. */

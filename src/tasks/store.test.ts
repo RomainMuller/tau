@@ -5,12 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { decodeTaskList, encodeTaskList } from "./codec.ts";
+import { checkProcess, decodeTaskList, encodeTaskList } from "./codec.ts";
 import { TauError } from "./errors.ts";
 import { seedTaskList } from "./model.ts";
 import { taskListFile, tauDir } from "./paths.ts";
 import { acknowledgeTask, claimTask, createTask, delegateTask, failTask, releaseTaskOfAgent } from "./rules.ts";
-import { MAX_FILE_BYTES, TaskListStore } from "./store.ts";
+import { MAX_FILE_BYTES, noWrite, peekLiveness, TaskListStore } from "./store.ts";
 import { DatabaseSync } from "node:sqlite";
 
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -474,3 +474,147 @@ describe("codec", () => {
   }
 });
 
+
+const PROCESS = { pid: 4242, start: "ps:Tue Oct 7 09:25:38 2026", machine: "host", token: "t-1", attachedAt: NOW };
+
+describe("codec, process records", () => {
+  it("reads a list and an agent record with and without process records", () => {
+    const list = seedTaskList("s1", NOW);
+    delegateTask(list, LEAD, { id: "T0", agent: "tau-t0" });
+    assert.deepEqual(decodeTaskList(encodeTaskList(list), "f"), list);
+    list.leadProcess = { ...PROCESS, detachedAt: NOW };
+    list.agents[0]!.process = (({ start: _start, ...rest }) => rest)(PROCESS);
+    const decoded = decodeTaskList(encodeTaskList(list), "f");
+    assert.deepEqual(decoded, list);
+    assert.equal(decoded.agents[0]?.process?.start, undefined);
+  });
+
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ["pid 0", { pid: 0 }],
+    ["pid 1", { pid: 1 }],
+    ["pid -1", { pid: -1 }],
+    ["pid 1.5", { pid: 1.5 }],
+    ["a pid that is a string", { pid: "5" }],
+    ["a start that is too long", { start: "x".repeat(201) }],
+    ["an empty machine", { machine: "" }],
+    ["a token that is too long", { token: "t".repeat(201) }],
+    ["a token that is not a string", { token: 3 }],
+    ["no attachedAt", { attachedAt: undefined }],
+    ["a detachedAt that is not a string", { detachedAt: 1 }],
+  ];
+  for (const [name, change] of invalid) {
+    it(`rejects a process record with ${name}`, () => {
+      const lead = JSON.parse(encodeTaskList({ ...seedTaskList("s1", NOW), leadProcess: { ...PROCESS, ...change } as never }));
+      assert.throws(() => decodeTaskList(JSON.stringify(lead), "f"), /leadProcess/);
+      const list = seedTaskList("s1", NOW);
+      delegateTask(list, LEAD, { id: "T0", agent: "tau-t0" });
+      const agent = JSON.parse(encodeTaskList(list));
+      agent.agents[0].process = { ...PROCESS, ...change };
+      assert.throws(() => decodeTaskList(JSON.stringify(agent), "f"), /agents\[0\]\.process/);
+    });
+  }
+
+  it("checkProcess throws a TauError", () => {
+    assert.throws(() => checkProcess({ ...PROCESS, pid: 1 }, "x"), TauError);
+    assert.deepEqual(checkProcess(PROCESS, "x"), PROCESS);
+  });
+});
+
+describe("update without a write", () => {
+  it("does not change the file", async () => {
+    const store = new TaskListStore(file);
+    await store.ensure(() => seedTaskList("s1", NOW));
+    const reader = new DatabaseSync(file);
+    const version = () => Number((reader.prepare("PRAGMA data_version").get() as { data_version: number }).data_version);
+    const before = version();
+    const files = async () => Promise.all([file, `${file}-wal`].map(async (path) => (await stat(path)).mtimeMs));
+    const times = await files();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const { list, result } = await store.update((current) => noWrite(current?.revision));
+    assert.equal(result, 1);
+    assert.equal(list?.sessionId, "s1");
+    assert.equal(version(), before);
+    assert.deepEqual(await files(), times);
+    reader.close();
+    store.close();
+  });
+
+  it("does not make the file with create: false", async () => {
+    const store = new TaskListStore(file);
+    await assert.rejects(store.update(() => noWrite(undefined), { create: false }), /does not exist/);
+    await assert.rejects(stat(file), { code: "ENOENT" });
+    store.close();
+  });
+});
+
+describe("peekLiveness", () => {
+  async function make(change: (list: ReturnType<typeof seedTaskList>) => void = () => undefined): Promise<TaskListStore> {
+    const store = new TaskListStore(file);
+    await store.ensure(() => {
+      const list = seedTaskList("s1", NOW);
+      change(list);
+      return list;
+    });
+    // Keep a read connection open, as a live agent does: the WAL and SHM files stay.
+    await store.read();
+    return store;
+  }
+
+  it("reads the session, the lead process, and the number of live agents", async () => {
+    const store = await make((list) => {
+      list.leadProcess = PROCESS;
+      createTask(list, LEAD, { title: "B", type: "code" });
+      delegateTask(list, LEAD, { id: "T0", agent: "tau-t0" });
+      delegateTask(list, LEAD, { id: "T1", agent: "tau-t1" });
+      list.agents[1]!.state = "ended";
+    });
+    assert.deepEqual(await peekLiveness(file), { session: "s1", lead: PROCESS, live: 1 });
+    store.close();
+  });
+
+  it("gives no lead for a list without a valid lead process", async () => {
+    const store = await make();
+    assert.deepEqual(await peekLiveness(file), { session: "s1", lead: undefined, live: 0 });
+    const db = new DatabaseSync(file);
+    db.prepare("UPDATE tasklist SET json = json_set(json, '$.leadProcess', json(?))").run(JSON.stringify({ ...PROCESS, pid: 1 }));
+    db.close();
+    assert.deepEqual(await peekLiveness(file), { session: "s1", lead: undefined, live: 0 });
+    store.close();
+  });
+
+  it("gives undefined without a tasklist table, for a list that is too large, and for a symbolic link", async () => {
+    await mkdir(join(dir, "tasklists"), { recursive: true });
+    const empty = new DatabaseSync(file);
+    empty.exec("CREATE TABLE other (x)");
+    empty.close();
+    assert.equal(await peekLiveness(file), undefined);
+    await rm(file);
+
+    const store = await make();
+    const db = new DatabaseSync(file);
+    db.prepare("UPDATE tasklist SET json = ?").run(JSON.stringify({ sessionId: "s1", pad: "x".repeat(MAX_FILE_BYTES) }));
+    db.close();
+    assert.equal(await peekLiveness(file), undefined);
+    store.close();
+
+    const link = join(dir, "tasklists", "link.db");
+    await symlink(file, link);
+    assert.equal(await peekLiveness(link), undefined);
+  });
+
+  it("does not change the database and WAL files", async () => {
+    const store = await make((list) => {
+      list.leadProcess = PROCESS;
+    });
+    const files = async () =>
+      Promise.all([file, `${file}-wal`].map(async (path) => {
+        const info = await stat(path);
+        return [info.size, info.mtimeMs];
+      }));
+    const before = await files();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await peekLiveness(file);
+    assert.deepEqual(await files(), before);
+    store.close();
+  });
+});

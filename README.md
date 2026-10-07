@@ -489,7 +489,89 @@ resume the lead session, its liveness check compares its sub-agents with
 `herdr agent list`. Each `in_progress` task of a sub-agent that does not
 exist becomes `failed`, with the result `owner agent exited` and
 `retryable: true`. A task of the lead stays `in_progress`: the lead works on
-it again.
+it again. When a different lead runs, it can end the sub-agents first (see
+[When a parent stops](#when-a-parent-stops)).
+
+#### When a parent stops
+
+Only the parent watches its sub-agents. So `tau` also uses a second check,
+for the sub-agents of a lead that stopped:
+
+- Each `tau` process records its process in the task list: its PID, its
+  start time, its machine, and a random token. The lead records it in the
+  list, and a sub-agent in its agent record. At shutdown, the process
+  records that it stopped (only when the record has its token, so a
+  `/reload` does not change the record of the new runtime).
+- Each lead also checks the task lists of other sessions, about every
+  minute (60 seconds, ± 25 %). The first check is 15 to 30 seconds after the
+  lead starts. The checks of a different lead must find that the lead of a
+  list stopped, for at least 2 minutes. The 2 minutes start at the first
+  check that finds the stop, so the time after the stop is longer: 2
+  minutes, plus up to one or two check intervals. Then, when the list has
+  sub-agents that did not end, the checks end the sub-agents of that list,
+  at all depths, deepest first. Usually one check ends all of them. When
+  many panes wait for a close, the checks end them in batches (see below).
+  Their `in_progress` tasks become `failed`, with
+  the result `owner agent exited` and `retryable: true`, and their records
+  end. The history shows the actor `tau`. A task of the lead stays
+  `in_progress`. A task of a sub-agent with a sub-task that is not closed
+  (for example, a sub-task that the lead owns) also stays `in_progress`
+  (rule 7). When you resume the lead and the sub-tasks close, the liveness
+  check of the lead fails it. Then `tau` closes the pane of each sub-agent
+  that it ended, only when herdr shows the sub-agent in the pane (the name
+  **and** the pi session). It does not close an empty pane. It tells you in
+  a message, for example
+  `tau: the lead of session <id> stopped. tau ended 3 sub-agents and closed 2 panes.`
+- A check ends only the sub-agents whose pane close it can remember (at
+  most 100 panes wait for a close). A sub-agent with no pane needs no
+  close, so it can end also when 100 panes wait (but not before its own
+  sub-agents end). The other sub-agents
+  stay, and a later check ends them, when the panes before them closed.
+- **A change of behavior:** when you close a lead (also the original session
+  after a `/fork`), a different lead that runs ends its sub-agents when its
+  checks found that the lead stopped, for at least 2 minutes (see above).
+  Before this version, they continued their work. When you resume the lead,
+  the failed tasks stay `failed`. You can retry them with `tau_delegate` or
+  `tau_claim`.
+- A sub-agent whose process stopped, but that herdr still shows (for
+  example, a different pi with the same session is in the pane), ends when
+  the checks of its parent found that the process stopped, for at least 2
+  minutes: its parent does the same as for a sub-agent that herdr does not
+  show. The parent checks that the PID exists at each liveness check, and
+  it reads the start time at most one time in 30 seconds. So it also finds
+  a new process with the same PID.
+- When `tau` cannot know, the process is alive. Examples: the list has no
+  record (a list from an older version of `tau`: `tau` does not change it),
+  the record is from a different machine or container, or the start time
+  cannot be read and the PID exists.
+
+`tau` reads the start time from `/proc` on Linux, and with `ps` on macOS and
+other systems. The start time makes sure that a new process with the same
+PID is not the old process. A zombie process (a process that stopped, but
+that its parent did not collect) is a stopped process.
+
+The machine of a process record is the host name. On Linux, `tau` also adds
+the machine ID (`/etc/machine-id` or `/var/lib/dbus/machine-id`, when it can
+read it) and the PID namespace.
+
+Limits:
+
+- A pane stays open when herdr does not show the sub-agent in it, when the
+  herdr of the checking lead is a different herdr server, or when the
+  checking lead stops before the close.
+- Only a running lead does this check. When no lead runs, the sub-agents
+  stay until a lead starts (a lead of any project of your user).
+- A task list that no process has open (it has no `-wal` and `-shm` files) is
+  not checked: no sub-agent of it runs.
+- This check is not a security boundary. A program of your user can write a
+  false task list, with the name and the pi session of a live sub-agent of
+  a different list. Then `tau` can end the record in the false list, and
+  close the pane of that live sub-agent.
+- `tau` does not support a `tasklists` directory that two computers share
+  (for example, on a network drive), when it cannot read a machine ID (for
+  example, on macOS). Two computers with the same host name then have the
+  same machine text, and a lead can think that a live lead of the other
+  computer stopped.
 
 ### Work gate
 
@@ -1286,7 +1368,9 @@ compaction, or a session resume.
     └── <lead-session-id>.db
 ```
 
-The database has the task list and the messages between its agents. See
+The database has the task list (also the process records of its agents, see
+[When a parent stops](#when-a-parent-stops)) and the messages between its
+agents. See
 [Messages and notes](#messages-and-notes) for when an agent gets its
 messages. The database keeps up to 2000 older messages that were read, and
 the messages that were read in the last minute: `tau` removes the oldest
@@ -1318,6 +1402,10 @@ transaction.
   automatically when its process stops. While a different process has the
   lock, `tau` waits for at most 5 seconds, and it does not block pi while it
   waits.
+- A lead also opens the task lists of other sessions: it reads their lead
+  process (with a read-only connection), and writes only to end the
+  sub-agents of a lead that stopped (see
+  [When a parent stops](#when-a-parent-stops)).
 
 After you change or upgrade the files of `tau`, restart the lead (and its
 sub-agents) before you continue the work. A sub-agent loads the `tau` files
@@ -1336,9 +1424,10 @@ with no file (`--no-session`) records that it has no file. `tau` removes a
 task list only when all these conditions are true:
 
 1. It is not the task list of the current session.
-2. Its files (the database, and the `-wal` and `-shm` files) did not change
-   for 1 day. pi makes the session file only after the first answer of the
-   model, so a new session has no file yet.
+2. Its database and its `-wal` file did not change for 1 day. pi makes the
+   session file only after the first answer of the model, so a new session
+   has no file yet. (`tau` does not use the `-shm` file: a reader can change
+   it.)
 3. `tau` can read the task list, and the list is for the session of its
    file name.
 4. The session has no file, or `tau` finds no file of the session: the
@@ -1417,13 +1506,20 @@ a sub-agent task, the sub-agent task (and a `waiting` sub-task between them)
 stays open: close or cancel them, then `tau` fails the sub-agent task
 (rule 11). Messages between agents are not copied.
 
-The sub-agents of the original session continue their work after the fork.
-Nobody watches them while the original session is not open: the panes of
-these sub-agents stay open when they finish. When you open the original
-session again, its liveness check ends these sub-agents. It closes the pane
-of each one when this is safe (see [Liveness](#liveness)): herdr must show
-the sub-agent in the pane. If herdr does not show it, the pane stays open,
-and you close it yourself.
+The copy does not have the process records of the original session: the lead
+of the fork records its own process.
+
+When the original session is not open, nobody watches its sub-agents. A
+different lead that runs (for example, the lead of the fork) ends them when
+its checks found that the original lead stopped, for at least 2 minutes
+(plus up to one or two check intervals of about 1 minute): their tasks
+fail (`owner agent exited`, retryable), except a task with a sub-task that
+is not closed (rule 7), and `tau` closes their panes when
+herdr shows them (see [When a parent stops](#when-a-parent-stops)). When you open the original
+session again before that, its liveness check watches them again. It closes
+the pane of each one that ended when this is safe (see
+[Liveness](#liveness)): herdr must show the sub-agent in the pane. If herdr
+does not show it, the pane stays open, and you close it yourself.
 
 How `tau` finds the fork point: before each message enters the session of
 the lead (your prompts, the answers of the model, and the tool results),

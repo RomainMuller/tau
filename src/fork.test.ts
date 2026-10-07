@@ -72,6 +72,20 @@ describe("forkTaskList", () => {
     assert.equal("sessionFile" in forkTaskList(list, revision, "new", NOW), false);
   });
 
+  it("does not copy the process records of the old session", () => {
+    const { list, revision } = oldList();
+    const record = { pid: 42, machine: "m", token: "t", attachedAt: NOW };
+    list.leadProcess = record;
+    for (const agent of list.agents) agent.process = record;
+    assert.ok(list.agents.length > 0);
+    const forked = forkTaskList(list, revision, "new", NOW);
+    assert.equal("leadProcess" in forked, false);
+    for (const agent of forked.agents) assert.equal("process" in agent, false);
+    // The old list does not change.
+    assert.deepEqual(list.leadProcess, record);
+    assert.deepEqual(list.agents[0]?.process, record);
+  });
+
   it("rolls back to the fork point, and fails the tasks of the sub-agents of the old session", () => {
     const { list, revision } = oldList();
     const forked = forkTaskList(list, revision, "new", NOW);
