@@ -37,8 +37,8 @@ export interface InboxOptions {
   readonly now: () => string;
   /** True while pi does not run the agent (and does not compact the session). */
   readonly isIdle: () => boolean;
-  /** Gives messages to the model of an idle agent: pi starts a turn. Throws when this fails. */
-  readonly deliver: (text: string) => void;
+  /** Gives messages to the model of an idle agent: pi starts a turn. Throws when this fails. The poll waits for the promise. */
+  readonly deliver: (text: string) => void | Promise<void>;
   /** Called after messages were taken (the `✉` counts changed). */
   readonly onChange?: () => void;
   readonly intervalMs?: number;
@@ -144,7 +144,7 @@ export class Inbox {
       return;
     }
     try {
-      deliver(messagesText(messages));
+      await deliver(messagesText(messages));
       this.#lastTurn = clock();
     } catch (error) {
       await store.untakeMessages(messages.map((message) => message.id));

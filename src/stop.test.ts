@@ -368,6 +368,23 @@ describe("promptSection", () => {
     }
   });
 
+  it("reminds an agent with no open work to populate the task list first", () => {
+    // Without the flag (the default), there is no reminder.
+    assert.doesNotMatch(promptSection(LEAD, ASK_TOOL), /no open task|no active task/);
+    assert.doesNotMatch(promptSection(SUB, ASK_TOOL), /no task to work on/);
+    // The lead must populate the task list before it works on a new request.
+    const lead = promptSection(LEAD, ASK_TOOL, false);
+    assert.match(lead, /^You are the lead agent[\s\S]*The task list has no open task\. You must not do any work for a new request before you populate the task list: create tasks \(tau_create\), then claim one \(tau_claim\) and delegate the rest \(tau_delegate\)\. tau blocks all tools other than the tau tools and the ask tool while you have no active task\./);
+    // A sub-agent with no work asks its parent for a new task. The text
+    // must not say that its tasks are closed: a task that another agent
+    // reowned is still in progress.
+    const sub = promptSection(SUB, ASK_TOOL, false);
+    assert.match(sub, /You have no task to work on\. You must not do any work without an active task\. Tell your parent what you need \(tau_send\), or end your turn\./);
+    // The reminder does not remove the other rules.
+    assert.match(lead, /lead agent\. You cannot stop/);
+    assert.match(sub, /call an available "ask question" tool/);
+  });
+
   it("continuation does not tell to use tau_ask_user when the tool is not active", async () => {
     const text = continuationText(list, openWork(list, LEAD)!, LEAD, undefined);
     assert.match(text, /call an ask question tool\. Do not end your turn to ask\./);

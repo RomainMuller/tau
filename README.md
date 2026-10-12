@@ -625,6 +625,15 @@ error and registers no tools and no gate.
 `tau` cannot check that the work is for the active task. The message and the
 system prompt tell the agent to do only that work.
 
+When the task list has no open task for the agent, `tau` also reminds it to
+populate the list before it works on a new request. The reminder is in the
+`<tau>` section of the system prompt at each prompt, and it rides on the
+result of a `tau_*` tool call and on a delivered message: pi rebuilds the
+system prompt only for an idle prompt, so a turn that a message or a queued
+prompt starts would otherwise miss it. The lead is told to create tasks
+(`tau_create`) and claim or delegate them; a sub-agent with no work is told
+to ask its parent (`tau_send`) or end its turn.
+
 A lead that delegates all tasks owns no task while it waits. This is correct:
 it calls only `tau_*` tools.
 

@@ -41,10 +41,32 @@ export const ASK_TOOL = "tau_ask_user";
 export const PROMPT_SECTION = "tau";
 
 /**
+ * The reminder for an agent whose task list has no open work. tau puts it
+ * in the system prompt section (see `promptSection`), and appends it to
+ * tau tool results and delivered messages while the task list has no open
+ * work: pi rebuilds the system prompt only for an idle prompt (the
+ * `before_agent_start` event), so a turn that a message or a queued prompt
+ * starts uses the old section.
+ */
+export function promptReminder(actor: Actor): string {
+  const noWork =
+    actor.scope === undefined
+      ? "The task list has no open task. You must not do any work for a new request before you populate the task list: create tasks (tau_create), then claim one (tau_claim) and delegate the rest (tau_delegate)."
+      : "You have no task to work on. You must not do any work without an active task. Tell your parent what you need (tau_send), or end your turn.";
+  return `${noWork} tau blocks all tools other than the tau tools and the ask tool while you have no active task.`;
+}
+
+/**
  * The system prompt section that tells the rule. pi shows sections also
  * with a custom system prompt, but not the tool guidelines.
+ *
+ * When `hasOpenWork` is false (the task list has no open task for the
+ * agent), the section also tells the "populate first" reminder (see
+ * `promptReminder`): an agent that completed its tasks must not act on a
+ * new prompt before the task list covers it. The gate blocks the tools,
+ * but this tells the rule before the first blocked tool call.
  */
-export function promptSection(actor: Actor, askTool: string | undefined): string {
+export function promptSection(actor: Actor, askTool: string | undefined, hasOpenWork = true): string {
   const rule =
     actor.scope === undefined
       ? "You are the lead agent. You cannot stop while a task in the tau task list is waiting or in progress."
@@ -55,6 +77,7 @@ export function promptSection(actor: Actor, askTool: string | undefined): string
       : `A failed sub-task (retryable) of ${actor.scope} also needs a decision before you stop: retry it with tau_delegate (or tau_claim) with the same task ID, or acknowledge it with tau_ack. Do not create a new task for a retry. If ${actor.scope} itself fails, your parent decides.`;
   return [
     rule,
+    ...(hasOpenWork ? [] : [promptReminder(actor)]),
     "If you stop too early, tau tells you to continue.",
     failed,
     ...(askTool === undefined || askTool === ASK_TOOL

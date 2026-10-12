@@ -1008,6 +1008,20 @@ describe("tau extension", () => {
       await t.done();
     });
 
+    it("adds the no-open-work reminder to a message that starts a turn of an idle agent", async () => {
+      const t = await setup("deliver-4");
+      t.setIdle(true);
+      // The task list is complete: the turn that the message starts gets
+      // the reminder (pi does not emit before_agent_start for it).
+      await t.store.mutate((list) => completeTask(list, { actor: { name: "tau-t0" }, now: "2026-01-01T00:00:01.000Z" }, "T0", "done"));
+      await t.send("info", "hello");
+      await t.handle.inbox!.poll();
+      assert.equal(t.pi.sent.length, 1);
+      const [message] = t.pi.sent[0] as unknown as [{ content: string }];
+      assert.match(message.content, /\| hello\n\ntau: The task list has no open task\./);
+      await t.done();
+    });
+
     it("does not start turns after a run that did not reach the settle boundary (Esc), until user input", async () => {
       const t = await setup("deliver-3");
       // pi skips agent_before_settle after an abort, then emits agent_settled.
@@ -1571,6 +1585,155 @@ describe("tau extension", () => {
     assert.match(withAsk, /Do not end your turn to ask a question\./);
     assert.match(withAsk, /call tau_ask_user alone/);
     assert.doesNotMatch(await start(["read", "tau_list"]), /tau_ask_user/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("reminds the agent to populate the task list when it has no open work", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "prompt-2");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const start = async () => {
+      const event = { type: "before_agent_start", prompt: "x", systemPromptOptions: { selectedTools: ["read", "tau_list"], sections: {} as Record<string, string> } };
+      await pi.handlers.get("before_agent_start")![0]!(event, ctx);
+      return event.systemPromptOptions.sections.tau ?? "";
+    };
+    // T0 is in progress: open work, so no reminder.
+    assert.doesNotMatch(await start(), /The task list has no open task\./);
+    // After the last task closes, the next prompt gets the reminder.
+    await pi.tools.get("tau_complete")!.execute("0", { result: "done" });
+    const section = await start();
+    assert.match(section, /The task list has no open task\. You must not do any work for a new request before you populate the task list/);
+    // A new task makes the reminder go away again.
+    await pi.tools.get("tau_create")!.execute("0", { title: "Next", type: "code" });
+    assert.doesNotMatch(await start(), /The task list has no open task\./);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("keeps the section without the reminder when the task list cannot be read", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "broken-prompt");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    await rm(join(root, "tau", "tasklists", "broken-prompt.db"));
+    await writeFile(join(root, "tau", "tasklists", "broken-prompt.db"), "not a database");
+    const event = { type: "before_agent_start", prompt: "x", systemPromptOptions: { selectedTools: ["read", "tau_list"], sections: {} as Record<string, string> } };
+    await pi.handlers.get("before_agent_start")![0]!(event, ctx);
+    // The read fails: tau keeps the section, and the gate reports the
+    // problem at the first tool call (it must not tell to create tasks).
+    assert.match(event.systemPromptOptions.sections.tau ?? "", /^You are the lead agent\./);
+    assert.doesNotMatch(event.systemPromptOptions.sections.tau ?? "", /no open task|populate the task list/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("reminds a sub-agent with no open work to ask its parent", async () => {
+    enableHerdr();
+    const file = join(root, "tau", "tasklists", "sub-prompt.db");
+    const lead = new TaskListStore(file);
+    await lead.ensure(() => seedTaskList("sub-prompt", "2026-01-01T00:00:00.000Z"));
+    await lead.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" }, { id: "T0", agent: "tau-t0" });
+      setAgentPane(list, "tau-t0", "w1:p1");
+    });
+    lead.close();
+    const env = { TAU_TASKLIST: file, TAU_TASK_ID: "T0", TAU_AGENT_NAME: "tau-t0", TAU_PARENT_AGENT: "lead", TAU_CONFIG: LEAD_CONFIG };
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "sub-prompt");
+    createTau(pi.api, { ...deps, env });
+    await emit(pi, "session_start", ctx);
+    const start = async () => {
+      const event = { type: "before_agent_start", prompt: "x", systemPromptOptions: { selectedTools: ["read", "tau_list"], sections: {} as Record<string, string> } };
+      await pi.handlers.get("before_agent_start")![0]!(event, ctx);
+      return event.systemPromptOptions.sections.tau ?? "";
+    };
+    // The task is in progress: no reminder.
+    assert.doesNotMatch(await start(), /no task to work on/);
+    await pi.tools.get("tau_complete")!.execute("0", { result: "done" });
+    const section = await start();
+    assert.match(section, /You have no task to work on\. You must not do any work without an active task\. Tell your parent what you need \(tau_send\), or end your turn\./);
+    // The sub-agent must not see the text of the lead.
+    assert.doesNotMatch(section, /populate the task list/);
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("appends the reminder to tau tool results while there is no open work", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "prompt-3");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const toolResult = async (toolName: string) => {
+      const result = (await pi.handlers.get("tool_result")![0]!({ type: "tool_result", toolName, content: [{ type: "text", text: "ok" }] }, ctx)) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      return result === undefined ? "" : result.content.map((part) => part.text ?? "").join("\n");
+    };
+    // T0 is in progress: no reminder on a tau tool result.
+    assert.doesNotMatch(await toolResult("tau_list"), /no open task/);
+    // A sub-agent owns a second task and sends a message.
+    await pi.tools.get("tau_create")!.execute("0", { title: "Other", type: "code" });
+    const other = new TaskListStore(join(root, "tau", "tasklists", "prompt-3.db"));
+    await other.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:01.000Z" }, { id: "T1", agent: "tau-t1" });
+    });
+    await other.sendMessage(
+      { sender: "tau-t1", recipient: "lead", priority: "info", text: "hello", sentAt: "2026-01-01T00:00:02.000Z" },
+      () => ({ senderTask: "T1" }),
+    );
+    await other.mutate((list) => completeTask(list, { actor: { name: "tau-t1" }, now: "2026-01-01T00:00:03.000Z" }, "T1", "done"));
+    // The lead closes its last task: the result of the next tau tool call
+    // has the message first, then the reminder.
+    await pi.tools.get("tau_complete")!.execute("0", { result: "done" });
+    const result = (await pi.handlers.get("tool_result")![0]!({ type: "tool_result", toolName: "tau_list", content: [{ type: "text", text: "ok" }] }, ctx)) as {
+      content: Array<{ text: string }>;
+    };
+    assert.match(result.content[1]!.text, /^\n\nNew messages:\n\n✉ info from @tau-t1/);
+    assert.match(result.content[2]!.text, /^\n\ntau: The task list has no open task\./);
+    // A read error gives no reminder, and does not fail the delivery.
+    await rm(join(root, "tau", "tasklists", "prompt-3.db"));
+    await writeFile(join(root, "tau", "tasklists", "prompt-3.db"), "not a database");
+    assert.doesNotMatch(await toolResult("tau_list"), /no open task/);
+    // The gate blocks other tools, so their results get no reminder (and
+    // there can be no results: the block stops the call).
+    assert.doesNotMatch(await toolResult("read"), /no open task/);
+    other.close();
+    await emit(pi, "session_shutdown", ctx);
+  });
+
+  it("adds the reminder to a continuation message while there is no open work", async () => {
+    enableHerdr();
+    const pi = fakePi({ code: 0, stdout: PANE_REPLY });
+    const { ctx } = fakeCtx(true, "prompt-4");
+    createTau(pi.api, deps);
+    await emit(pi, "session_start", ctx);
+    const settle = chain(pi, "agent_before_settle");
+    const run = async () => {
+      const result = (await settle({ type: "agent_before_settle", outcome: "completed", entries: [], continue: false }, ctx)) as {
+        entries: Array<{ content: string }>;
+      };
+      return result === undefined ? "" : (result.entries.at(-1)?.content ?? "");
+    };
+    // A message without open work: delivered, but no reminder (T0 is open).
+    await pi.tools.get("tau_create")!.execute("0", { title: "Other", type: "code" });
+    const other = new TaskListStore(join(root, "tau", "tasklists", "prompt-4.db"));
+    await other.mutate((list) => {
+      delegateTask(list, { actor: { name: "lead" }, now: "2026-01-01T00:00:01.000Z" }, { id: "T1", agent: "tau-t1" });
+    });
+    const send = (text: string) =>
+      other.sendMessage(
+        { sender: "tau-t1", recipient: "lead", priority: "info", text, sentAt: "2026-01-01T00:00:02.000Z" },
+        () => ({ senderTask: "T1" }),
+      );
+    await send("hello");
+    assert.match(await run(), /\| hello$/);
+    // The list is complete: the continuation message carries the reminder.
+    await other.mutate((list) => completeTask(list, { actor: { name: "tau-t1" }, now: "2026-01-01T00:00:03.000Z" }, "T1", "done"));
+    await pi.tools.get("tau_complete")!.execute("0", { result: "done" });
+    await send("again");
+    assert.match(await run(), /\| again\n\ntau: The task list has no open task\./);
+    other.close();
     await emit(pi, "session_shutdown", ctx);
   });
 

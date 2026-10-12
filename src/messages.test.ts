@@ -351,7 +351,7 @@ describe("Inbox", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const box = new Inbox({ store: racing, agent: "tau-t0", now: () => NOW, isIdle: () => idle, deliver: (text) => delivered.push(text) });
+    const box = new Inbox({ store: racing, agent: "tau-t0", now: () => NOW, isIdle: () => idle, deliver: (text): void => void delivered.push(text) });
     await box.poll();
     assert.deepEqual(delivered, []);
     assert.equal((await store.unreadCounts()).get("tau-t0"), 1);

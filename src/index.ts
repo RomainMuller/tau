@@ -20,7 +20,7 @@ import { OrphanReaper, sameProcess } from "./reaper.ts";
 import { TauError } from "./tasks/errors.ts";
 import { LEAD_AGENT, seedTaskList, type ProcessRecord, type TaskList } from "./tasks/model.ts";
 import { tauDir } from "./tasks/paths.ts";
-import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, promptSection, StopGuard } from "./stop.ts";
+import { ASK_TOOL, CONTINUE_MESSAGE_TYPE, PROMPT_SECTION, openWork, promptReminder, promptSection, StopGuard } from "./stop.ts";
 import {
   detachProcess,
   setAgentError,
@@ -250,6 +250,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     }
     identity = opened!.identity;
     selfRecord = opened!.process;
+    /** The actor of this session, for closures that run later (narrowing of `identity` does not reach them). */
+    const sessionActor = identity.actor;
     if (problems.length > 0) {
       report(ctx, `tau configuration ${configFile}:\n${problems.map((line) => `- ${line}`).join("\n")}`, "warning");
     }
@@ -289,7 +291,13 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
       agent: identity.actor.name,
       now: deps.now,
       isIdle: () => ctx.isIdle(),
-      deliver: (text) => pi.sendMessage({ customType: MESSAGE_TYPE, content: text, display: true }, { triggerTurn: true }),
+      deliver: async (text) => {
+        // The idle delivery starts a turn with `triggerTurn`: pi does not
+        // emit `before_agent_start` for it, so the reminder goes with the
+        // message (see `openWorkReminder`).
+        const suffix = await openWorkReminder(sessionActor, () => store.read());
+        await pi.sendMessage({ customType: MESSAGE_TYPE, content: text + suffix, display: true }, { triggerTurn: true });
+      },
       onChange: () => void tree.refresh(),
       ...(deps.inboxMs === undefined ? {} : { intervalMs: deps.inboxMs }),
     });
@@ -348,8 +356,8 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
     // the delivery reads it in agent_settled: register the tracker last, and
     // give the delivery a function that reads its state.
     let continuationPending: () => boolean = () => false;
-    registerMessageDelivery(pi, inbox, guard, () => continuationPending(), identity.role === "subagent");
-    registerStopRule(pi, guard, identity.actor, config.askTool);
+    registerMessageDelivery(pi, inbox, guard, () => continuationPending(), identity.role === "subagent", identity.actor, () => store.read());
+    registerStopRule(pi, guard, identity.actor, config.askTool, () => store.read());
     continuationPending = registerContinuationTracker(pi);
     // After the tracker: the report needs the final decision of the boundary.
     if (identity.role === "subagent") registerErrorReport(pi, session, identity.parent);
@@ -541,6 +549,24 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
 }
 
 /**
+ * The reminder for an agent whose task list has no open work (see
+ * `promptReminder` in `stop.ts`). pi rebuilds the system prompt only for
+ * an idle prompt (the `before_agent_start` event): a turn that a message
+ * or a queued prompt starts uses the old section. So tau adds the
+ * reminder to tau tool results and delivered messages while the task
+ * list has no open work. When tau cannot read the list, there is no
+ * reminder: the gate reports the problem at the next tool call.
+ */
+async function openWorkReminder(actor: Actor, read: () => Promise<TaskList | undefined>): Promise<string> {
+  try {
+    const list = await read();
+    return list !== undefined && openWork(list, actor) === undefined ? `\n\ntau: ${promptReminder(actor)}` : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
  * The delivery of messages while the agent works (see `inbox.ts`):
  *
  * - Each tool result gets the `steer` messages; a `tau_*` tool result gets
@@ -562,9 +588,12 @@ function registerMessageDelivery(
   continuationPending: () => boolean,
   /** True for a sub-agent: after an error, a message starts a new turn (see `registerErrorReport`). */
   resumeAfterError: boolean,
+  actor: Actor,
+  read: () => Promise<TaskList | undefined>,
 ): void {
   /** Continuations for messages since the last user input. See `MAX_MESSAGE_CONTINUATIONS`. */
   let continuations = 0;
+  const reminder = () => openWorkReminder(actor, read);
   pi.on("input", (event) => {
     if (event.source !== "extension") {
       inbox.resume();
@@ -577,8 +606,14 @@ function registerMessageDelivery(
     // before the answer of the user. The messages wait.
     if (event.toolName === ASK_TOOL && !event.isError) return undefined;
     const messages = await inbox.take(TASK_TOOL_NAMES.has(event.toolName) ? undefined : "steer").catch(() => []);
-    if (messages.length === 0) return undefined;
-    return { content: [...event.content, { type: "text", text: `\n\nNew messages:\n\n${messagesText(messages)}` }] };
+    // The gate blocks all other tools while there is no open work, so the
+    // reminder only rides on tau tool results.
+    const suffix = TASK_TOOL_NAMES.has(event.toolName) ? await reminder() : "";
+    if (messages.length === 0 && suffix === "") return undefined;
+    const extra: Array<{ type: "text"; text: string }> = [];
+    if (messages.length > 0) extra.push({ type: "text", text: `\n\nNew messages:\n\n${messagesText(messages)}` });
+    if (suffix !== "") extra.push({ type: "text", text: suffix });
+    return { content: [...event.content, ...extra] };
   });
   // True after a settle boundary with the outcome `completed`, until the next
   // turn ends. pi skips the boundary after an abort: then this stays false.
@@ -604,7 +639,10 @@ function registerMessageDelivery(
     if (messages.length === 0) return undefined;
     continuations += 1;
     return {
-      entries: [...event.entries, { type: "custom_message", customType: MESSAGE_TYPE, content: messagesText(messages), display: true }],
+      entries: [
+        ...event.entries,
+        { type: "custom_message", customType: MESSAGE_TYPE, content: messagesText(messages) + (await reminder()), display: true },
+      ],
       continue: true,
     };
   });
@@ -730,11 +768,27 @@ export const MAX_MESSAGE_CONTINUATIONS = 5;
  * tau adds a continuation message when the agent has open work, and asks pi
  * for one more model request.
  */
-function registerStopRule(pi: ExtensionAPI, guard: StopGuard, actor: Actor, configuredAskTool: string | undefined): void {
+function registerStopRule(
+  pi: ExtensionAPI,
+  guard: StopGuard,
+  actor: Actor,
+  configuredAskTool: string | undefined,
+  /** Reads the task list, to check for open work at each prompt. */
+  read: () => Promise<TaskList | undefined>,
+): void {
   let warned = false;
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const askTool = activeAskTool(configuredAskTool, event.systemPromptOptions.selectedTools);
-    event.systemPromptOptions.sections[PROMPT_SECTION] = promptSection(actor, askTool);
+    // The reminder for a finished list (see `promptSection`): each prompt
+    // checks the list again, so the reminder re-arms after the work is done.
+    let hasOpenWork = true;
+    try {
+      const list = await read();
+      hasOpenWork = list === undefined || openWork(list, actor) !== undefined;
+    } catch {
+      // The gate reports the problem at the first tool call.
+    }
+    event.systemPromptOptions.sections[PROMPT_SECTION] = promptSection(actor, askTool, hasOpenWork);
     if (configuredAskTool !== undefined && askTool === undefined && !warned) {
       // Tell it one time for each load of tau (a /reload tells it again).
       warned = true;
