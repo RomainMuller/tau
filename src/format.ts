@@ -219,7 +219,7 @@ export function formatChange(list: TaskList, task: Task, verb: string, agent: st
             ? "ready to claim"
             : open.length > 0
               ? `waits for ${open.join(", ")}`
-              : "you can claim it after your active task closes"
+              : "you can claim it after your active task closes. Do not do its work in your active task"
         }`
       : task.status;
   return `${verb} ${task.id} (${state}): ${cleanLine(task.title)}`;

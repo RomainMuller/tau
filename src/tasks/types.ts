@@ -3,7 +3,8 @@ export interface TaskTypeDefinition {
   readonly description: string;
   /**
    * When true, the work gate blocks the `edit` and `write` tools while a task
-   * of this type is the active task.
+   * of this type is the active task, except for files in the temporary
+   * directory (`/tmp` and `os.tmpdir()`, see `tempDirectories` in `gate.ts`).
    */
   readonly readOnly: boolean;
   /**
@@ -20,7 +21,7 @@ export const DEFAULT_TASK_TYPE_DEFINITIONS: Readonly<Record<string, TaskTypeDefi
     readOnly: true,
     writableExtensions: [".md"],
   },
-  research: { description: "Read code, docs, or the web. No file changes.", readOnly: true },
+  research: { description: "Read code, docs, or the web. No project file changes.", readOnly: true },
   code: { description: "Change code or files.", readOnly: false },
   test: { description: "Write or run tests.", readOnly: false },
   review: { description: "Read-only check of work done by other tasks.", readOnly: true },

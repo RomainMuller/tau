@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { chmod, link, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { homedir, tmpdir } from "node:os";
-import { join, win32 } from "node:path";
+import { join, relative, win32 } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { checkGate, resolveLikePi } from "./gate.ts";
+import { checkGate, isSafeTempDirectory, resolveLikePi, tempDirectories } from "./gate.ts";
 import { descriptionIsWork, formatSection, formatTask } from "./format.ts";
 import { findTask, seedTaskList, type TaskList } from "./tasks/model.ts";
 import { abortTask, claimTask, completeTask, createTask, delegateTask, failTask, updateTask } from "./tasks/rules.ts";
@@ -274,11 +275,24 @@ describe("task tools", () => {
 });
 
 describe("task tools, more cases", () => {
+  it("tells in T0 to make a complete task list, and to use T0 only for the plan", async () => {
+    const text = await call("tau_get", { id: "T0", section: "description" });
+    assert.match(text, /Make a complete task list for all the work that the prompt needs:\n.*research, changes \(code, docs\), validation \(tests\), and review/);
+    assert.match(text, /This task is only for the plan\. Read only enough of the code and docs to find the tasks\n.*Do the research, the changes, and the tests in the tasks that\n.*you create, not here\./);
+    assert.match(text, /close this task \(tau_complete\),\n.*then claim or delegate the other tasks\./);
+  });
+
   it("offers only sub-tasks of the active task as ready to claim", async () => {
     await call("tau_claim", { id: "T0" });
     assert.match(
       await call("tau_create", { title: "Other root", type: "code" }),
-      /Created T1 \(waiting, you can claim it after your active task closes\)/,
+      /Created T1 \(waiting, you can claim it after your active task closes\. Do not do its work in your active task\)/,
+    );
+    // The claim error tells the correct action: close T0, then claim T1.
+    // It must not suggest to cancel T1, or to do the work of T1 in T0.
+    await assert.rejects(
+      call("tau_claim", { id: "T1" }),
+      /You work on task T0\. You can claim only a sub-task of T0\. To claim T1: finish the work of T0, close it \(tau_complete or tau_fail\), then claim T1 again\. Do not cancel T1 for this reason, and do not do the work of T1 in T0: each task is only for its own work\./,
     );
     await call("tau_create", { title: "Sub", type: "code", parent: "T0" });
     const text = await call("tau_list");
@@ -367,7 +381,16 @@ describe("task tools, more cases", () => {
   });
 
   it("shows the writable extensions of a read-only type", () => {
-    assert.match(tools.get("tau_create")!.parameters.properties["type"]!.description ?? "", /plan: .*\(read-only, except \.md files\)/);
+    assert.match(tools.get("tau_create")!.parameters.properties["type"]!.description ?? "", /plan: .*\(read-only, except \.md files and temporary files\)/);
+    assert.match(tools.get("tau_create")!.parameters.properties["type"]!.description ?? "", /research: .*\(read-only, except temporary files\)/);
+    assert.match(tools.get("tau_create")!.parameters.properties["type"]!.description ?? "", /\nRead-only types can change files in the system temporary directory \(os\.tmpdir\(\); also \/tmp, but not on Windows\) to check ideas\.$/);
+  });
+
+  it("tells the agent that each task is only for its own work", () => {
+    const guidelines = (tools.get("tau_list") as { promptGuidelines?: string[] }).promptGuidelines?.join("\n") ?? "";
+    assert.match(guidelines, /first make a complete task list: research, changes, validation \(tests\), and review/);
+    assert.match(guidelines, /Each task is only for its own work\. Never do the work of a different task in your active task\. Never cancel a task because you cannot claim it now/);
+    assert.match(tools.get("tau_cancel")!.description, /Do not cancel a task because you cannot claim it now, or to do its work in a different task\./);
   });
 
   it("lists the configured task types in the type enums", () => {
@@ -503,7 +526,7 @@ describe("work gate", () => {
       await rm(dir, { recursive: true, force: true });
     });
     const gate = async (toolName: string, toolInput: unknown) =>
-      checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types, toolInput, cwd: dir });
+      checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types, toolInput, cwd: dir, tempDirectories: [] });
 
     it("keeps T0 as a plan task", async () => {
       assert.equal(findTask(await list(), "T0")?.type, "plan");
@@ -520,7 +543,7 @@ describe("work gate", () => {
 
     it("blocks other files, and a missing or wrong path", async () => {
       for (const toolName of ["write", "edit"]) {
-        assert.match((await gate(toolName, { path: "src/a.ts" })) ?? "", /which is read-only\.\nThis type permits changes only to files with the extensions: \.md\./);
+        assert.match((await gate(toolName, { path: "src/a.ts" })) ?? "", /which is read-only\.\nOutside the temporary directory, this type permits changes only to files with the extensions: \.md\./);
         assert.match((await gate(toolName, {})) ?? "", /read-only/);
         assert.match((await gate(toolName, { path: 5 })) ?? "", /read-only/);
         assert.match((await gate(toolName, undefined)) ?? "", /read-only/);
@@ -686,6 +709,221 @@ describe("work gate", () => {
     assert.match((await gate("write")) ?? "", /read-only/);
     assert.equal(await gate("bash"), undefined);
     assert.equal(await gate("read"), undefined);
+    assert.match((await gate("edit")) ?? "", /Read-only tasks can (change files in the temporary directory \(.+\) to check ideas|usually change files in the temporary directory, but no temporary directory is safe now)\./);
+  });
+
+  describe("read-only task in the temporary directory", () => {
+    let temp: string;
+    let outside: string;
+    beforeEach(async () => {
+      // "temp" acts as the temporary directory. "outside" is out of it.
+      temp = await realpath(await mkdtemp(join(tmpdir(), "tau-temp-")));
+      outside = await realpath(await mkdtemp(join(tmpdir(), "tau-outside-")));
+      await call("tau_create", { title: "Research", type: "research" });
+      await call("tau_claim", { id: "T1" });
+    });
+    afterEach(async () => {
+      await rm(temp, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    });
+    const gate = async (toolName: string, toolInput: unknown, cwd = outside) =>
+      checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types, toolInput, cwd, tempDirectories: [temp] });
+
+    it("allows edit and write of files in the temporary directory, also in new directories", async () => {
+      await writeFile(join(temp, "a.ts"), "x");
+      for (const toolName of ["write", "edit"]) {
+        assert.equal(await gate(toolName, { path: join(temp, "a.ts") }), undefined);
+        assert.equal(await gate(toolName, { path: join(temp, "new", "deep", "b.json") }), undefined);
+        assert.equal(await gate(toolName, { path: "c.txt" }, temp), undefined);
+      }
+    });
+
+    it("blocks files out of the temporary directory, and the directory itself", async () => {
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: join(outside, "a.ts") })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: "a.ts" })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: join(temp, "..", "x.ts") })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: temp })) ?? "", /read-only/);
+        assert.match((await gate(toolName, {})) ?? "", /read-only/);
+      }
+    });
+
+    it("blocks a symbolic link in the temporary directory that points out of it, or dangles", async () => {
+      await writeFile(join(outside, "a.ts"), "x");
+      await symlink(join(outside, "a.ts"), join(temp, "link.ts"));
+      await symlink(outside, join(temp, "dir"));
+      await symlink(join(temp, "missing.ts"), join(temp, "dangling.ts"));
+      for (const toolName of ["write", "edit"]) {
+        assert.match((await gate(toolName, { path: join(temp, "link.ts") })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: join(temp, "dir", "a.ts") })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: join(temp, "dir", "new", "b.ts") })) ?? "", /read-only/);
+        assert.match((await gate(toolName, { path: join(temp, "dangling.ts") })) ?? "", /read-only/);
+      }
+    });
+
+    it("allows a symbolic link that points into the temporary directory", async () => {
+      await writeFile(join(temp, "a.ts"), "x");
+      await symlink(join(temp, "a.ts"), join(outside, "link.ts"));
+      assert.equal(await gate("write", { path: join(outside, "link.ts") }), undefined);
+    });
+
+    it("blocks a file with more than one hard link", async () => {
+      await writeFile(join(outside, "a.ts"), "x");
+      await link(join(outside, "a.ts"), join(temp, "hard.ts"));
+      assert.match((await gate("write", { path: join(temp, "hard.ts") })) ?? "", /read-only/);
+    });
+
+    it("allows names that start with two dots, but not a parent directory", async () => {
+      assert.equal(await gate("write", { path: join(temp, "..notes") }), undefined);
+      assert.equal(await gate("write", { path: join(temp, "..scratch", "a.ts") }), undefined);
+      assert.match((await gate("write", { path: join(temp, "..") })) ?? "", /read-only/);
+    });
+
+    it("blocks a new file under a dangling symbolic link to a directory", async () => {
+      await symlink(join(outside, "missing-dir"), join(temp, "dangling-dir"));
+      assert.match((await gate("write", { path: join(temp, "dangling-dir", "a.ts") })) ?? "", /read-only/);
+      assert.match((await gate("write", { path: join(temp, "dangling-dir", "deep", "a.ts") })) ?? "", /read-only/);
+    });
+
+    it("accepts a path with a different case on a file system that ignores case", async (t) => {
+      await writeFile(join(temp, "case.ts"), "x");
+      const upper = join(temp, "CASE.TS");
+      let ignoresCase = false;
+      try {
+        await realpath(upper);
+        ignoresCase = true;
+      } catch {
+        // The file system uses case.
+      }
+      if (!ignoresCase) {
+        t.skip("the file system uses case");
+        return;
+      }
+      assert.equal(await gate("write", { path: upper }), undefined);
+      const upperDir = join(temp.toUpperCase(), "new.ts");
+      assert.equal(await gate("write", { path: upperDir }), undefined);
+    });
+
+    it("blocks with no temporary directory", async () => {
+      const reason = checkGate({
+        toolName: "write", tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types,
+        toolInput: { path: join(temp, "a.ts") }, cwd: outside, tempDirectories: [],
+      });
+      assert.match(reason ?? "", /read-only/);
+    });
+  });
+
+  it("uses the real temporary directories for a type that the configuration does not define", async (t) => {
+    await call("tau_create", { title: "Research", type: "research" });
+    await call("tau_claim", { id: "T1" });
+    const roots = tempDirectories({ cwd: process.cwd() });
+    if (roots.length === 0) {
+      t.skip("no safe temporary directory in this environment");
+      return;
+    }
+    const only = { code: { description: "Change code.", readOnly: false } };
+    const gate = async (path: string) =>
+      checkGate({ toolName: "write", tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: only, toolInput: { path }, cwd: process.cwd() });
+    for (const root of roots) assert.equal(await gate(join(root, `tau-unknown-${process.pid}`, "a.ts")), undefined, root);
+    assert.match((await gate(join(process.cwd(), "not-here.ts"))) ?? "", /type "research", which is read-only/);
+  });
+
+  it("finds only the real paths of /tmp and os.tmpdir()", () => {
+    const candidates = new Set([realpathSync.native(tmpdir()), ...(process.platform === "win32" ? [] : [realpathSync.native("/tmp")])]);
+    for (const dir of tempDirectories()) assert.ok(candidates.has(dir), dir);
+  });
+
+  it("uses the usual Windows temporary directory in the home directory, but not other directories of the home directory", () => {
+    // The Windows path functions work on all platforms. These directories do
+    // not exist here, so tau uses the resolved paths.
+    const options = { cwd: "D:\\work\\repo", home: "C:\\Users\\me" };
+    assert.equal(isSafeTempDirectory("C:\\Users\\me\\AppData\\Local\\Temp", options, "win32"), true);
+    assert.equal(isSafeTempDirectory("C:\\Users\\ME\\appdata\\local\\temp", options, "win32"), true);
+    assert.equal(isSafeTempDirectory("C:\\Temp", options, "win32"), true);
+    assert.equal(isSafeTempDirectory("C:\\Users\\me\\Documents", options, "win32"), false);
+    assert.equal(isSafeTempDirectory("C:\\Users\\me\\AppData\\Local\\Temp\\x", options, "win32"), false);
+    assert.equal(isSafeTempDirectory("C:\\Users\\me", options, "win32"), false);
+    assert.equal(isSafeTempDirectory("D:\\work\\repo\\tmp", options, "win32"), false);
+    assert.equal(isSafeTempDirectory("D:\\work", options, "win32"), false);
+    assert.equal(isSafeTempDirectory("C:\\", options, "win32"), false);
+  });
+
+  describe("checks of the system temporary directory (it comes from the environment)", { skip: process.platform === "win32" }, () => {
+    let base: string;
+    let home: string;
+    beforeEach(async () => {
+      base = realpathSync.native(await mkdtemp(join(tmpdir(), "tau-roots-")));
+      home = join(base, "home");
+      await mkdir(home);
+    });
+    afterEach(async () => {
+      await rm(base, { recursive: true, force: true });
+    });
+    const roots = (dir: string, extra: { cwd?: string; uid?: number } = {}) =>
+      tempDirectories({ platform: "linux", tmpdir: dir, cwd: extra.cwd ?? home, home, ...(extra.uid === undefined ? {} : { uid: extra.uid }) });
+
+    it("does not use a relative path, also to a safe directory", async () => {
+      const dir = join(base, "private");
+      await mkdir(dir, { mode: 0o700 });
+      assert.ok(roots(dir).includes(dir));
+      assert.ok(!roots(relative(process.cwd(), dir)).includes(dir));
+    });
+
+    it("does not let a cwd or a home directory of / block the temporary directories", async () => {
+      const dir = join(base, "private");
+      await mkdir(dir, { mode: 0o700 });
+      assert.ok(tempDirectories({ platform: "linux", tmpdir: dir, cwd: "/", home }).includes(dir));
+      assert.ok(tempDirectories({ platform: "linux", tmpdir: dir, cwd: home, home: "/" }).includes(dir));
+      // "/" itself stays out.
+      assert.deepEqual(tempDirectories({ platform: "linux", tmpdir: "/", cwd: "/", home: "/" }).filter((root) => root === "/"), []);
+    });
+
+    it("uses a private directory of the user", async () => {
+      const dir = join(base, "private");
+      await mkdir(dir, { mode: 0o700 });
+      assert.ok(roots(dir).includes(dir));
+      // A different user owns it: not safe.
+      assert.ok(!roots(dir, { uid: (process.getuid?.() ?? 0) + 1 }).includes(dir));
+    });
+
+    it("uses a shared directory with the sticky bit", async () => {
+      const dir = join(base, "shared");
+      await mkdir(dir);
+      await chmod(dir, 0o1777);
+      assert.ok(roots(dir).includes(dir));
+    });
+
+    it("does not use a directory that other users can open, or that does not exist", async () => {
+      const dir = join(base, "open");
+      await mkdir(dir);
+      await chmod(dir, 0o755);
+      assert.ok(!roots(dir).includes(dir));
+      const shared = join(base, "no-sticky");
+      await mkdir(shared);
+      await chmod(shared, 0o777);
+      assert.ok(!roots(shared).includes(shared));
+      assert.ok(!roots(join(base, "missing")).includes(join(base, "missing")));
+    });
+
+    it("does not use the file system root, the cwd, the home directory, or a directory that contains them", async () => {
+      assert.ok(!roots("/").includes("/"));
+      const work = join(base, "work");
+      await mkdir(join(work, "repo"), { recursive: true, mode: 0o700 });
+      await chmod(work, 0o700);
+      assert.ok(!roots(work, { cwd: join(work, "repo") }).includes(work));
+      assert.ok(!roots(join(work, "repo"), { cwd: join(work, "repo") }).includes(join(work, "repo")));
+      await chmod(base, 0o700);
+      assert.ok(!roots(base).includes(base), "base contains home");
+      assert.ok(!roots(home).includes(home), "home itself");
+      // A private directory in the home directory or in the cwd (for
+      // example ~/.ssh) is not a temporary directory.
+      const inHome = join(home, ".ssh");
+      await mkdir(inHome, { mode: 0o700 });
+      assert.ok(!roots(inHome).includes(inHome), "in home");
+      const inCwd = join(work, "repo", "private");
+      await mkdir(inCwd, { mode: 0o700 });
+      assert.ok(!roots(inCwd, { cwd: join(work, "repo") }).includes(inCwd), "in cwd");
+    });
   });
 
   it("uses the read-only flag of the sub-task that is active", async () => {

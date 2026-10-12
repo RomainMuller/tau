@@ -117,11 +117,14 @@ const OPTIONAL_ID = (description: string) => Type.Optional(ID(description));
 const StringEnum = (values: readonly string[], description: string) =>
   Type.Unsafe<string>({ type: "string", enum: [...values], description });
 
+/** The text about the temporary files that read-only tasks can change. */
+const TEMP_NOTE = "Read-only types can change files in the system temporary directory (os.tmpdir(); also /tmp, but not on Windows) to check ideas.";
+
 function typeDescription(types: Readonly<Record<string, TaskTypeDefinition>>): string {
   const lines = Object.entries(types).map(
-    ([name, type]) => `${name}: ${type.description}${type.readOnly ? ` (read-only${type.writableExtensions?.length ? `, except ${type.writableExtensions.join(" ")} files` : ""})` : ""}`,
+    ([name, type]) => `${name}: ${type.description}${type.readOnly ? ` (read-only${type.writableExtensions?.length ? `, except ${type.writableExtensions.join(" ")} files and temporary files` : ", except temporary files"})` : ""}`,
   );
-  return `The task type. One of:\n${lines.join("\n")}`;
+  return `The task type. One of:\n${lines.join("\n")}${Object.values(types).some((type) => type.readOnly) ? `\n${TEMP_NOTE}` : ""}`;
 }
 
 function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpec[] {
@@ -135,6 +138,8 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       promptGuidelines: [
         "All work must be for a tau task that you own. Before other tools, claim a task with tau_claim, or create one with tau_create and claim it.",
         "Do only the work that your active task needs. When it is done, close it with tau_complete or tau_fail and a result.",
+        "For a new request, first make a complete task list: research, changes, validation (tests), and review, with sub-tasks when the parts are clear. Do this in the plan task (T0) when it is open. Then close the plan task, and claim or delegate the other tasks.",
+        "Each task is only for its own work. Never do the work of a different task in your active task. Never cancel a task because you cannot claim it now: close your active task first, then claim it.",
         "To retry a failed task (retryable), use tau_delegate or tau_claim with the same task ID. Do not create a new task for a retry. You can first change the failed task with tau_update (for example, better instructions in its description). When you do not retry a failed task, acknowledge it with tau_ack.",
       ],
       parameters: Type.Object({
@@ -292,7 +297,7 @@ function specs(taskTypes: Readonly<Record<string, TaskTypeDefinition>>): ToolSpe
       name: "tau_cancel",
       label: "tau cancel",
       description:
-        "Cancel a waiting task that is not necessary anymore, with a reason. Its waiting sub-tasks are canceled too.",
+        "Cancel a waiting task that is not necessary anymore, with a reason. Its waiting sub-tasks are canceled too. Do not cancel a task because you cannot claim it now, or to do its work in a different task.",
       promptSnippet: "Cancel a waiting task",
       parameters: Type.Object({
         id: ID("The task ID."),

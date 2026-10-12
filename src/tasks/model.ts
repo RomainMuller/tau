@@ -541,11 +541,17 @@ export function seedTaskList(sessionId: string, now: string, owner?: string): Ta
         title: "Prepare task list",
         type: "plan",
         description: [
-          "Read the user prompt. Plan the work. At minimum, make the tasks that the work needs.",
+          "Read the user prompt. Make a complete task list for all the work that the prompt needs:",
+          "research, changes (code, docs), validation (tests), and review. Add sub-tasks when the",
+          "parts of the work are clear. Agents can add more sub-tasks later, during research or work.",
           "Give each task a short title and the correct type. Add dependencies",
           "between tasks when one task needs the result of a different task.",
           "If the work justifies it, also write the plan in a file. With the default",
           'task types, use PLAN.md: the type "plan" permits changes to Markdown files.',
+          "This task is only for the plan. Read only enough of the code and docs to find the tasks",
+          "and their dependencies. Do the research, the changes, and the tests in the tasks that",
+          "you create, not here. When the task list is complete, close this task (tau_complete),",
+          "then claim or delegate the other tasks.",
         ].join("\n"),
         dependencies: [],
   });

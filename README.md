@@ -106,10 +106,16 @@ task (a [fork](#fork) can get a copy of the list of its old session):
 T0    in_progress  Prepare task list    @lead
 ```
 
-This task tells the agent to read the user prompt, plan the work, and create the
-tasks it needs (at minimum). If the work justifies it, the agent can also write
-the plan in `PLAN.md`: this works with the default `plan` type, which is
-read-only, except for Markdown files. The lead owns `T0` from the start: it does not claim it. While
+This task tells the agent to read the user prompt and make a complete task list:
+research, changes, validation (tests), and review, with sub-tasks when the parts
+of the work are clear. `T0` is only for the plan: the agent reads only enough
+of the code and docs to find the tasks, closes `T0`, then claims or delegates
+the other tasks. tau tells agents that each task is only for its own work: an
+agent must not cancel a task because it cannot claim it now, and must not do
+the work of a task in a different task. If the work justifies it, the agent can
+also write the plan in `PLAN.md`: this works with the default `plan` type,
+which is read-only, except for Markdown files (and temporary files). The lead
+owns `T0` from the start: it does not claim it. While
 `T0` is open, the lead can claim only sub-tasks of `T0`. To work on a different
 root task, the lead closes `T0` first.
 
@@ -153,7 +159,7 @@ have `plan`.
 | Type       | Read-only | Use it for                                                  |
 |------------|-----------|-------------------------------------------------------------|
 | `plan`     | yes, except `.md` files | Make or change the task list. See [Plan tasks](#plan-tasks).|
-| `research` | yes       | Read code, docs, or the web. No file changes.               |
+| `research` | yes       | Read code, docs, or the web. No project file changes.       |
 | `code`     | no        | Change code or files.                                       |
 | `test`     | no        | Write or run tests.                                         |
 | `review`   | yes       | Read-only check of work done by other tasks.                |
@@ -162,7 +168,9 @@ have `plan`.
 For a read-only type, the [work gate](#work-gate) blocks `edit` and `write`.
 A type can set `writableExtensions` (for example `[".md"]`): the gate then
 permits `edit` and `write` on files with these extensions, in any directory.
-The `plan` type does this for `.md` files.
+The `plan` type does this for `.md` files. All read-only types can also change
+files in the temporary directory (`/tmp`, and `os.tmpdir()`, for example
+`$TMPDIR` on macOS), to check ideas.
 
 A custom `taskTypes` list replaces the default list. A custom `plan` type
 without `"readOnly": true` is writable, and the gate does not block it. To keep
@@ -603,14 +611,34 @@ with one of these extensions (not case-sensitive). If the file is a symbolic
 link, the file that it points to must have one of these extensions too. If the
 `path` argument is missing, the gate blocks the call.
 
+All read-only types can also `edit` and `write` files in a temporary directory:
+`/tmp` (not on Windows) and `os.tmpdir()`. The environment sets `os.tmpdir()`
+(`TMPDIR`, `TEMP`, or `TMP`), so the gate uses a temporary directory only when
+it is safe: an absolute path, not the file system root, apart from the working
+directory and the home directory (not the same, not in them, and not around
+them), and (not on Windows) a directory
+that all users can write to with the sticky bit (as `/tmp`), or a directory of
+the user that other users cannot open (as `$TMPDIR` on macOS). On Windows, the
+usual `%USERPROFILE%\AppData\Local\Temp` is permitted, also if it is in the
+home directory. A working directory or home directory of `/` does not block the
+temporary directories. Apart from these checks, `tau` trusts the environment:
+if you set `TMPDIR` to a private directory that is not temporary, read-only
+tasks can change files in it. The gate uses real paths: a
+symbolic link (of the file, or of a parent directory) must point into a
+temporary directory. A file with more than one hard link is blocked, because
+its other names can be out of the temporary directory. This check is a guard
+for the work of agents, not a sandbox: a different process can change a path
+after the check and before pi writes, and `bash` is not blocked.
+
 ```text
 ✖ edit
   tau blocked edit: your active task T1 has the type "research", which is read-only.
+  Read-only tasks can change files in the temporary directory (/private/tmp, /var/folders/…/T) to check ideas.
   Record what you found in the task result. Create a "code" task for changes.
 ```
 
 For a type with `writableExtensions`, the message also says:
-`This type permits changes only to files with the extensions: .md.`
+`Outside the temporary directory, this type permits changes only to files with the extensions: .md.`
 
 A task type that the configuration does not define is read-only.
 
@@ -1761,7 +1789,7 @@ uses the default configuration.
   // "readOnly": true and "writableExtensions": [".md"], as below.
   "taskTypes": {
     "plan":     { "description": "Make or change the task list. Can write Markdown files (for example PLAN.md).", "readOnly": true, "writableExtensions": [".md"] },
-    "research": { "description": "Read code, docs, or the web. No file changes.", "readOnly": true },
+    "research": { "description": "Read code, docs, or the web. No project file changes.", "readOnly": true },
     "code":     { "description": "Change code or files." },
     "test":     { "description": "Write or run tests." },
     "review":   { "description": "Read-only check of work done by other tasks.", "readOnly": true },

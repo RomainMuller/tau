@@ -36,6 +36,11 @@ export interface GateInput {
   readonly toolInput?: unknown;
   /** The working directory, to resolve a relative `path`. */
   readonly cwd?: string | undefined;
+  /**
+   * The real paths of the temporary directories, where read-only tasks can
+   * change files. The default is `tempDirectories()`. Tests set it.
+   */
+  readonly tempDirectories?: readonly string[] | undefined;
 }
 
 function hasExtension(file: string, extensions: readonly string[]): boolean {
@@ -89,6 +94,180 @@ function withRealParent(full: string): string {
   } catch {
     return full;
   }
+}
+
+/**
+ * The real path of `full`: the real path of its nearest existing ancestor,
+ * joined with the missing part. A write can create missing directories, and
+ * a missing part cannot be a symbolic link. `undefined` when tau cannot
+ * find a real ancestor.
+ */
+function realPathOfNew(full: string): string | undefined {
+  let ancestor = full;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync.native(ancestor), ...missing);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+    }
+    // A dangling symbolic link also gives ENOENT: a write would follow it.
+    try {
+      fs.lstatSync(ancestor);
+      return undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+    }
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return undefined;
+    missing.unshift(path.basename(ancestor));
+    ancestor = parent;
+  }
+}
+
+/** The options of `tempDirectories`. Tests set them. */
+export interface TempDirectoryOptions {
+  readonly platform?: NodeJS.Platform;
+  /** The system temporary directory. The default is `os.tmpdir()` (it uses `TMPDIR`, `TEMP`, or `TMP`). */
+  readonly tmpdir?: string;
+  /** The working directory. A temporary directory must not contain it. */
+  readonly cwd?: string;
+  /** The home directory. A temporary directory must not contain it. */
+  readonly home?: string;
+  /** The user ID. The default is `process.getuid()`. */
+  readonly uid?: number;
+}
+
+/** The real path of `dir`, or the resolved path when it does not exist. */
+function realOrResolved(dir: string, paths: path.PlatformPath): string {
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return paths.resolve(dir);
+  }
+}
+
+/** Windows paths ignore case. */
+function sameWindowsPath(a: string, b: string): boolean {
+  return path.win32.resolve(a).toLowerCase() === path.win32.resolve(b).toLowerCase();
+}
+
+/**
+ * True when `root` is a safe temporary directory. The environment sets
+ * `os.tmpdir()`, so tau does not trust it without checks:
+ * - It must be absolute, and must not be the file system root.
+ * - It must not be the working directory or the home directory, be in
+ *   them, or contain them. Exception: on Windows, the usual temporary
+ *   directory `<home>\\AppData\\Local\\Temp` can be in the home directory.
+ * - tau trusts the environment for the rest: a directory that passes these
+ *   checks is a temporary directory, also when it is not one (for example
+ *   `TMPDIR` set to a different private directory of the user).
+ * - Not on Windows: it must be a directory that all users can write to
+ *   with the sticky bit (as `/tmp`), or a directory of the user that other
+ *   users cannot open (as `$TMPDIR` on macOS).
+ */
+export function isSafeTempDirectory(root: string, options: TempDirectoryOptions, platform: NodeJS.Platform): boolean {
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  if (!paths.isAbsolute(root) || paths.dirname(root) === root) return false;
+  const home = options.home ?? os.homedir();
+  // The usual temporary directory of Windows is in the home directory.
+  const windowsTemp = platform === "win32" ? realOrResolved(paths.join(home, "AppData", "Local", "Temp"), paths) : undefined;
+  for (const protectedDir of [options.cwd ?? process.cwd(), home]) {
+    const real = realOrResolved(protectedDir, paths);
+    // The root must be apart from the cwd and the home directory: not the
+    // same, not around it, and not in it. A file system root (as a cwd of
+    // "/") contains all directories: it does not block a root in it.
+    if (real === root || isInside(root, real, paths)) return false;
+    const inside = paths.dirname(real) !== real && isInside(real, root, paths);
+    if (inside && !(protectedDir === home && windowsTemp !== undefined && sameWindowsPath(root, windowsTemp))) return false;
+  }
+  if (platform === "win32") return true;
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(root);
+  } catch {
+    return false;
+  }
+  if (!stat.isDirectory()) return false;
+  const shared = (stat.mode & 0o1000) !== 0 && (stat.mode & 0o002) !== 0;
+  const uid = options.uid ?? process.getuid?.();
+  const own = uid !== undefined && stat.uid === uid && (stat.mode & 0o077) === 0;
+  return shared || own;
+}
+
+/**
+ * The real paths of the temporary directories: `/tmp` (not on Windows) and
+ * `os.tmpdir()`. A directory that is not safe (see `isSafeTempDirectory`)
+ * is not in the result.
+ */
+export function tempDirectories(options: TempDirectoryOptions = {}): string[] {
+  const platform = options.platform ?? process.platform;
+  const tmpdir = options.tmpdir ?? os.tmpdir();
+  const candidates = platform === "win32" ? [tmpdir] : ["/tmp", tmpdir];
+  const result = new Set<string>();
+  const paths = platform === "win32" ? path.win32 : path.posix;
+  for (const candidate of candidates) {
+    // A relative path comes from a bad environment: do not resolve it.
+    if (!paths.isAbsolute(candidate)) continue;
+    let real: string;
+    try {
+      // The native function gives the case of the names on the disk.
+      real = fs.realpathSync.native(candidate);
+    } catch {
+      // The directory does not exist: it cannot contain the file.
+      continue;
+    }
+    if (isSafeTempDirectory(real, options, platform)) result.add(real);
+  }
+  return [...result];
+}
+
+/** True when `file` is in `root` (not `root` itself). Both are real paths. */
+function isInside(root: string, file: string, paths: path.PlatformPath = path): boolean {
+  const relative = paths.relative(root, file);
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${paths.sep}`) && !paths.isAbsolute(relative);
+}
+
+/**
+ * True when the tool call changes only a file in a temporary directory (see
+ * `tempDirectories`). Read-only tasks can write there to check ideas. The
+ * check fails closed, as `writesPermittedFile`. It is a guard for the work
+ * of agents, not a sandbox: a different process can change a path after the
+ * check and before pi writes (and `bash` is not blocked):
+ * - tau uses the real path: a symbolic link (of the file or of a parent
+ *   directory) must point into a temporary directory, and must not dangle.
+ * - A file with more than one hard link is blocked: its other names can be
+ *   out of the temporary directory.
+ */
+function writesTempFile(input: GateInput, roots: readonly string[]): boolean {
+  const target = (input.toolInput as { path?: unknown } | null | undefined)?.path;
+  if (typeof target !== "string" || target === "" || roots.length === 0) return false;
+  let full: string;
+  try {
+    full = resolveLikePi(target, input.cwd ?? process.cwd());
+  } catch {
+    return false;
+  }
+  let real: string | undefined;
+  let stat: fs.Stats | undefined;
+  try {
+    stat = fs.lstatSync(full);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  if (stat === undefined) {
+    real = realPathOfNew(full);
+  } else {
+    try {
+      // A dangling link fails here: a write would create its target.
+      real = fs.realpathSync.native(full);
+      stat = fs.statSync(real);
+    } catch {
+      return false;
+    }
+    if (!stat.isFile() || stat.nlink > 1) return false;
+  }
+  return real !== undefined && roots.some((root) => isInside(root, real));
 }
 
 /**
@@ -156,13 +335,18 @@ export function checkGate(input: GateInput): string | undefined {
   if (FILE_CHANGE_TOOLS.has(input.toolName) && activeType?.readOnly !== false) {
     const extensions = activeType?.writableExtensions;
     if (extensions !== undefined && extensions.length > 0 && writesPermittedFile(input, extensions)) return undefined;
+    const tempRoots = input.tempDirectories ?? tempDirectories(input.cwd === undefined ? {} : { cwd: input.cwd });
+    if (writesTempFile(input, tempRoots)) return undefined;
     // Name a type that permits changes, from the configured types.
     const writable = Object.entries(input.taskTypes).find(([name, type]) => !type.readOnly && name !== "plan")?.[0];
     return [
       `tau blocked ${input.toolName}: your active task ${active.id} has the type "${cleanLine(active.type)}", which is read-only.`,
       ...(extensions === undefined || extensions.length === 0
         ? []
-        : [`This type permits changes only to files with the extensions: ${extensions.join(", ")}.`]),
+        : [`Outside the temporary directory, this type permits changes only to files with the extensions: ${extensions.join(", ")}.`]),
+      tempRoots.length === 0
+        ? "Read-only tasks can usually change files in the temporary directory, but no temporary directory is safe now."
+        : `Read-only tasks can change files in the temporary directory (${tempRoots.join(", ")}) to check ideas.`,
       writable === undefined
         ? 'Record what you found in the task result. No configured task type other than "plan" permits file changes: tell the user.'
         : `Record what you found in the task result. Create a "${writable}" task for changes.`,

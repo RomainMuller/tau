@@ -374,7 +374,7 @@ describe("promptSection", () => {
     assert.doesNotMatch(promptSection(SUB, ASK_TOOL), /no task to work on/);
     // The lead must populate the task list before it works on a new request.
     const lead = promptSection(LEAD, ASK_TOOL, false);
-    assert.match(lead, /^You are the lead agent[\s\S]*The task list has no open task\. You must not do any work for a new request before you populate the task list: create tasks \(tau_create\), then claim one \(tau_claim\) and delegate the rest \(tau_delegate\)\. tau blocks all tools other than the tau tools and the ask tool while you have no active task\./);
+    assert.match(lead, /^You are the lead agent[\s\S]*The task list has no open task\. You must not do any work for a new request before you populate the task list: create a complete set of tasks \(tau_create\) for research, changes, validation \(tests\), and review, then claim one \(tau_claim\) and delegate the rest \(tau_delegate\)\. Each task is only for its own work\. tau blocks all tools other than the tau tools and the ask tool while you have no active task\./);
     // A sub-agent with no work asks its parent for a new task. The text
     // must not say that its tasks are closed: a task that another agent
     // reowned is still in progress.

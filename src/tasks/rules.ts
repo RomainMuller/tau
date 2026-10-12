@@ -185,7 +185,7 @@ export function claimTask(list: TaskList, ctx: RuleContext, id: string): Task {
   if (active !== undefined && !isDescendant(task.id, active.id)) {
     throw new TauError(
       "busy",
-      `You work on task ${active.id}. You can claim only a sub-task of ${active.id}. Close ${active.id} first to claim a different task.`,
+      `You work on task ${active.id}. You can claim only a sub-task of ${active.id}. To claim ${task.id}: finish the work of ${active.id}, close it (tau_complete or tau_fail), then claim ${task.id} again. Do not cancel ${task.id} for this reason, and do not do the work of ${task.id} in ${active.id}: each task is only for its own work.`,
     );
   }
 

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CONFIG, parseConfig } from "./config.ts";
+import { tempDirectories } from "./gate.ts";
 import tau, { createTau, errorKind, STICKY_NO_SERVER_NOTICE, type TauDependencies } from "./index.ts";
 import type { ProcessProbe } from "./process-info.ts";
 import { ServerAbsentError, type StickyServer } from "./sticky/server.ts";
@@ -741,12 +742,17 @@ describe("tau extension", () => {
     // T0 is a plan task: the gate gets the tool input and the cwd of pi.
     const cwd = await mkdtemp(join(tmpdir(), "tau-gate-cwd-"));
     try {
-      await writeFile(join(cwd, "a.ts"), "x");
-      await symlink(join(cwd, "a.ts"), join(cwd, "link.md"));
+      // The link points to a file that is not Markdown, out of the
+      // temporary directories.
+      const outside = join(process.cwd(), "package.json");
+      await symlink(outside, join(cwd, "link.md"));
       const planCtx = { ...ctx, cwd };
       const write = (path: string) => gate({ type: "tool_call", toolName: "write", toolCallId: "p", input: { path } }, planCtx);
       assert.equal(await write("PLAN.md"), undefined);
-      assert.match(((await write("a.ts")) as { reason: string }).reason, /extensions: \.md\./);
+      // The cwd is in os.tmpdir(): tau does not use a temporary directory
+      // that contains the cwd, so "a.ts" stays blocked.
+      assert.match(((await write("a.ts")) as { reason: string }).reason, /read-only/);
+      assert.match(((await write(join(process.cwd(), "not-here.ts"))) as { reason: string }).reason, /extensions: \.md\./);
       // "link.md" exists only in the cwd of pi: the gate resolves it there.
       assert.match(((await write("link.md")) as { reason: string }).reason, /read-only/);
     } finally {
@@ -764,6 +770,19 @@ describe("tau extension", () => {
 
     await pi.tools.get("tau_claim")!.execute("3", { id: "T1" });
     assert.equal(await gate({ type: "tool_call", toolName: "bash", toolCallId: "4", input: {} }, ctx), undefined);
+
+    // A research task can change files in the safe temporary directories,
+    // and not other files.
+    await pi.tools.get("tau_create")!.execute("5", { title: "Look", type: "research" });
+    await pi.tools.get("tau_complete")!.execute("6", { result: "done" });
+    await pi.tools.get("tau_claim")!.execute("7", { id: "T2" });
+    const repoCtx = { ...ctx, cwd: process.cwd() };
+    const change = (toolName: string, path: string) => gate({ type: "tool_call", toolName, toolCallId: "8", input: { path } }, repoCtx);
+    for (const root of tempDirectories({ cwd: process.cwd() })) {
+      assert.equal(await change("write", join(root, `tau-index-${process.pid}`, "a.ts")), undefined, root);
+      assert.equal(await change("edit", join(root, `tau-index-${process.pid}.ts`)), undefined, root);
+    }
+    assert.match(((await change("write", join(process.cwd(), "not-here.ts"))) as { reason: string }).reason, /type "research", which is read-only/);
   });
 
   it("registers the tools only one time for sessions that start later", async () => {
