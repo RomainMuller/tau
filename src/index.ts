@@ -514,6 +514,23 @@ export function createTau(pi: ExtensionAPI, deps: TauDependencies): TauHandle {
   };
 }
 
+/** The name of the built-in codemode tool of pi. */
+const CODEMODE_TOOL = "codemode";
+
+/**
+ * True when the registered `codemode` tool is the built-in tool of pi. A
+ * different extension can register a tool with this name, and that tool can
+ * do work outside the gate. The built-in tool sends each tool call of a
+ * script through the `tool_call` hooks.
+ */
+function isBuiltInCodemode(pi: ExtensionAPI): boolean {
+  try {
+    return pi.getAllTools().some((tool) => tool.name === CODEMODE_TOOL && tool.sourceInfo?.path === `builtin:${CODEMODE_TOOL}`);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Blocks tool calls that are not for an active task. See `gate.ts`. If tau
  * cannot read the task list, it blocks the call too, and tells why.
@@ -538,6 +555,7 @@ function registerWorkGate(pi: ExtensionAPI, session: TaskSession): void {
               agent: session.actor.name,
               taskTypes: session.taskTypes,
               askTool: session.askTool,
+              codemodeTool: event.toolName === CODEMODE_TOOL && isBuiltInCodemode(pi) ? CODEMODE_TOOL : undefined,
               toolInput: event.input,
               cwd: ctx.cwd,
             });

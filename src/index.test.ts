@@ -24,7 +24,7 @@ interface FakePi {
   readonly execCalls: string[][];
   /** The names of all other API members that the extension used. */
   readonly otherCalls: string[];
-  readonly tools: Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>;
+  readonly tools: Map<string, { execute: (id: string, params: unknown) => Promise<unknown>; sourceInfo?: { path: string } }>;
   /** The tools that are not active (pi.getActiveTools). All registered tools are active by default. */
   readonly inactive: Set<string>;
   /** The calls of pi.sendMessage: the message and the options. */
@@ -48,7 +48,7 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
   const handlers = new Map<string, Handler[]>();
   const execCalls: string[][] = [];
   const otherCalls: string[] = [];
-  const tools = new Map<string, { execute: (id: string, params: unknown) => Promise<unknown> }>();
+  const tools = new Map<string, { execute: (id: string, params: unknown) => Promise<unknown>; sourceInfo?: { path: string } }>();
   const inactive = new Set<string>();
   const sent: Array<[unknown, unknown]> = [];
   const shortcuts: string[] = [];
@@ -63,9 +63,9 @@ function fakePi(reply: Reply | ((args: string[]) => Reply)): FakePi {
     appendEntry: (customType: string, data: unknown) => void entries.push([customType, data]),
     registerShortcut: (key: string) => void shortcuts.push(key),
     sendMessage: (message: unknown, options: unknown) => void sent.push([message, options]),
-    getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+    getAllTools: () => [...tools.entries()].map(([name, tool]) => ({ name, sourceInfo: tool.sourceInfo })),
     getActiveTools: () => [...tools.keys()].filter((name) => !inactive.has(name)),
-    registerTool(tool: { name: string; execute: (id: string, params: unknown) => Promise<unknown> }) {
+    registerTool(tool: { name: string; execute: (id: string, params: unknown) => Promise<unknown>; sourceInfo?: { path: string } }) {
       tools.set(tool.name, tool);
     },
     on(event: string, handler: Handler) {
@@ -767,6 +767,23 @@ describe("tau extension", () => {
     assert.equal(blocked.block, true);
     assert.match(blocked.reason, /no active task/);
     assert.equal(await gate({ type: "tool_call", toolName: "tau_list", toolCallId: "2", input: {} }, ctx), undefined);
+    // The built-in codemode tool works with no active task. A different
+    // tool with this name does not.
+    const codemode = { type: "tool_call", toolName: "codemode", toolCallId: "c", input: { code: "" } };
+    assert.match(((await gate(codemode, ctx)) as { reason: string }).reason, /tau blocked codemode: you have no active task/);
+    pi.tools.set("codemode", { execute: async () => undefined, sourceInfo: { path: "/x/other-codemode.ts" } });
+    assert.match(((await gate(codemode, ctx)) as { reason: string }).reason, /tau blocked codemode: you have no active task/);
+    pi.tools.set("codemode", { execute: async () => undefined, sourceInfo: { path: "builtin:codemode" } });
+    assert.equal(await gate(codemode, ctx), undefined);
+    // When tau cannot read the tool list, it blocks codemode.
+    const api = pi.api as unknown as { getAllTools: () => unknown };
+    const getAllTools = api.getAllTools;
+    api.getAllTools = () => {
+      throw new Error("no tools");
+    };
+    assert.match(((await gate(codemode, ctx)) as { reason: string }).reason, /tau blocked codemode: you have no active task/);
+    api.getAllTools = getAllTools;
+    assert.match(((await gate({ type: "tool_call", toolName: "bash", toolCallId: "c2", input: {} }, ctx)) as { reason: string }).reason, /no active task/);
 
     await pi.tools.get("tau_claim")!.execute("3", { id: "T1" });
     assert.equal(await gate({ type: "tool_call", toolName: "bash", toolCallId: "4", input: {} }, ctx), undefined);
@@ -1828,6 +1845,14 @@ describe("tau extension", () => {
     };
     assert.equal(result.block, true);
     assert.match(result.reason, /cannot read the task list/);
+    // The built-in codemode tool is blocked too.
+    pi.tools.set("codemode", { execute: async () => undefined, sourceInfo: { path: "builtin:codemode" } });
+    const codemode = (await gate({ type: "tool_call", toolName: "codemode", toolCallId: "2", input: { code: "" } }, ctx)) as {
+      block: boolean;
+      reason: string;
+    };
+    assert.equal(codemode.block, true);
+    assert.match(codemode.reason, /cannot read the task list/);
   });
 
   it("does not block the configured ask tool when the task list cannot be read", async () => {

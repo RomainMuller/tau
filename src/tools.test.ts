@@ -476,6 +476,30 @@ describe("work gate", () => {
     assert.match((await gate("edit", "ask_user_question")) ?? "", /read-only/);
   });
 
+  it("permits the built-in codemode tool with no active task, but not the tools that it calls", async () => {
+    const gate = async (toolName: string, codemodeTool?: string) =>
+      checkGate({ toolName, tauTools: TASK_TOOL_NAMES, list: await list(), agent: "lead", taskTypes: types, codemodeTool });
+    assert.equal(await gate("codemode", "codemode"), undefined);
+    // The calls of a script come through the gate one by one.
+    assert.equal(await gate("tau_create", "codemode"), undefined);
+    for (const toolName of ["bash", "read", "edit", "write", "some_mcp_tool"]) {
+      assert.match((await gate(toolName, "codemode")) ?? "", /you have no active task/, toolName);
+    }
+    // A codemode tool that is not the built-in tool of pi stays blocked.
+    assert.match((await gate("codemode")) ?? "", /tau blocked codemode: you have no active task/);
+  });
+
+  it("blocks the codemode tool for an ended agent", async () => {
+    const at = { actor: { name: "lead" }, now: "2026-01-01T00:00:00.000Z" };
+    await store.mutate((current) => {
+      createTask(current, at, { title: "Work", type: "code" });
+      delegateTask(current, at, { id: "T1", agent: "tau-t1" });
+      abortTask(current, at, "T1", "stop");
+    });
+    const reason = checkGate({ toolName: "codemode", tauTools: TASK_TOOL_NAMES, list: await list(), agent: "tau-t1", taskTypes: types, codemodeTool: "codemode" });
+    assert.match(reason ?? "", /your agent record ended/);
+  });
+
   it("blocks all tools except the tau tools for an ended agent, also with a task in progress", async () => {
     const at = (name: string, scope?: string) => ({ actor: scope === undefined ? { name } : { name, scope }, now: "2026-01-01T00:00:00.000Z" });
     await store.mutate((current) => {

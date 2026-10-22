@@ -1,6 +1,7 @@
 /**
  * The work gate. An agent must have an active task before it can use tools
- * other than the tau tools. When the type of the active task is read-only,
+ * other than the tau tools (and the built-in `codemode` tool, whose tool calls
+ * go through the gate one by one). When the type of the active task is read-only,
  * the gate also blocks the tools that change files.
  *
  * tau cannot check that a tool call is for the active task. The messages
@@ -32,6 +33,15 @@ export interface GateInput {
    * must be able to ask the user. The tool only reads an answer.
    */
   readonly askTool?: string | undefined;
+  /**
+   * The name of the built-in `codemode` tool of pi, when it is the
+   * registered tool with this name. Else `undefined`. The gate permits this
+   * tool also when the agent has no active task: an agent can then batch
+   * tau tool calls (for example, create a task list in one call). pi sends
+   * each tool call of a script through the gate, so the gate still blocks
+   * the other tools.
+   */
+  readonly codemodeTool?: string | undefined;
   /** The arguments of the tool call. The gate reads `path` of `edit` and `write`. */
   readonly toolInput?: unknown;
   /** The working directory, to resolve a relative `path`. */
@@ -322,6 +332,7 @@ export function checkGate(input: GateInput): string | undefined {
   }
   const active = activeTask(input.list, input.agent);
   if (active === undefined) {
+    if (input.codemodeTool !== undefined && input.toolName === input.codemodeTool) return undefined;
     return [
       `tau blocked ${input.toolName}: you have no active task. All work must be for a task that you own.`,
       "1. Find the task that this work is for (tau_list), and claim it (tau_claim).",

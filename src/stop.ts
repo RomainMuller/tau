@@ -53,7 +53,7 @@ export function promptReminder(actor: Actor): string {
     actor.scope === undefined
       ? "The task list has no open task. You must not do any work for a new request before you populate the task list: create a complete set of tasks (tau_create) for research, changes, validation (tests), and review, then claim one (tau_claim) and delegate the rest (tau_delegate). Each task is only for its own work."
       : "You have no task to work on. You must not do any work without an active task. Tell your parent what you need (tau_send), or end your turn.";
-  return `${noWork} tau blocks all tools other than the tau tools and the ask tool while you have no active task.`;
+  return `${noWork} tau blocks all tools other than the tau tools and the ask tool while you have no active task. Exception: the built-in codemode tool of pi (when it is available), to batch tau tool calls (for example, to create many tasks in one call). tau blocks the other tools that a codemode script calls.`;
 }
 
 /**

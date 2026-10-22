@@ -595,6 +595,19 @@ If an agent calls a tool that is not a `tau_*` tool (or the
   Do only the work that the active task needs.
 ```
 
+Exception: the built-in `codemode` tool of pi. An agent with no active task
+can use it to batch `tau_*` calls (for example, to create a full task list in
+one call, not with one tool call for each task). pi sends each tool call of a
+script through the work gate, so the gate still blocks the tools that are not
+`tau_*` tools (or the `askTool`). `tau` permits only the built-in tool (its
+source is `builtin:codemode`): if a different extension registers a
+`codemode` tool, the gate blocks it as usual. Some functions of a script are
+not tool calls, so the gate does not see them: `models` (classifiers and
+image generation), `store()` (it adds an entry to the session), and
+`image()` (it writes a file in the temporary directory). A script can use
+them with no active task. The record of an ended agent still blocks
+`codemode`.
+
 If `tau` cannot read the task list, it blocks the call too, and tells why.
 When the record of a sub-agent ended (for example, an agent aborted it),
 `tau` blocks all its tools except the `tau_*` tools (and the `askTool`),
